@@ -178,7 +178,17 @@ final class ProviderRelayTransfer {
     var body = Data()
     var received = 0
     var publicLinkAssets: [String] = []
+    var settingsObservation: ProviderRelaySettingsObservation?
     init(client: ProviderRelayClient, url: URL, method: String, staticOnly: Bool) { self.client = client; self.url = url; self.method = method; self.staticOnly = staticOnly }
+}
+
+final class ProviderRelaySettingsObservation {
+    let path: String
+    let method: String
+    var status = 0
+    var stage = "started"
+    init(path: String, method: String) { self.path = path; self.method = method }
+    var dictionary: [String: Any] { ["path": path, "method": method, "status": status, "stage": stage] }
 }
 
 struct ProviderRelayTaskKey: Hashable {
@@ -223,6 +233,7 @@ final class ProviderRelayServer: NSObject, URLSessionDataDelegate, URLSessionTas
     var runtimeInspection: [String: Any] = ["state": "uninspected"]
     var providerReport: [String: Any]?
     var requestRoutes = ["browserScript": 0, "hostModule": 0, "runtimeModule": 0, "rejections": 0]
+    var settingsRequests: [ProviderRelaySettingsObservation] = []
 
     init(mainOrigin: URL, browserShim: Data, sideChatHostScript: Data) throws {
         self.policy = ProviderRelayPolicy(key: try providerRelayRandomKey(), bridgeNonce: try providerRelayRandomKey(), bridgeToken: try providerRelayRandomKey(), mainOrigin: mainOrigin)
@@ -317,8 +328,12 @@ final class ProviderRelayServer: NSObject, URLSessionDataDelegate, URLSessionTas
         var outgoing = URLRequest(url: upstream)
         outgoing.httpMethod = request.method
         if !request.body.isEmpty { outgoing.httpBody = request.body }
-        let basic: Set<String> = ["accept", "accept-language", "user-agent", "content-type", "authorization", "range", "if-range", "last-event-id"]
-        for (name, value) in request.headers where basic.contains(name) || name.hasPrefix("oai-") || name.hasPrefix("openai-") || name.hasPrefix("x-openai-") {
+        let staticOnly = ProviderRelayPolicy.staticAssetPath(upstream.path) || upstream.host == "cdn.oaistatic.com" || upstream.host == "persistent.oaistatic.com"
+        let isMain = upstream.scheme == policy.mainOrigin.scheme && upstream.host == policy.mainOrigin.host && upstream.port == policy.mainOrigin.port
+        let basic: Set<String> = ["accept", "accept-language", "user-agent", "content-type", "range", "if-range", "last-event-id"]
+        for (name, value) in request.headers {
+            let protected = ["authorization", "chatgpt-account-id", "originator"].contains(name) || name.hasPrefix("oai-") || name.hasPrefix("openai-") || name.hasPrefix("x-openai-")
+            guard basic.contains(name) || (isMain && !staticOnly && protected) else { continue }
             if value.utf8.count <= 8192 { outgoing.setValue(value, forHTTPHeaderField: name) }
         }
         if origin != nil {
@@ -328,12 +343,19 @@ final class ProviderRelayServer: NSObject, URLSessionDataDelegate, URLSessionTas
         }
         // No incoming Cookie/Referer/Host/control headers are forwarded.
         // Static modules use a separate cookie-free request policy.
-        let staticOnly = policy.publicStatic(request) || upstream.host == "cdn.oaistatic.com" || upstream.host == "persistent.oaistatic.com"
         if staticOnly { outgoing.httpShouldHandleCookies = false }
         requestCount += 1
         let task = session.dataTask(with: outgoing)
         client.task = task
-        transfers[ProviderRelayTaskKey(session, task)] = ProviderRelayTransfer(client: client, url: upstream, method: request.method, staticOnly: staticOnly)
+        let transfer = ProviderRelayTransfer(client: client, url: upstream, method: request.method, staticOnly: staticOnly)
+        if ["/backend-api/settings/user", "/__codex-api/settings/user"].contains(upstream.path),
+           upstream.scheme == policy.mainOrigin.scheme, upstream.host == policy.mainOrigin.host, upstream.port == policy.mainOrigin.port {
+            let observation = ProviderRelaySettingsObservation(path: upstream.path, method: request.method)
+            settingsRequests.append(observation)
+            if settingsRequests.count > 8 { settingsRequests.removeFirst(settingsRequests.count - 8) }
+            transfer.settingsObservation = observation
+        }
+        transfers[ProviderRelayTaskKey(session, task)] = transfer
         task.resume()
     }
 
@@ -363,6 +385,7 @@ final class ProviderRelayServer: NSObject, URLSessionDataDelegate, URLSessionTas
         runtimeInspection = ["state": "uninspected"]
         providerReport = nil
         requestRoutes = ["browserScript": 0, "hostModule": 0, "runtimeModule": 0, "rejections": 0]
+        settingsRequests.removeAll()
         enabled = accessible
         for probe in abandoned { probe.completion(false) }
     }
@@ -439,6 +462,8 @@ final class ProviderRelayServer: NSObject, URLSessionDataDelegate, URLSessionTas
             }
             guard let transfer = self.transfers[key] else { completionHandler(.cancel); return }
             transfer.status = response.statusCode
+            transfer.settingsObservation?.status = response.statusCode
+            transfer.settingsObservation?.stage = "response"
             if response.value(forHTTPHeaderField: "cf-mitigated") == "challenge" {
                 self.challengeCount += 1
                 transfer.client.error(502, ProviderRelayMessages.text("browserVerification"))
@@ -504,6 +529,7 @@ final class ProviderRelayServer: NSObject, URLSessionDataDelegate, URLSessionTas
                 return
             }
             guard self.session === session, let transfer = self.transfers.removeValue(forKey: key), !transfer.client.completed else { return }
+            transfer.settingsObservation?.stage = error == nil ? "complete" : "networkFailure"
             if error != nil { transfer.client.error(502, ProviderRelayMessages.text("upstreamFailed")); return }
             guard self.session === session, !transfer.client.completed else { return }
             if transfer.document && transfer.method != "HEAD" {

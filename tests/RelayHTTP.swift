@@ -24,7 +24,8 @@ import Foundation
                     switch line {
                     case "clear":
                         try! engine.replaceSession(accessible: true); engine.phase = "guest"; emit()
-                    case "status": emit(["providerReport": engine.providerReport ?? NSNull(), "requestRoutes": engine.requestRoutes])
+                    case "status": emit(["providerReport": engine.providerReport ?? NSNull(), "requestRoutes": engine.requestRoutes,
+                                         "settingsRequests": engine.settingsRequests.map(\.dictionary)])
                     case "verify":
                         let cookie = HTTPCookie(properties: [.name: "__Secure-next-auth.session-token", .value: "synthetic-fixture-only",
                             .domain: ".chatgpt.com", .path: "/", .secure: "TRUE", HTTPCookiePropertyKey("HttpOnly"): "TRUE"])!

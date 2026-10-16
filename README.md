@@ -32,6 +32,9 @@ public module URLs must remain canonical so both use the same module instance.
 The relay forwards the actual browser User-Agent, retains script CSP protection,
 and narrowly adapts local framing/reporting directives. Never fake a Chrome
 origin, alter browser ancestry, strip CSP, or replace conversation requests.
+It uses the website's own API-base setting to route requests to `/backend-api`.
+Original account/API identity headers go only to official nonstatic ChatGPT
+requests, never static or CDN resources.
 
 The macOS package uses a **Manifest V2 persistent background page**, with the
 real `browserAction` toolbar API. Safari's MV3 worker stopped answering
@@ -101,10 +104,12 @@ tabs, or `safari_native` for isolated tests.
   the old document/snapshot was then rejected before input.
 - Safari → native messaging → XPC → signature-verified OpenAI host: protocol-2
   hello, desktop discovery, tab listing, and agent-tab creation passed.
-- The former native sidecar passed signed-in conversation and owning-page
-  selection checks. The new embedded route has passed installed inline mount,
-  page reflow, fixed-control compensation, and official session validation.
-  Signed-in embedded conversation/context acceptance is still in progress.
+- The installed embedded route passed official session validation and real
+  account-settings requests. The original signed-in ChatGPT UI returned the
+  exact owning-page selection even though the prompt did not contain it.
+  Closing/reopening retained the login and the same conversation. Inline page
+  reflow, fixed-control compensation, divider resizing, and fullscreen rendering
+  passed in Safari.
 - Native MCP input, click, and link navigation passed through the signed
   companion. Both input and click events were trusted browser events.
 - A fresh Codex app-server client loaded 19 tools and called

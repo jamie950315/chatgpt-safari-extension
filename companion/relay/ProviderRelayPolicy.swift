@@ -189,7 +189,11 @@ struct ProviderRelayPolicy {
     func publicStatic(_ request: ProviderRelayRequest) -> Bool {
         guard request.method == "GET" || request.method == "HEAD",
               let parts = URLComponents(string: localOrigin + request.target), parts.query == nil else { return false }
-        return parts.percentEncodedPath.range(of: #"^/cdn/assets/(?:[A-Za-z0-9_-]+[.-][A-Za-z0-9._-]+\.(?:js|css|woff2|woff|svg|png|webp|ico)|async/[A-Za-z0-9_-]+[.-][A-Za-z0-9._-]+\.js)$"#, options: .regularExpression) != nil
+        return Self.staticAssetPath(parts.percentEncodedPath)
+    }
+
+    static func staticAssetPath(_ path: String) -> Bool {
+        path.range(of: #"^/cdn/assets/(?:[A-Za-z0-9_-]+[.-][A-Za-z0-9._-]+\.(?:js|css|woff2|woff|svg|png|webp|ico)|async/[A-Za-z0-9_-]+[.-][A-Za-z0-9._-]+\.js)$"#, options: .regularExpression) != nil
     }
 
     func rejection(for request: ProviderRelayRequest, enabled: Bool) -> (Int, String)? {

@@ -26,6 +26,10 @@ This is a development-signed conversion of Chrome extension 1.26.1005.11759.
   Forward the actual browser User-Agent. Keep exact real frame/parent identity,
   account scope, and owner invalidation. Do not fake Chrome ancestry, strip CSP,
   or replace the original conversation UI/request construction.
+- Set the original website's own-origin `codex.browser.apiBaseUrl` to
+  `/backend-api` before entry modules run. Forward actual account/API identity
+  headers only to official nonstatic ChatGPT requests; never attach them or
+  session cookies to static/CDN resources. Do not fabricate account settings.
 - `native/BridgeService.swift` handles the signed extension's native messages.
   The original OpenAI host transport and companion operations are separate.
   Keep XPC client, process signing, and precise origin checks; never log native
@@ -74,13 +78,13 @@ Build with `./scripts/build-safari.sh`; output is
 and team `N3JN8G9YWK`. The app is Universal, not notarized. The containing app is
 unsandboxed for its native runtime; the Safari extension stays sandboxed.
 
-Native hello, desktop discovery/tab listing/creation, former native side chat,
-and actual owning-page selection passed. Embedded-route installed mount/reflow
-and official session validation passed; its signed-in conversation/context
-acceptance is still in progress. The original signed-in UI
-answered with selected text that was absent from the prompt, including after
-a cold launch without Reload. Closing/reopening the sidecar retained the
-conversation. Real Safari-native input/click/navigation passed; a fresh Codex
+Native hello and desktop discovery/tab listing/creation passed. The installed
+embedded route passed official session validation, real settings requests,
+signed-in conversation, owning-page selected-text context, page reflow,
+fixed-control compensation, and divider resizing. The original ChatGPT UI
+answered with selected text absent from the prompt. Closing/reopening the
+inline sidebar retained its login and the same conversation. Real
+Safari-native input/click/navigation passed; a fresh Codex
 app-server consumer loaded 19 MCP tools and called session
 status. The active desktop conversation also used the registered MCP tools for
 real page reading, input, click, and navigation. Preserve saved-owner polling

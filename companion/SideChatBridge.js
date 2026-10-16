@@ -246,7 +246,7 @@ globalThis.__CHATGPT_SAFARI_ADAPTER_READY__ = (async () => {
     setLocation(value) {
       if (this.disposed) return;
       let url; try { url = new URL(value, location.href); } catch { return; }
-      if (url.origin === location.origin) void request("locationChanged", { url: officialURL(url.href) }).catch(() => {});
+      if (url.origin === actualOrigin || (relayMode && url.origin === "https://chatgpt.com")) void request("locationChanged", { url: officialURL(url.href) }).catch(() => {});
     }
     setAuthState(state) {
       if (this.disposed || !["expired", "logout_requested", "signed_in", "signed_out"].includes(state)) return;
@@ -338,7 +338,7 @@ globalThis.__CHATGPT_SAFARI_ADAPTER_READY__ = (async () => {
     } else if (method === "openInBrowser" || method === "locationChanged") {
       if (typeof payload.url !== "string" || payload.url.length > 16384) return;
       let url; try { url = new URL(payload.url); } catch { return; }
-      if (url.origin !== actualOrigin || url.username || url.password) return;
+      if ((url.origin !== actualOrigin && !(relayMode && url.origin === "https://chatgpt.com")) || url.username || url.password) return;
       await request(method, { url: officialURL(url.href) });
     } else if (method === "authStateChanged") {
       if (!["expired", "logout_requested", "signed_in", "signed_out"].includes(payload.state)) return;

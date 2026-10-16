@@ -24,6 +24,10 @@ test("provider relay uses real bounded HTTP, isolated capabilities, module gates
     if (req.url === "/api/auth/session") {
       res.writeHead(200, { "Content-Type": "application/json" });
       res.end(JSON.stringify(sessionValid ? { user: { id: "synthetic-user" }, accessToken: "synthetic-only", expires: new Date(Date.now() + 3600_000).toISOString() } : {}));
+    } else if (req.url.startsWith("/backend-api/settings/user")) {
+      res.writeHead(200, { "Content-Type": "application/json" }); res.end("{\"fixture\":true}");
+    } else if (req.url.startsWith("/__codex-api/settings/user")) {
+      res.writeHead(404, { "Content-Type": "application/json" }); res.end("{\"fixture\":false}");
     } else if (req.url === "/stream") {
       res.writeHead(200, { "Content-Type": "text/event-stream" }); res.write("data: first\n\n"); setTimeout(() => res.end("data: last\n\n"), 250);
     } else if (req.url === "/challenge") {
@@ -155,6 +159,29 @@ test("provider relay uses real bounded HTTP, isolated capabilities, module gates
     socket.on("data", chunk => { bytes += chunk; }); socket.on("end", () => resolve(Number(bytes.match(/^HTTP\/1.1 (\d+)/)?.[1]))); socket.on("error", reject);
   });
   assert.equal(rawStatus, 400);
+  const protectedHeaders = { Authorization: "Bearer synthetic-provider-token", "ChatGPT-Account-ID": "synthetic-account-scope",
+    "X-OpenAI-Expected-Account-Id": "synthetic-account-scope", Originator: "synthetic-browser-client", "OAI-Client-Version": "synthetic-client-version" };
+  await call("/backend-api/settings/user?private=fixture-only", { headers: protectedHeaders });
+  assert.equal(received.at(-1).headers["chatgpt-account-id"], "synthetic-account-scope");
+  assert.equal(received.at(-1).headers["x-openai-expected-account-id"], "synthetic-account-scope");
+  assert.equal(received.at(-1).headers.originator, "synthetic-browser-client");
+  assert.equal(received.at(-1).headers.authorization, "Bearer synthetic-provider-token");
+  await call("/cdn/assets/async/637745.14f70978dc.js", { headers: protectedHeaders });
+  for (const name of ["authorization", "chatgpt-account-id", "x-openai-expected-account-id", "originator", "oai-client-version", "cookie"]) {
+    assert.equal(received.at(-1).headers[name], undefined, `Static module must not receive protected ${name}`);
+  }
+  await call("/cdn/assets/fixture-123.js?cohort=synthetic", { headers: protectedHeaders });
+  for (const name of ["authorization", "chatgpt-account-id", "x-openai-expected-account-id", "originator", "oai-client-version", "cookie"]) {
+    assert.equal(received.at(-1).headers[name], undefined, `Authenticated static resource must not receive protected ${name}`);
+  }
+  await call("/__codex-api/settings/user");
+  child.stdin.write("status\n"); const settingsStatus = await next();
+  assert.deepEqual(settingsStatus.settingsRequests, [
+    { path: "/backend-api/settings/user", method: "GET", status: 200, stage: "complete" },
+    { path: "/__codex-api/settings/user", method: "GET", status: 404, stage: "complete" },
+  ]);
+  assert.ok(!JSON.stringify(settingsStatus.settingsRequests).includes("fixture-only"));
+  assert.ok(!JSON.stringify(settingsStatus.settingsRequests).includes("synthetic-account-scope"));
   const old = entry;
   child.stdin.write("verify\n"); entry = await next();
   assert.equal(entry.verified, true); assert.notEqual(entry.key, old.key); assert.notEqual(entry.accountScope, old.accountScope);

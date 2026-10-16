@@ -86,6 +86,18 @@
   }) });
   // Host messaging belongs solely to SideChatBridge. This shim exposes no account/native operations.
 
+  // Use the original website's explicit API-base setting in this relay's own origin.
+  // The website otherwise classifies localhost as the separate Codex API surface.
+  try {
+    window.localStorage.setItem("codex.browser.apiBaseUrl", "/backend-api");
+    if (window.localStorage.getItem("codex.browser.apiBaseUrl") !== "/backend-api") throw new Error("The provider API base setting was not retained");
+  } catch (error) {
+    void report({ state: "failed", failures: 1, errors: [{
+      kind: error?.name === "SecurityError" ? "SecurityError" : "UnknownError", frames: ["/__chatgpt/browser.js"],
+    }] }).catch(() => {});
+    throw new Error("The ChatGPT provider API base setting could not be saved");
+  }
+
   async function bufferedBody(request, signal) {
     if (signal?.aborted) throw signal.reason;
     if (!request.body) return new ArrayBuffer(0);

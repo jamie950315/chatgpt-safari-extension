@@ -114,6 +114,12 @@ test("isolated provider uses its real parent/origin and a capability-bound chann
     result: { context: { instanceId: "browser-a", tabId: 10, windowId: 20, url: "https://example.com" } } } });
   assert.equal((await waiting).tabId, 10);
   assert.equal(f.requests.length, 0);
+  const conversationURL = "https://chatgpt.com/c/12345678-1234-4234-8234-123456789abc?surface=browser_side_chat";
+  connection.setLocation(conversationURL);
+  await flush();
+  const changed = sent.find(value => value.method === "locationChanged");
+  assert.equal(changed.params.url, conversationURL);
+  port.onmessage({ data: { type: "reply", id: changed.id, result: { ok: true } } });
   connection.dispose();
   f.window.dispatchEvent(new MockEvent("pagehide"));
 });

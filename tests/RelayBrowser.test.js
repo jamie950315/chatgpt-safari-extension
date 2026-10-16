@@ -5,7 +5,7 @@ const vm = require("node:vm");
 const path = require("node:path");
 
 const source = fs.readFileSync(path.join(__dirname, "../companion/relay/ProviderBrowser.js"), "utf8");
-function setup() {
+function setup(options = {}) {
   const origin = "http://chatgpt-provider-fixture.localhost:34567", key = "a".repeat(64);
   const fetches = [], reports = [], listeners = [];
   class Element { setAttribute(name, value) { this[name] = value; } }
@@ -20,8 +20,13 @@ function setup() {
     setRequestHeader(key, value) { (this.headers ||= {})[key] = value; }
   }
   const location = { origin, href: origin + "/c/fixture?surface=browser_side_chat&__chatgpt_key=" + key };
+  const storage = new Map(), storageWrites = [];
   const context = { URL, Request, Headers, Uint8Array, ArrayBuffer, Promise, TextEncoder, location,
     history: { state: null, replaceState(_state, _unused, url) { location.href = String(url); } },
+    localStorage: { getItem(key) { return storage.get(key) ?? null; }, setItem(key, value) {
+      if (options.storageFailure) { const error = new Error("Synthetic storage failure"); error.name = "SecurityError"; throw error; }
+      storageWrites.push(key); storage.set(key, value);
+    } },
     document: { addEventListener(name, callback) { listeners.push([name, callback]); } },
     Element, HTMLImageElement: elementClass("src"), HTMLScriptElement: elementClass("src"),
     HTMLLinkElement: elementClass("href"), HTMLIFrameElement: elementClass("src"), HTMLFormElement: class extends Element {},
@@ -32,12 +37,14 @@ function setup() {
   vm.createContext(context);
   const bootstrap = { providerOrigin: origin, parentExtensionOrigin: "safari-web-extension://fixture-extension",
     bridgeToken: "b".repeat(64), key, runtimeURL: "https://chatgpt.com/cdn/assets/633146.c3403bd103.js" };
-  vm.runInContext(source.replace("/*__CHATGPT_RELAY_BOOTSTRAP__*/", JSON.stringify(bootstrap)), context);
-  return { context, config: context.ChatGPTSafariProviderRelay, fetches, reports, listeners, key, origin };
+  let initializationError;
+  try { vm.runInContext(source.replace("/*__CHATGPT_RELAY_BOOTSTRAP__*/", JSON.stringify(bootstrap)), context); }
+  catch (error) { if (!options.storageFailure) throw error; initializationError = error; }
+  return { context, config: context.ChatGPTSafariProviderRelay, fetches, reports, listeners, key, origin, storageWrites, initializationError };
 }
 
 test("provider URL mapping keeps real origins and removes local capabilities from public links", () => {
-  const { config, context, key, origin, listeners } = setup();
+  const { config, context, key, origin, listeners, storageWrites } = setup();
   assert.equal(Object.isFrozen(config), true);
   assert.equal(config.providerOrigin, origin);
   assert.equal(config.parentExtensionOrigin, "safari-web-extension://fixture-extension");
@@ -55,6 +62,8 @@ test("provider URL mapping keeps real origins and removes local capabilities fro
   assert.throws(() => config.upstreamURL("https://attacker.invalid/"));
   assert.equal(listeners.some(([name]) => name === "message"), false, "Only SideChatBridge owns provider host messaging");
   assert.equal(config.key, undefined, "The HTTP capability remains inside the routing closure");
+  assert.equal(context.localStorage.getItem("codex.browser.apiBaseUrl"), "/backend-api");
+  assert.deepEqual(storageWrites, ["codex.browser.apiBaseUrl"], "Only the provider's existing API-base setting is written");
 });
 
 test("adapter imports share the original site's canonical public-module runtime identity", () => {
@@ -99,4 +108,13 @@ test("provider boot reports directly through captured fetch without the function
   assert.equal(reports[1][1].redirect, "error");
   assert.deepEqual(JSON.parse(reports[1][1].body), { state: "installed", usedOrigin: 1, channelConnected: true });
   await assert.rejects(config.report({ state: "failed", errors: [{ kind: "Error", frames: ["x".repeat(9000)] }] }), /8 KiB/);
+});
+
+test("provider API-base storage failure is explicit and reports only a safe error category", async () => {
+  const { config, reports, initializationError } = setup({ storageFailure: true });
+  assert.match(initializationError.message, /API base setting could not be saved/);
+  await config.report({ state: "failed" });
+  const failure = JSON.parse(reports[0][1].body);
+  assert.deepEqual(failure, { state: "failed", failures: 1, errors: [{ kind: "SecurityError", frames: ["/__chatgpt/browser.js"] }] });
+  assert.equal(reports.some(([, options]) => options.body.includes("Synthetic storage failure")), false);
 });

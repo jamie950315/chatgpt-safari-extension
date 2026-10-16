@@ -126,7 +126,8 @@ final class ChatGPTProviderRelay {
                 "challenges": engine?.challengeCount ?? 0, "activeRequests": engine?.transfers.count ?? 0,
                 "runtimeInspection": engine?.runtimeInspection ?? ["state": "uninspected"],
                 "providerReport": engine?.providerReport ?? NSNull(),
-                "requestRoutes": engine?.requestRoutes ?? ["browserScript": 0, "hostModule": 0, "runtimeModule": 0, "rejections": 0]]
+                "requestRoutes": engine?.requestRoutes ?? ["browserScript": 0, "hostModule": 0, "runtimeModule": 0, "rejections": 0],
+                "settingsRequests": engine?.settingsRequests.map(\.dictionary) ?? []]
             DispatchQueue.main.async { completion(value) }
         }
     }
