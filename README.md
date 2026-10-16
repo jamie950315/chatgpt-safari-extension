@@ -1,85 +1,98 @@
-# ChatGPT for Safari — development conversion
+# ChatGPT for Safari — native development port
 
-Open `dist/ChatGPT for Safari.app`, then enable its extension in Safari Settings.
+Click the **ChatGPT** toolbar button on an HTTP/HTTPS page to open native side
+chat beside Safari. Sign in once in that window. Its persistent WebKit profile
+is separate from ordinary Safari, so Safari cookies and existing tabs stay intact.
+
+Open `dist/ChatGPT for Safari.app` to enable the extension in Safari Settings.
 This is a local Apple Development-signed build, not an official OpenAI Safari
-extension or a notarized release. **The full conversion is not complete.**
+extension or a notarized release.
 
-## Current behavior
+## Side chat uses the original ChatGPT interface
 
-- The toolbar mounts a resizable sidebar in the current HTTP/HTTPS page. It loads
-  the original ChatGPT side-chat extension UI, not a replacement website launcher.
-- Safari native messaging reaches an embedded XPC service and the installed,
-  signature-verified OpenAI native host. A real protocol-2 hello has passed from
-  the installed Safari extension. The desktop runtime discovers it as **Safari**,
-  lists real Safari tabs, and creates an agent tab in a real Safari window.
-  Navigation and page interaction remain blocked at debugger attachment.
-- Agent-created tabs use native Safari windows instead of Chrome tab groups.
-  Explicit preferred-window requests are honored; user tabs and popup tabs are
-  not moved. This restores tab creation, not CDP browser control.
-- The sidebar's **Open connection diagnostics** button opens its native-host
-  test and background transport status. The test sends no page content.
-- ChatGPT's `frame-ancestors` policy currently rejects the nested Safari frame.
-  The original UI therefore reaches its load-error screen rather than a working
-  conversation. The conversion does not remove the site's security headers.
+The containing app hosts the original
+`https://chatgpt.com/?surface=browser_side_chat` as a top-level WKWebView in an
+AppKit sidecar window. It does not embed a blocked ChatGPT iframe or remove CSP.
 
-## What still prevents the requested end state
+Safari's native tabs/scripting APIs provide the owning page, selected text, and
+tab-mention candidates. The original website's Chrome-only host boundary is
+replaced with a native connection that implements its context, submission,
+account, and invalidation contract. The website still constructs its own
+conversation requests.
 
-Safari 27.0.1 on the tested Mac does not expose the native sidePanel API. The
-content sidebar restores its owning page's layout when closed, but it is not a
-Safari-native dock. Loading a sidebar shell does not establish chat, login, or
-tab-context functionality; those flows remain incomplete because of the frame
-restriction above.
+This adapter is bound to the inspected website deployment: runtime
+`633146.1f9c264032.js`, host factories `aH` and `Kxt`. A changed or already
+executed factory is reported as an adapter failure. Do not substitute a fake
+Chrome origin, alter `window.parent`, or silently fall back to an ordinary
+website launcher.
 
-The original desktop browser runtime translates Playwright, accessibility, and
-input operations into Chrome DevTools Protocol requests before they reach the
-extension. Safari has no `chrome.debugger`. Apple's `safaridriver --mcp` passed
-real input/click/navigation tests after remote automation was enabled, but its
-automation session cannot attach to existing Safari tabs or their login state.
-It is not wired into the original runtime. Browser control is not reported as
-supported merely because those isolated tests passed.
+## Desktop control uses Safari-native tools
 
-Installed testing reached `chrome.debugger.attach` after successful desktop tab
-creation. The adapter now reports that missing capability explicitly. A complete
-port still needs a Safari-capable desktop execution backend and a supported host
-for the original ChatGPT side chat. Extension flags cannot supply either one:
-the native sidebar is compiled out, and the current desktop backend sends CDP
-requests rather than Safari WebDriver/MCP operations.
+The `safari_native` MCP server exposes Apple's actual Safari automation tools:
+read page content, type, click, navigate, handle tabs, and inspect requests.
+The companion owns one persistent `safaridriver --mcp` process, shared through
+an authenticated loopback channel.
 
-The original package also requests Chrome APIs that Safari does not implement,
-including bookmarks, downloads, history, offscreen documents, sessions, tab
-groups, and top sites. Unsupported event registration is guarded; this is not a
-complete implementation of those APIs.
+**Automation uses an isolated Safari session.** Its tabs and website logins are
+separate from ordinary Safari tabs. Enable Safari **Develop → Allow Remote
+Automation and External Agents** before using it. The native side-chat profile
+is also separate from the automation profile.
 
-## Rebuild and focused checks
+Use [the native automation guide](automation/README.md) for the launch command,
+desktop configuration, and a complete read/type/click/navigation example.
+The `safari_native` server is installed in this Mac's shared Codex/ChatGPT desktop
+MCP configuration. Reload the server or start a new client session after changing
+its configuration. [Official MCP configuration documentation](https://developers.openai.com/codex/mcp).
+
+The original OpenAI native-host connection remains available: the desktop runtime
+discovers the extension as Safari, lists real tabs, and creates agent tabs using
+native Safari windows. Its legacy raw-CDP navigation path is not the control
+backend; Safari does not expose `chrome.debugger`. Use `safari_native` instead.
+
+## Installed acceptance
+
+- Safari → native messaging → XPC → signature-verified OpenAI host: protocol-2
+  hello, desktop discovery, tab listing, and agent-tab creation passed.
+- Native side-chat guest and signed-in prompt/response passed. The original
+  signed-in UI attached selected text from the actual owning Safari page; a
+  prompt that did not contain the text received that exact text as its answer.
+  Closing and reopening the native window retained the conversation and login.
+- Native MCP input, click, and link navigation passed through the signed
+  companion. Both input and click events were trusted browser events.
+- A fresh Codex app-server client loaded 19 tools and called
+  `safari_session_status` successfully. This is distinct from an already-running
+  chat's cached tool catalog.
+
+The background restores polling only for the native window's matching saved
+owner after a worker reload; it does not reopen a window or restart a quit app.
+
+## Build and focused checks
 
 ```sh
 ./scripts/build-safari.sh
 python3 -m unittest discover -s tests -p 'test_prepare*.py'
-node --test tests/test_native_transport.js tests/test_safari_sidebar.js tests/test_session_windows.js
+node --test tests/test_native_transport.js tests/test_safari_sidebar.js tests/test_session_windows.js tests/test_companion_background.js tests/sidechat_companion_bridge.js
 ```
 
 Requirements: full Xcode, macOS, and the local Apple Development identity for
-team `N3JN8G9YWK`. The build produces arm64/x86_64 binaries, verifies signatures,
-and retains the previous app under `dist/previous-*`. It does not publish or
-notarize anything.
+team `N3JN8G9YWK`. The build creates Universal arm64/x86_64 binaries, verifies
+signatures, and retains the previous app under `dist/previous-*`.
 
-The native bridge uses the existing OpenAI registration at
-`~/Library/Application Support/Google/Chrome/NativeMessagingHosts/com.openai.codexextension.json`.
-It does not change Chrome/Edge registrations, copy credentials, or impersonate a
-Chrome origin. Its XPC client must be this team's signed Safari extension; the
-launched host must have OpenAI's signing identity.
+The containing app is not sandboxed so it can own the Apple driver and private
+local IPC service; the Safari extension remains sandboxed. IPC binds only to
+127.0.0.1 and requires a random token stored in a mode-0600 descriptor. The XPC
+client and OpenAI host retain their code-signature checks. No credentials,
+cookies, native message contents, or authorization tokens belong in logs or Git.
 
 ## Source layout
 
 - `chatgpt.crx` and `unpacked/`: ignored, unmodified original download.
 - `vendor/`: preserved upstream inputs for version-bound preparation.
-- `scripts/prepare-safari.py`: exact upstream transformations; an unexpected
-  upstream change fails rather than silently skipping a patch.
-- `native/`: XPC transport, native framing, and host identity validation.
+- `scripts/prepare-safari.py`: exact upstream transformations.
+- `native/`: original-host XPC transport, companion client, Safari automation.
+- `companion/`: AppKit side chat, website host adapter, authenticated IPC.
+- `automation/`: desktop MCP stdio entry point and configuration.
 - `safari/ChatGPT for Safari/`: containing app, extension, and Xcode project.
-- Extension `Resources/safari/`: native-port transport, owning-tab sidebar,
-  session-window management, frame authorization, and fixed-operation background RPC. Privileged scripting
-  stays in the background: calling it directly from an embedded extension page
-  caused WebKit to terminate the page process during installed testing.
 
-Upstream version: **1.26.1005.11759**. [Chrome Web Store listing](https://chromewebstore.google.com/detail/chatgpt/hehggadaopoacecdllhhajmbjkdcmajg).
+Upstream Chrome extension: **1.26.1005.11759**.
+[Chrome Web Store listing](https://chromewebstore.google.com/detail/chatgpt/hehggadaopoacecdllhhajmbjkdcmajg).

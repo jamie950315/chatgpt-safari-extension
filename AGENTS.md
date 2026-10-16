@@ -1,49 +1,56 @@
 # ChatGPT Safari Conversion
 
-## Goal and current boundary
+## Required outcome
 
-The requested result is the original side chat, a real ChatGPT/Codex desktop
-connection, and browser automation in Safari. All three must work in the actual
-installed build before declaring completion. This is a local development-signed
-conversion of Chrome extension 1.26.1005.11759, not an official Safari release.
+The original side chat, a real ChatGPT/Codex desktop connection, and Safari
+automation must work in the installed build before declaring completion.
+This is a development-signed conversion of Chrome extension 1.26.1005.11759.
 
-The current build has a content sidebar and an XPC native-host transport. An
-installed-Safari protocol-2 native hello, desktop discovery as Safari, real tab
-listing, and desktop-requested agent tab creation passed. Navigation fails at
-the unavailable CDP debugger attachment. ChatGPT's frame-ancestors policy rejects the nested Safari chat
-frame. Safari's native sidePanel implementation is compiled out on the tested
-Safari 27.0.1. Do not remove site security headers, substitute a website launcher,
-or call the visible sidebar shell a working chat.
+## Current implementation
 
-The upstream desktop kernel expects arbitrary CDP, live remote objects, AX,
-trusted input, and real Document response interception. Safari's official MCP
-supports isolated automation sessions, not attachment to existing Safari tabs.
-Do not return empty CDP successes or equate standalone MCP probes with integration.
-
-## Ownership and build
-
-- `unpacked/` and `chatgpt.crx` are ignored, preserved original downloads.
-- `vendor/` holds upstream inputs; `scripts/prepare-safari.py` applies exact,
-  version-bound changes to copied extension resources.
+- The production toolbar uses an AppKit sidecar with a top-level ChatGPT
+  WKWebView. Its profile persists independently of Safari; never import cookies.
+  The old content-sidebar source remains as preserved tested infrastructure,
+  not the production route.
+- `companion/SideChatBridge.js` replaces the inspected website's Chrome-only
+  host boundary (`aH` and `Kxt`, runtime `633146.1f9c264032.js`). Keep exact
+  deployment checks, real origin/WebView identity, account scope, and owner
+  invalidation. Do not fake Chrome origins or browser ancestry, strip CSP, or
+  replace the original conversation UI/request construction.
+- `native/BridgeService.swift` handles the signed extension's native messages.
+  The original OpenAI host transport and companion operations are separate.
+  Keep XPC client, process signing, and precise origin checks; never log native
+  messages or credentials.
+- `CompanionControlServer` binds authenticated HTTP only to loopback. Its
+  mode-0600 descriptor is runtime data, never source. The containing app owns
+  one `SafariAutomation` instance and one Apple driver.
+- `automation/` exposes this same backend through the `safari_native` MCP server.
+  Use real native tool results; do not emulate CDP with empty successes or DOM
+  input events. Apple automation uses isolated tabs/logins, not existing tabs.
 - `Resources/safari/sidebar-adapter.js` is the sole toolbar/sidebar state owner.
-  Embedded extension frames use fixed-operation runtime RPC for privileged
-  scripting/tab APIs. Direct scripting from those frames triggered WebKit IPC
-  validation failure and page termination in installed testing.
-- `Resources/safari/session-windows.js` replaces the upstream internal tab-group
-  manager with real Safari window/tab creation. Preserve explicit preferred
-  windows and stable tab IDs; do not move user tabs or fabricate Chrome groups.
-  The upstream native connection calls `ChatGPTSafariConnectNative` directly:
-  assigning Safari's built-in `runtime.connectNative` did not replace its behavior.
-- `native/` bridges request/reply Safari messages to the existing OpenAI stdio
-  host through an embedded XPC service. Keep code-signature checks and precise
-  client/origin checks; never log native message contents or credentials.
-- Build with `./scripts/build-safari.sh`; output is
-  `dist/ChatGPT for Safari.app`, with previous builds retained in `dist/`.
-  Use the local Apple Development identity and team `N3JN8G9YWK`.
-- Native and source tests do not replace installed chat, desktop request, and
-  browser-control acceptance. Build artifacts and probe logs stay ignored.
+  Its companion binding brokers real Safari context/selection/tab mentions and
+  releases ownership when the native window closes.
+- Upstream calls `ChatGPTSafariConnectNative` directly. Assigning Safari's
+  built-in `runtime.connectNative` did not replace that host method.
+- Session windows replace the upstream internal Chrome tab-group manager.
+  Preserve preferred windows and stable tab IDs; never move user tabs.
 
-Preserve browser profiles, login state, drafts, and user tabs. Test only owned
-pages, do not restart Safari, and clean up task-owned probes. Do not alter the
-installed OpenAI app/plugin, Chrome host registrations, or system security to
-conceal an unsupported integration.
+## Build and acceptance
+
+Build with `./scripts/build-safari.sh`; output is
+`dist/ChatGPT for Safari.app`. Signing uses the local Apple Development identity
+and team `N3JN8G9YWK`. The app is Universal, not notarized. The containing app is
+unsandboxed for its native runtime; the Safari extension stays sandboxed.
+
+Native hello, desktop discovery/tab listing/creation, guest and signed-in side
+chat, and actual owning-page selection passed. The original signed-in UI
+answered with selected text that was absent from the prompt. Closing/reopening
+the sidecar retained the conversation. Real Safari-native input/click/navigation
+passed; a fresh Codex app-server consumer loaded 19 MCP tools and called session
+status. Preserve saved-owner polling across background reload without reopening
+the native UI or restarting a quit app.
+
+Preserve original downloads, browser profiles, login state, drafts, and user
+tabs. Test only owned pages, do not restart Safari, and stop owned probes.
+Do not alter the installed OpenAI app/plugin or Chrome host registration.
+Build artifacts, private configuration backups, and probe reports stay ignored.

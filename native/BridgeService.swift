@@ -179,6 +179,7 @@ private final class HostSession {
 final class BridgeService: NSObject, SafariNativeBridge {
     private let queue = DispatchQueue(label: "dev.jamie.chatgpt-safari.native-host")
     private var sessions: [String: HostSession] = [:]
+    private let companion = CompanionClient()
 
     func handle(_ request: Data, withReply reply: @escaping (Data) -> Void) {
         queue.async { [self] in
@@ -193,6 +194,16 @@ final class BridgeService: NSObject, SafariNativeBridge {
                 for (id, session) in sessions where Date().timeIntervalSince(session.lastActivity) > 90 {
                     session.fail("CONNECTION_EXPIRED", "The Safari background disconnected.")
                     sessions.removeValue(forKey: id)
+                }
+                if operation == "companion" {
+                    guard let command = command["command"] as? [String: Any],
+                          let action = command["action"] as? String,
+                          ["open", "update", "close", "status", "poll", "resolve", "automation"].contains(action) else {
+                        reply(encode(failure("INVALID_COMPANION_COMMAND", "Unknown Safari companion operation.")))
+                        return
+                    }
+                    companion.handle(command) { reply(encode($0)) }
+                    return
                 }
                 if operation == "open" {
                     guard command["application"] as? String == "com.openai.codexextension",

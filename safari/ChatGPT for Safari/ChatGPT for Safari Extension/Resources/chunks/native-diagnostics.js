@@ -6,6 +6,17 @@ const refresh = async () => {
 };
 document.querySelector("#refresh").addEventListener("click", () => refresh().catch(console.error));
 refresh().catch(console.error);
+document.querySelector("#automation").addEventListener("click", async () => {
+  const output = document.querySelector("#automation-result");
+  output.textContent = "Checking…";
+  try {
+    const response = await runtime.sendNativeMessage("dev.jamie.chatgpt-safari", {
+      operation: "companion", command: { action: "automation", command: { action: "status" } },
+    });
+    if (!response?.ok) throw new Error(response?.error?.message || "The Safari companion is unavailable.");
+    output.textContent = JSON.stringify(response.result, null, 2);
+  } catch (error) { output.textContent = error.message; }
+});
 document.querySelector("#test").addEventListener("click", async () => {
   let connectionId;
   const request = async message => {

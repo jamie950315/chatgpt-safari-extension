@@ -1,0 +1,142 @@
+const test = require("node:test");
+const assert = require("node:assert/strict");
+const vm = require("node:vm");
+const fs = require("node:fs");
+const source = fs.readFileSync("companion/SideChatBridge.js", "utf8");
+class MockEvent { constructor(type, options = {}) { this.type = type; Object.assign(this, options); } }
+class MockCustomEvent extends MockEvent {}
+function fixture(options = {}) {
+  const listeners = new Map(), documentListeners = new Map(), attributes = new Map();
+  const requests = [], messages = [], events = [];
+  const on = (map, type, callback) => { if (!map.has(type)) map.set(type, []); map.get(type).push(callback); };
+  const off = (map, type, callback) => map.set(type, (map.get(type) || []).filter(item => item !== callback));
+  const emit = (map, event) => { for (const callback of map.get(event.type) || []) callback(event); };
+  const context = { instanceId: "safari-test", tabId: 10, windowId: 20, url: "https://example.com" };
+  const capabilities = { "browserSideChat.tabContext.read": true, "browserTabMentions.search": true };
+  const window = {
+    addEventListener: (type, callback) => on(listeners, type, callback),
+    removeEventListener: (type, callback) => off(listeners, type, callback),
+    dispatchEvent: event => { events.push(event.type); emit(listeners, event); },
+    webkit: { messageHandlers: { chatgptSidechat: { async postMessage(message) {
+      requests.push(message);
+      if (message.method === "capabilities") return { browserContext: { instanceId: "safari-test" }, capabilities };
+      if (message.method === "context") return { context, capabilities };
+      if (message.method === "tabContext") return { tabId: 10, url: "https://example.com" };
+      if (message.method === "tabMentions") return { candidates: [{ tabId: 10, title: "Example" }] };
+      return { ok: true };
+    } } } },
+  };
+  window.top = window;
+  window.parent = window;
+  window.postMessage = (data, targetOrigin) => {
+    messages.push({ data, targetOrigin });
+    emit(listeners, { type: "message", data, source: window, origin: "https://chatgpt.com", isTrusted: true });
+  };
+  const document = {
+    documentElement: {
+      setAttribute: (name, value) => attributes.set(name, value),
+      removeAttribute: name => attributes.delete(name),
+    },
+    addEventListener: (type, callback) => on(documentListeners, type, callback),
+  };
+  const sandbox = { window, document, location: { origin: "https://chatgpt.com", href: "https://chatgpt.com/?surface=browser_side_chat" },
+    URL, Event: MockEvent, CustomEvent: MockCustomEvent, Date, console, setTimeout, clearTimeout,
+    crypto: require("node:crypto").webcrypto, __testRuntime: options.runtime };
+  const runtimeImport = 'import("https://chatgpt.com/cdn/assets/633146.1f9c264032.js")';
+  const input = options.runtime ? source.replace(runtimeImport, "Promise.resolve({ __webpack_require__: globalThis.__testRuntime })") : source;
+  vm.runInNewContext(input, sandbox);
+  return { window, document, requests, messages, events, attributes,
+    gesture: trusted => emit(documentListeners, new MockEvent("pointerdown", { isTrusted: trusted })) };
+}
+const flush = () => new Promise(resolve => setImmediate(resolve));
+test("top-level side chat routes original context and capability messages without a self-message loop", async () => {
+  const f = fixture();
+  assert.equal(f.window.__CODEX_BROWSER_SIDE_CHAT__, true);
+  f.window.parent.postMessage({ type: "browser_side_chat_context_requested", protocolVersion: 2,
+    requestId: "context-1", includeSelection: true }, "safari-web-extension://known-owner");
+  f.window.parent.postMessage({ type: "browser_side_chat_capabilities_requested" }, "safari-web-extension://known-owner");
+  await flush();
+  assert.equal(f.requests.length, 2);
+  const context = f.messages.find(item => item.data.type === "browser_side_chat_context");
+  assert.equal(context.data.requestId, "context-1");
+  assert.equal(context.data.context.tabId, 10);
+  assert.equal(context.targetOrigin, "https://chatgpt.com");
+  assert.equal(JSON.parse(f.attributes.get("data-chatgpt-extension-status")).capabilities["browserTabMentions.search"], true);
+  f.window.postMessage({ type: "unrelated", value: "ordinary message" }, "https://chatgpt.com");
+  assert.equal(f.messages.at(-1).data.value, "ordinary message");
+  assert.equal(f.requests.length, 2);
+});
+test("tab mentions require a recent trusted gesture and publish the upstream temporary DOM contract", async () => {
+  const f = fixture();
+  f.window.dispatchEvent(new MockEvent("chatgpt-extension-request-status"));
+  await flush();
+  const search = () => f.window.dispatchEvent(new MockCustomEvent("chatgpt-extension-request-browser-tab-mentions", {
+    detail: { query: "Example", limit: 5 },
+  }));
+  search();
+  f.gesture(false); search();
+  await flush();
+  assert.equal(f.requests.filter(item => item.method === "tabMentions").length, 0);
+  f.gesture(true); search();
+  await flush();
+  assert.equal(f.requests.filter(item => item.method === "tabMentions").length, 1);
+  assert.ok(f.events.includes("chatgpt-extension-browser-tabs"));
+  assert.equal(f.attributes.has("data-chatgpt-extension-browser-tabs"), false);
+});
+test("invalid protocol messages do not reach native tab operations", async () => {
+  const f = fixture();
+  f.window.postMessage({ type: "browser_side_chat_context_requested", protocolVersion: 1, requestId: "bad" }, "*");
+  f.window.postMessage({ type: "browser_side_chat_open_in_browser", url: "https://evil.example/" }, "*");
+  f.window.postMessage({ type: "browser_side_chat_auth_state_changed", state: "made-up" }, "*");
+  await flush();
+  assert.equal(f.requests.length, 0);
+});
+test("fixed diagnostics preserve document identity and expose only public script paths", () => {
+  const f = fixture();
+  f.document.scripts = [
+    { src: "https://cdn.oaistatic.com/assets/public.js?version=test#fragment" },
+    { src: "https://chatgpt.com/assets/client.mjs?build=test" },
+    { src: "https://third-party.example/private.js" },
+    { src: "https://chatgpt.com/backend-api/session?token=secret" },
+  ];
+  const result = f.window.__CHATGPT_SAFARI_SIDECAR__.diagnostics();
+  assert.equal(result.sideChatPreloadFlag, true);
+  assert.equal(result.parentIsSelf, true);
+  assert.deepEqual(Array.from(result.publicScripts), [
+    "https://cdn.oaistatic.com/assets/public.js", "https://chatgpt.com/assets/client.mjs",
+  ]);
+});
+test("the version-bound native host boundary drives the original context and submit lifecycle", async () => {
+  const runtime = { m: {}, c: {}, d(exports, getters) {
+    for (const [name, get] of Object.entries(getters)) Object.defineProperty(exports, name, { get, enumerable: true });
+  } };
+  const f = fixture({ runtime });
+  await flush();
+  assert.equal(f.window.__CHATGPT_SAFARI_SIDECAR__.diagnostics().siteAdapter.state, "installed");
+  runtime.m.aH = (module, exports, require) => require.d(exports, { a: () => () => undefined });
+  runtime.m.Kxt = () => { throw new Error("The Chrome-only connection was not replaced"); };
+  const originExports = {};
+  runtime.m.aH({}, originExports, runtime);
+  assert.equal(originExports.a(f.window), "https://chatgpt.com");
+  assert.equal(originExports.a({}), undefined);
+  const connectionExports = {};
+  runtime.m.Kxt({}, connectionExports, runtime);
+  let account = "account-a";
+  const connection = new connectionExports.BrowserSideChatConnection({
+    pageWindow: f.window, parentOrigin: "https://chatgpt.com", getAuthScope: () => account,
+  });
+  const context = await connection.waitForContext();
+  assert.equal(context.tabId, 10);
+  assert.equal(connection.confirmed, true);
+  assert.equal(connection.extensionStatus.toolbar.pin, "unsupported");
+  const submit = await connection.prepareSubmit("Context changed");
+  submit.assertCurrent();
+  account = "account-b";
+  assert.throws(submit.assertCurrent, /Context changed/);
+  account = "account-a";
+  f.window.__CHATGPT_SAFARI_SIDECAR__.receive({ type: "browser_side_chat_context_invalidated", protocolVersion: 2 });
+  assert.throws(submit.assertCurrent, /Context changed/);
+  await flush();
+  connection.dispose();
+  await assert.rejects(connection.getContext(), /not available/);
+});

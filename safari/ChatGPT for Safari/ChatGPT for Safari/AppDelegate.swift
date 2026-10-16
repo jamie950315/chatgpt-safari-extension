@@ -1,20 +1,64 @@
-//
-//  AppDelegate.swift
-//  ChatGPT for Safari
-//
-//
-
 import Cocoa
 
 @main
 class AppDelegate: NSObject, NSApplicationDelegate {
+    private let companionServer = CompanionControlServer()
+    private let automation = SafariAutomation()
+    private var serviceLaunch = false
 
     func applicationDidFinishLaunching(_ notification: Notification) {
-        // Override point for customization after application launch.
+        startCompanionServer()
+        if serviceLaunch { hideSetupWindow() }
+    }
+
+    private func startCompanionServer() {
+        companionServer.commandHandler = { [weak self] command, reply in
+            if command["action"] as? String == "automation" {
+                guard let action = command["command"] as? [String: Any], let self else {
+                    reply(["ok": false, "error": "Invalid Safari automation command"]); return
+                }
+                self.automation.handle(action, reply: reply)
+            } else {
+                SideChatCompanionController.shared.handle(command: command, reply: reply)
+            }
+        }
+        do { try companionServer.start() }
+        catch {
+            let alert = NSAlert()
+            alert.messageText = "The Safari companion could not start"
+            alert.informativeText = error.localizedDescription
+            alert.runModal()
+        }
+    }
+
+    func application(_ application: NSApplication, open urls: [URL]) {
+        startCompanionServer()
+        for url in urls where url.scheme == "chatgpt-safari" && url.query == nil && url.fragment == nil {
+            guard url.path.isEmpty || url.path == "/" else { continue }
+            if url.host == "service" {
+                serviceLaunch = true
+                hideSetupWindow()
+                DispatchQueue.main.async { self.hideSetupWindow() }
+            }
+            if url.host == "sidechat", url.path.isEmpty || url.path == "/" {
+                SideChatCompanionController.shared.show()
+            }
+            // chatgpt-safari://service only wakes the private command listener.
+        }
+    }
+
+    private func hideSetupWindow() {
+        for window in NSApp.windows where window.title == "ChatGPT for Safari" {
+            window.orderOut(nil)
+        }
     }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
-        return true
+        return false
     }
 
+    func applicationWillTerminate(_ notification: Notification) {
+        automation.close()
+        companionServer.stop()
+    }
 }

@@ -73,6 +73,16 @@
           openByWindow.set(item.windowId, item);
         }
       }
+      if (options.companion && openByWindow.size) {
+        let restored;
+        try { restored = await options.companion.restore(Array.from(openByWindow.values())); }
+        catch (error) { reportError(error); }
+        // The native companion has one window. Retain only its authenticated owner.
+        for (const [windowId, state] of openByWindow) {
+          if (state.instanceId !== restored?.instanceId) openByWindow.delete(windowId);
+        }
+        await save();
+      }
     })();
 
     function serialize(operation) {
@@ -118,6 +128,7 @@
     }
 
     async function mount(state) {
+      if (options.companion) return options.companion.open(state);
       await api.scripting.executeScript({
         target: { tabId: state.tabId, frameIds: [0] },
         files: ["safari/sidebar-content.js"],
@@ -136,7 +147,8 @@
     }
 
     async function closeState(state, reason, alreadyUnmounted = false) {
-      if (!alreadyUnmounted) {
+      if (options.companion) await options.companion.close(state);
+      else if (!alreadyUnmounted) {
         const result = await api.tabs.sendMessage(state.tabId, {
           type: MESSAGE.unmount, instanceId: state.instanceId,
         }, { frameId: 0 });
@@ -375,6 +387,12 @@
       }
     }
 
+    options.companion?.onClosed.addListener(state => {
+      serialize(async () => {
+        const current = openByWindow.get(state.windowId);
+        if (current?.instanceId === state.instanceId) await closeState(current, "native_window", true);
+      }).catch(reportError);
+    });
     api.tabs.onRemoved.addListener((tabId) => {
       serialize(async () => {
         optionsByTab.delete(tabId);

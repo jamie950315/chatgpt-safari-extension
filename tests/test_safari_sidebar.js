@@ -84,6 +84,24 @@ test("mounts the original side-chat page in the owning top frame", async () => {
   assert.equal(opened.length, 1, "opening an existing sidebar is idempotent");
 });
 
+test("background restoration rebinds only the actual native owner without opening UI", async () => {
+  const owner = { tabId: 11, windowId: 3, instanceId: "native-owner", path: "codex-work-sidepanel.html" };
+  const stale = { ...owner, windowId: 4, instanceId: "stale-owner" };
+  const calls = [];
+  const f = fixture({
+    savedState: { version: 1, openPanels: [stale, owner] },
+    companion: {
+      onClosed: event(),
+      async restore(states) { calls.push(states); return states.find(item => item.instanceId === owner.instanceId); },
+      async open() { assert.fail("Restoration must not reopen the native UI"); },
+    },
+  });
+  await f.adapter.ready;
+  assert.deepEqual(calls, [[stale, owner]]);
+  assert.deepEqual(f.storage.chatgptSafariSidebarStateV1.openPanels, [owner]);
+  assert.equal(f.messages.length, 0);
+});
+
 test("does not replace a restricted Safari page with a launcher", async () => {
   const f = fixture();
   f.tabs.get(11).url = "favorites://";

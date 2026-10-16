@@ -4,5 +4,22 @@
 <dict>
 	<key>SFSafariWebExtensionConverterVersion</key>
 	<string>27.1</string>
+	<key>CFBundleURLTypes</key>
+	<array>
+		<dict>
+			<key>CFBundleURLName</key>
+			<string>Safari companion</string>
+			<key>CFBundleURLSchemes</key>
+			<array>
+				<string>chatgpt-safari</string>
+			</array>
+			<key>CFBundleTypeRole</key>
+			<string>Viewer</string>
+		</dict>
+	</array>
+	<key>NSMicrophoneUsageDescription</key>
+	<string>Allow ChatGPT side chat to use your microphone when you start a voice conversation.</string>
+	<key>NSCameraUsageDescription</key>
+	<string>Allow ChatGPT side chat to use your camera when you choose a video feature.</string>
 </dict>
 </plist>

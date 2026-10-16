@@ -8,6 +8,8 @@ SOURCE = ROOT / "vendor/background.chrome.js"
 TARGET = ROOT / "safari/ChatGPT for Safari/ChatGPT for Safari Extension/Resources/background.js"
 
 REPLACEMENTS = {
+    'async function xv({reason:e}){e!=="install"||Mn(globalThis.navigator)==="opera"||await wt(Dv).catch(()=>!1)&&await chrome.tabs.create({active:!0,url:`${Ir}/work/extension/installed`})}':
+        ('async function xv(){}', 1),  # Setup belongs to the native Safari companion, not Chrome's installation page.
     'async function El(e,t){await oa(e,':
         ('async function El(e,t){if(!chrome.debugger)throw new Error("Safari browser control is unavailable: the desktop runtime requires a CDP debugger, which Safari does not expose.");await oa(e,', 1),
     'async function k_(e,t){await Pl(t,':
@@ -21,7 +23,7 @@ REPLACEMENTS = {
     'function nc(){chrome.action.onClicked.addListener':
         ('function nc(){if(globalThis.ChatGPTSafariSidebar)return;chrome.action.onClicked.addListener', 1),
     'const f=new av(t);if(r)':
-        ('const f=new av(t);globalThis.ChatGPTSafariNativeManager=f;if(r)', 1),
+        ('const f=new av(t);globalThis.ChatGPTSafariNativeManager=f;globalThis.ChatGPTSafariHooks={getInstanceId:Ce,getTabMentions:v=>l.getUserTabs(v)};if(r)', 1),
     'async function Fv(e){let t;const r=a=>{t=a,ga=ga.then(async()=>{if(e.aborted||a!==t||a.kind===ar?.kind)return;ar=void 0;const s=await ec(a);if(e.aborted||a!==t)return;const o=s?a:At;await wa(o,!0),ar=o}).catch(()=>{console.warn("Failed to update Chrome side panel destination.")})},i=await zv();if(!e.aborted){i?.kind==="work_sidepanel"&&await wa(i);try{await Rr(Ws,(a,s,o)=>{s==="Ready"?r(Zl(o==null||a)):t=void 0},e)}catch{r({kind:"waiting_room"})}}}':
         ('async function Fv(e){if(!e.aborted){await ec({kind:"work_sidepanel"});await wa({kind:"work_sidepanel"},!0)}}', 1),
     'family:this.browserFamily,name:Te[this.browserFamily].shortDisplayName,version:':
@@ -68,7 +70,7 @@ def sidebar_functions() -> str:
 
 if __name__ == "__main__":
     resources = TARGET.parent
-    adapters = ["native-transport.js", "diagnostics-background.js", "sidechat-preload-background.js", "sidebar-adapter.js", "session-windows.js"]
+    adapters = ["native-transport.js", "diagnostics-background.js", "sidechat-preload-background.js", "companion-background.js", "sidebar-adapter.js", "session-windows.js"]
     TARGET.write_text(sidebar_functions() + "\n".join((resources / "safari" / name).read_text() for name in adapters)
                       + "\n" + prepare(SOURCE.read_text()))
     origin = '(()=>{const u=new URL(chrome.runtime.getURL("/"));return u.protocol+"//"+u.host})()'

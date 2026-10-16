@@ -7,6 +7,10 @@
 	objects = {
 
 /* Begin PBXBuildFile section */
+		A03000400010001000100001 /* SideChatBridge.js in Resources */ = {isa = PBXBuildFile; fileRef = A03000400010001000100002 /* SideChatBridge.js */; };
+		A03000300010001000100001 /* SafariAutomation.swift in Sources */ = {isa = PBXBuildFile; fileRef = A03000300010001000100002 /* SafariAutomation.swift */; };
+		A03000200010001000100001 /* CompanionControlServer.swift in Sources */ = {isa = PBXBuildFile; fileRef = A03000200010001000100002 /* CompanionControlServer.swift */; };
+		A03000100010001000100001 /* SideChatCompanionController.swift in Sources */ = {isa = PBXBuildFile; fileRef = A03000100010001000100002 /* SideChatCompanionController.swift */; };
 		A02000100010001000100001 /* safari in Resources */ = {isa = PBXBuildFile; fileRef = A02000100010001000100002 /* safari */; };
 		A01000100010001000100001 /* diagnostics.html in Resources */ = {isa = PBXBuildFile; fileRef = A01000100010001000100002 /* diagnostics.html */; };
 		7D22E7F93081CAC000CD05F6 /* AppDelegate.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7D22E7F83081CAC000CD05F6 /* AppDelegate.swift */; };
@@ -59,6 +63,10 @@
 /* End PBXCopyFilesBuildPhase section */
 
 /* Begin PBXFileReference section */
+		A03000400010001000100002 /* SideChatBridge.js */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.javascript; path = "../../companion/SideChatBridge.js"; sourceTree = SOURCE_ROOT; };
+		A03000300010001000100002 /* SafariAutomation.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "../../native/SafariAutomation.swift"; sourceTree = SOURCE_ROOT; };
+		A03000200010001000100002 /* CompanionControlServer.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "../../companion/CompanionControlServer.swift"; sourceTree = SOURCE_ROOT; };
+		A03000100010001000100002 /* SideChatCompanionController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "../../companion/SideChatCompanionController.swift"; sourceTree = SOURCE_ROOT; };
 		A02000100010001000100002 /* safari */ = {isa = PBXFileReference; lastKnownFileType = folder; name = safari; path = Resources/safari; sourceTree = "<group>"; };
 		A01000100010001000100002 /* diagnostics.html */ = {isa = PBXFileReference; lastKnownFileType = text.html; name = diagnostics.html; path = Resources/diagnostics.html; sourceTree = "<group>"; };
 		7D22E7F53081CAC000CD05F6 /* ChatGPT for Safari.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = "ChatGPT for Safari.app"; sourceTree = BUILT_PRODUCTS_DIR; };
@@ -109,6 +117,10 @@
 			isa = PBXGroup;
 			children = (
 				7D22E7F73081CAC000CD05F6 /* ChatGPT for Safari */,
+				A03000400010001000100002 /* SideChatBridge.js */,
+				A03000300010001000100002 /* SafariAutomation.swift */,
+				A03000200010001000100002 /* CompanionControlServer.swift */,
+				A03000100010001000100002 /* SideChatCompanionController.swift */,
 				7D22E8143081CAC200CD05F6 /* ChatGPT for Safari Extension */,
 				7D22E7F63081CAC000CD05F6 /* Products */,
 			);
@@ -265,6 +277,7 @@
 				7D22E8083081CAC000CD05F6 /* Main.storyboard in Resources */,
 				7D22E8033081CAC000CD05F6 /* Script.js in Resources */,
 				7D22E7FD3081CAC000CD05F6 /* Main.html in Resources */,
+				A03000400010001000100001 /* SideChatBridge.js in Resources */,
 				7D22E80A3081CAC200CD05F6 /* Assets.xcassets in Resources */,
 				7D22E8013081CAC000CD05F6 /* Style.css in Resources */,
 			);
@@ -298,6 +311,9 @@
 			isa = PBXSourcesBuildPhase;
 			files = (
 				7D22E8053081CAC000CD05F6 /* ViewController.swift in Sources */,
+				A03000300010001000100001 /* SafariAutomation.swift in Sources */,
+				A03000200010001000100001 /* CompanionControlServer.swift in Sources */,
+				A03000100010001000100001 /* SideChatCompanionController.swift in Sources */,
 				7D22E7F93081CAC000CD05F6 /* AppDelegate.swift in Sources */,
 			);
 		};
@@ -537,7 +553,7 @@
 				CODE_SIGN_IDENTITY = "Apple Development";
 				COMBINE_HIDPI_IMAGES = YES;
 				CURRENT_PROJECT_VERSION = 11759;
-				ENABLE_APP_SANDBOX = YES;
+				ENABLE_APP_SANDBOX = NO;
 				ENABLE_HARDENED_RUNTIME = YES;
 				ENABLE_OUTGOING_NETWORK_CONNECTIONS = YES;
 				ENABLE_USER_SELECTED_FILES = readonly;
@@ -564,7 +580,6 @@
 				REGISTER_APP_GROUPS = YES;
 				STRING_CATALOG_GENERATE_SYMBOLS = YES;
 				SWIFT_APPROACHABLE_CONCURRENCY = YES;
-				SWIFT_DEFAULT_ACTOR_ISOLATION = MainActor;
 				SWIFT_EMIT_LOC_STRINGS = YES;
 				SWIFT_UPCOMING_FEATURE_MEMBER_IMPORT_VISIBILITY = YES;
 				SWIFT_VERSION = 5.0;
@@ -581,7 +596,7 @@
 				CODE_SIGN_IDENTITY = "Apple Development";
 				COMBINE_HIDPI_IMAGES = YES;
 				CURRENT_PROJECT_VERSION = 11759;
-				ENABLE_APP_SANDBOX = YES;
+				ENABLE_APP_SANDBOX = NO;
 				ENABLE_HARDENED_RUNTIME = YES;
 				ENABLE_OUTGOING_NETWORK_CONNECTIONS = YES;
 				ENABLE_USER_SELECTED_FILES = readonly;
@@ -608,7 +623,6 @@
 				REGISTER_APP_GROUPS = YES;
 				STRING_CATALOG_GENERATE_SYMBOLS = YES;
 				SWIFT_APPROACHABLE_CONCURRENCY = YES;
-				SWIFT_DEFAULT_ACTOR_ISOLATION = MainActor;
 				SWIFT_EMIT_LOC_STRINGS = YES;
 				SWIFT_UPCOMING_FEATURE_MEMBER_IMPORT_VISIBILITY = YES;
 				SWIFT_VERSION = 5.0;
