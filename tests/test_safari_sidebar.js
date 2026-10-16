@@ -19,7 +19,7 @@ function event() {
 }
 
 function fixture(options = {}) {
-  const messages = [], scripts = [], rules = [], storage = {};
+  const messages = [], scripts = [], rules = [], storage = {}, controllers = new Set();
   if (options.savedState) storage.chatgptSafariSidebarStateV1 = structuredClone(options.savedState);
   const tabs = new Map([
     [11, { id: 11, windowId: 3, url: "https://example.com/", active: true }],
@@ -44,17 +44,24 @@ function fixture(options = {}) {
         return [...tabs.values()].filter((tab) => (!query.active || tab.active)
           && (query.windowId == null || tab.windowId === query.windowId));
       },
-      async sendMessage(tabId, message, target) {
-        messages.push({ tabId, message, target });
-        const mountFails = typeof options.mountFails === "function"
-          ? options.mountFails(tabId, message) : options.mountFails;
-        if (mountFails && message.type === MESSAGE.mount) return { ok: false, error: "Mount rejected" };
-        return { ok: true, instanceId: message.instanceId };
-      },
+      async sendMessage() { assert.fail("Sidebar control must not use Safari tabs.sendMessage"); },
       onRemoved: event(),
       onActivated: event(),
     },
-    scripting: { async executeScript(args) { scripts.push(args); return []; } },
+    scripting: { async executeScript(args) {
+      scripts.push(args);
+      if (options.scriptFailure) throw new Error("Script rejected");
+      if (args.files) { controllers.add(args.target.tabId); return [{ frameId: 0 }]; }
+      if (args.func.name !== "callSidebarController") return [];
+      if (options.noAcknowledgement) return [];
+      if (!controllers.has(args.target.tabId)) return [{ frameId: 0, result: { ok: false, code: "SIDEBAR_CONTROLLER_MISSING" } }];
+      const message = args.args[0], tabId = args.target.tabId;
+      messages.push({ tabId, message, target: args.target });
+      const mountFails = typeof options.mountFails === "function"
+        ? options.mountFails(tabId, message) : options.mountFails;
+      return [{ frameId: 0, result: mountFails && message.type === MESSAGE.mount
+        ? { ok: false, error: "Mount rejected" } : { ok: true, instanceId: message.instanceId } }];
+    } },
     declarativeNetRequest: { async updateSessionRules(args) { rules.push(args); } },
     action: { onClicked: event() },
   };
@@ -76,13 +83,76 @@ test("mounts the original side-chat page in the owning top frame", async () => {
   const f = fixture(), opened = [];
   f.adapter.sidePanel.onOpened.addListener((value) => opened.push(value));
   await f.adapter.sidePanel.open({ tabId: 11 });
-  assert.deepEqual(f.scripts[0], { target: { tabId: 11, frameIds: [0] }, files: ["safari/sidebar-content.js"] });
+  assert.equal(f.scripts[0].func.name, "callSidebarController");
+  assert.deepEqual(f.scripts[1], { target: { tabId: 11, frameIds: [0] }, world: "ISOLATED", files: ["safari/sidebar-content.js"] });
   assert.equal(f.messages[0].message.iframeUrl, f.api.runtime.getURL("codex-work-sidepanel.html"));
-  assert.deepEqual(f.messages[0].target, { frameId: 0 });
+  assert.deepEqual(f.messages[0].target, { tabId: 11, frameIds: [0] });
   assert.deepEqual(opened, [{ windowId: 3, tabId: 11, path: "codex-work-sidepanel.html" }]);
   assert.equal(extensionOrigin(f.api.runtime), "safari-web-extension://test-extension");
   await f.adapter.sidePanel.open({ tabId: 11 });
   assert.equal(opened.length, 1, "opening an existing sidebar is idempotent");
+  assert.equal(f.scripts.filter(script => script.files).length, 1, "only an explicitly missing controller installs the bundle");
+});
+
+test("script errors and missing acknowledgements never install or replay a command", async () => {
+  for (const options of [{ scriptFailure: true }, { noAcknowledgement: true }]) {
+    const f = fixture(options);
+    await assert.rejects(f.adapter.sidePanel.open({ tabId: 11 }), /Script rejected|did not acknowledge/);
+    assert.equal(f.scripts.length, 1);
+    assert.deepEqual(f.storage.chatgptSafariSidebarStateV1.openPanels, []);
+  }
+});
+
+test("the embedded companion opens before mounting and only its owning wrapper can request relay data", async () => {
+  const calls = [];
+  const f = fixture({ companion: {
+    embedded: true, onClosed: event(),
+    async open(state) { calls.push(["open", state.instanceId]); },
+    async close(state) {
+      assert.equal(f.messages.at(-1).message.type, MESSAGE.unmount, "page layout is restored before companion ownership is released");
+      calls.push(["close", state.instanceId]);
+    },
+    async frameRequest(state, payload) { calls.push(["request", state.instanceId, payload]); return { ready: true }; },
+  } });
+  await f.adapter.sidePanel.open({ tabId: 11 });
+  const mounted = f.messages[0].message;
+  assert.equal(mounted.iframeUrl, f.api.runtime.getURL("embedded-sidechat.html"));
+  assert.equal(calls[0][0], "open");
+  const sender = { id: f.api.runtime.id, url: mounted.iframeUrl, tab: f.tabs.get(11), frameId: 7 };
+  const message = { type: MESSAGE.operation, tabId: 11, windowId: 3, instanceId: mounted.instanceId,
+    operation: "companionRequest", payload: { action: "connection" } };
+  assert.deepEqual(await f.request(message, sender), { ok: true, value: { ready: true } });
+  for (const wrong of [
+    { ...sender, url: f.api.runtime.getURL("codex-work-sidepanel.html") },
+    { ...sender, url: mounted.iframeUrl + "?owner=forged" },
+    { ...sender, tab: { ...sender.tab, windowId: 4 } },
+  ]) assert.equal((await f.request(message, wrong)).ok, false);
+  assert.equal(calls.filter(([kind]) => kind === "request").length, 1);
+  await f.adapter.sidePanel.close({ tabId: 11 });
+  assert.deepEqual(calls.map(([kind]) => kind), ["open", "request", "close"]);
+});
+
+test("embedded restoration remounts an authenticated owner without reopening the native UI", async () => {
+  const owner = { tabId: 11, windowId: 3, instanceId: "embedded-owner", path: "codex-work-sidepanel.html", width: 480 };
+  const f = fixture({ savedState: { version: 1, openPanels: [owner] }, companion: {
+    embedded: true, onClosed: event(), async restore() { return owner; },
+    async open() { assert.fail("Restore must not reopen the companion"); },
+  } });
+  await f.adapter.ready;
+  assert.equal(f.messages.length, 1);
+  assert.equal(f.messages[0].message.iframeUrl, f.api.runtime.getURL("embedded-sidechat.html"));
+  assert.equal(f.messages[0].message.instanceId, owner.instanceId);
+});
+
+test("a rejected embedded mount releases its native context instead of retaining an invisible owner", async () => {
+  const calls = [];
+  const f = fixture({ mountFails: true, companion: {
+    embedded: true, onClosed: event(),
+    async open() { calls.push("open"); }, async close() { calls.push("close"); },
+  } });
+  await assert.rejects(f.adapter.sidePanel.open({ tabId: 11 }), /Mount rejected/);
+  assert.deepEqual(calls, ["open", "close"]);
+  assert.deepEqual(f.storage.chatgptSafariSidebarStateV1.openPanels, []);
 });
 
 test("background restoration rebinds only the actual native owner without opening UI", async () => {
@@ -250,23 +320,57 @@ class FakeStyle {
   removeProperty(key) { this.values.delete(key); }
 }
 class FakeElement {
-  constructor(tag) { this.tagName = tag; this.style = new FakeStyle(); this.children = []; this.attributes = new Map(); }
+  constructor(tag) {
+    this.tagName = tag; this.style = new FakeStyle(); this.children = []; this.attributes = new Map();
+    this.nodeType = 1; this.isConnected = true; this.events = new Map();
+    this.computed = { position: "static", right: "auto", left: "auto", transform: "none" };
+    this.rect = { left: 0, width: 100 };
+  }
   setAttribute(key, value) { this.attributes.set(key, value); }
-  addEventListener() {}
-  append(...children) { this.children.push(...children); for (const child of children) child.parent = this; }
-  remove() { this.parent.children = this.parent.children.filter((child) => child !== this); }
+  addEventListener(name, callback) { this.events.set(name, callback); }
+  append(...children) { this.children.push(...children); for (const child of children) child.parentElement = this; }
+  remove() { this.isConnected = false; this.parentElement.children = this.parentElement.children.filter((child) => child !== this); }
   attachShadow(options) { this.shadowOptions = options; this.shadow = new FakeElement("shadow"); return this.shadow; }
+  getBoundingClientRect() {
+    const maximum = Number.parseFloat(this.style.getPropertyValue("max-width"));
+    const width = Number.isFinite(maximum) ? Math.min(this.rect.width, maximum) : this.rect.width;
+    const right = Number.parseFloat(this.style.getPropertyValue("right") || this.computed.right);
+    const overrideLeft = Number.parseFloat(this.style.getPropertyValue("left"));
+    const left = Number.isFinite(overrideLeft) ? overrideLeft
+      : Number.isFinite(right) ? 1280 - right - width : this.rect.left;
+    return { left, width, right: left + width };
+  }
 }
 function contentFixture() {
-  const document = { documentElement: new FakeElement("html"), createElement: (tag) => new FakeElement(tag) };
-  const listeners = new Map();
+  const document = {
+    documentElement: new FakeElement("html"), body: new FakeElement("body"), createElement: (tag) => new FakeElement(tag),
+    createTreeWalker(element) {
+      const pending = [...element.children];
+      return { nextNode() {
+        const next = pending.shift();
+        if (next) pending.unshift(...next.children);
+        return next || null;
+      } };
+    },
+  };
+  document.documentElement.append(document.body);
+  const listeners = new Map(), observers = [], timers = new Map();
   const page = {
     document, innerWidth: 1280,
+    setTimeout(callback) { const id = timers.size + 1; timers.set(id, callback); return id; },
+    clearTimeout(id) { timers.delete(id); },
+    MutationObserver: class { constructor(callback) { this.callback = callback; observers.push(this); } observe() {} disconnect() {} },
+    getComputedStyle(element) {
+      return { ...element.computed,
+        right: element.style.getPropertyValue("right") || element.computed.right,
+        left: element.style.getPropertyValue("left") || element.computed.left,
+      };
+    },
     addEventListener(type, listener) { listeners.set(type, listener); },
     removeEventListener(type) { listeners.delete(type); },
   };
   const runtime = { id: "test-extension", getURL: (file) => "safari-web-extension://test-extension/" + file.replace(/^\//, ""), onMessage: event(), async sendMessage() {} };
-  return { document, listeners, content: createSidebarContent({ runtime }, page) };
+  return { document, page, observers, timers, listeners, content: createSidebarContent({ runtime }, page) };
 }
 
 test("content mounts a private original-page frame and restores the page layout on close", () => {
@@ -277,7 +381,7 @@ test("content mounts a private original-page frame and restores the page layout 
     tabId: 11, windowId: 3, instanceId: "test-token", width: 420,
   };
   assert.deepEqual(f.content.mount(message), { ok: true, instanceId: "test-token" });
-  const host = f.document.documentElement.children[0];
+  const host = f.document.documentElement.children[1];
   assert.deepEqual(host.shadowOptions, { mode: "closed" });
   const frame = host.shadow.children[1].children[1];
   assert.equal(frame.src, message.iframeUrl);
@@ -285,7 +389,7 @@ test("content mounts a private original-page frame and restores the page layout 
   assert.equal(f.document.documentElement.style.getPropertyValue("width"), "calc(100% - 420px)");
   assert.equal(f.content.unmount("wrong-token"), false);
   assert.equal(f.content.unmount("test-token"), true);
-  assert.equal(f.document.documentElement.children.length, 0);
+  assert.equal(f.document.documentElement.children.length, 1);
   assert.equal(f.document.documentElement.style.getPropertyValue("width"), "98%");
 });
 
@@ -294,7 +398,7 @@ test("content rejects foreign origins and arbitrary extension resources", () => 
   for (const iframeUrl of ["https://evil.example/codex-work-sidepanel.html", "safari-web-extension://other/codex-work-sidepanel.html", "safari-web-extension://test-extension/background.js"]) {
     assert.throws(() => f.content.mount({ iframeUrl, tabId: 11, windowId: 3, instanceId: "token" }), /authorized ChatGPT extension page/);
   }
-  assert.equal(f.document.documentElement.children.length, 0);
+  assert.equal(f.document.documentElement.children.length, 1);
 });
 
 test("closing does not overwrite a width changed by the page while its sidebar was open", () => {
@@ -321,4 +425,102 @@ test("resizing preserves a newly observed page width for later restoration", () 
   f.content.unmount("token");
   assert.equal(f.document.documentElement.style.getPropertyValue("width"), "92%");
   assert.equal(f.document.documentElement.style.getPropertyPriority("width"), "");
+});
+
+test("embedded content reserves a bounded width, keeps viewport-fixed controls visible and restores authored styles", () => {
+  const f = contentFixture();
+  const composer = new FakeElement("form");
+  composer.computed = { position: "fixed", right: "16px", left: "auto", transform: "none" };
+  composer.rect.width = 600;
+  composer.style.setProperty("right", "16px");
+  const header = new FakeElement("header");
+  header.computed = { position: "fixed", right: "0px", left: "0px", transform: "none" };
+  header.rect.width = 1280;
+  header.style.setProperty("min-width", "1000px");
+  f.document.body.append(composer, header);
+  f.document.documentElement.style.setProperty("min-width", "900px");
+  const message = { iframeUrl: "safari-web-extension://test-extension/embedded-sidechat.html",
+    tabId: 11, windowId: 3, instanceId: "inline-owner", width: 420 };
+  f.content.mount(message);
+  assert.equal(composer.style.getPropertyValue("right"), "436px");
+  assert.equal(composer.getBoundingClientRect().right, 844);
+  assert.equal(header.style.getPropertyValue("max-width"), "860px");
+  assert.equal(header.style.getPropertyValue("min-width"), "0px");
+  assert.equal(f.document.documentElement.style.getPropertyValue("min-width"), "0px");
+  assert.equal(f.document.documentElement.style.getPropertyValue("margin-right"), "420px");
+  f.content.mount({ ...message, width: 700 });
+  assert.equal(composer.style.getPropertyValue("right"), "716px", "repeated mount updates layout without replacing the conversation frame");
+  composer.style.setProperty("right", "30px", "important");
+  f.content.unmount(message.instanceId);
+  assert.equal(composer.style.getPropertyValue("right"), "30px", "a newer authored inline value belongs to the page");
+  assert.equal(header.style.getPropertyValue("min-width"), "1000px");
+  assert.equal(header.style.getPropertyValue("max-width"), "");
+  assert.equal(f.document.documentElement.style.getPropertyValue("min-width"), "900px");
+  assert.equal(f.document.documentElement.style.getPropertyValue("margin-right"), "");
+});
+
+test("fixed controls in transformed containing blocks are not mistaken for viewport controls", () => {
+  const f = contentFixture(), container = new FakeElement("section"), fixed = new FakeElement("button");
+  container.computed.transform = "translateX(0)";
+  fixed.computed = { position: "fixed", right: "12px", left: "auto", transform: "none" };
+  container.append(fixed);
+  f.document.body.append(container);
+  f.content.mount({ iframeUrl: "safari-web-extension://test-extension/embedded-sidechat.html",
+    tabId: 11, windowId: 3, instanceId: "owner", width: 420 });
+  assert.equal(fixed.style.getPropertyValue("right"), "");
+  f.content.unmount("owner");
+});
+
+test("new fixed controls are compensated in bounded scans and narrow viewports keep page space", () => {
+  const f = contentFixture();
+  f.page.innerWidth = 600;
+  f.content.mount({ iframeUrl: "safari-web-extension://test-extension/embedded-sidechat.html",
+    tabId: 11, windowId: 3, instanceId: "owner", width: 700 });
+  assert.equal(f.document.documentElement.style.getPropertyValue("width"), "calc(100% - 320px)");
+  f.page.innerWidth = 1280;
+  f.listeners.get("resize")();
+  const added = new FakeElement("button");
+  added.computed = { position: "fixed", right: "8px", left: "auto", transform: "none" };
+  f.document.body.append(added);
+  f.observers[0].callback([{ type: "childList", addedNodes: [added] }]);
+  assert.equal(f.timers.size, 1);
+  [...f.timers.values()][0]();
+  assert.equal(added.style.getPropertyValue("right"), "328px");
+  f.content.unmount("owner");
+  assert.equal(added.style.getPropertyValue("right"), "");
+});
+
+test("sidebar dragging preserves the grab offset and its keyboard resize and close controls restore layout", () => {
+  const f = contentFixture();
+  f.content.mount({ iframeUrl: "safari-web-extension://test-extension/embedded-sidechat.html",
+    tabId: 11, windowId: 3, instanceId: "owner", width: 420 });
+  const host = f.document.documentElement.children[1], panel = host.shadow.children[1];
+  const handle = panel.children[2], frame = panel.children[1];
+  const pointer = { button: 0, clientX: 855, pointerId: 1, preventDefault() {} };
+  handle.events.get("pointerdown")(pointer);
+  handle.events.get("pointermove")(pointer);
+  assert.equal(host.style.getPropertyValue("width"), "420px");
+  handle.events.get("pointermove")({ ...pointer, clientX: 785 });
+  assert.equal(host.style.getPropertyValue("width"), "490px");
+  handle.events.get("pointerup")();
+  assert.equal(frame.style.pointerEvents, "");
+  handle.events.get("keydown")({ key: "ArrowRight", preventDefault() {} });
+  assert.equal(host.style.getPropertyValue("width"), "466px");
+  assert.equal(handle.attributes.get("aria-valuemax"), "720");
+  panel.children[0].children[1].children[1].events.get("click")();
+  assert.equal(f.document.documentElement.children.length, 1);
+  assert.equal(f.document.documentElement.style.getPropertyValue("width"), "");
+  assert.equal(f.listeners.has("resize"), false);
+});
+
+test("a failed layout mount removes its host and restores the original page", () => {
+  const f = contentFixture();
+  f.document.documentElement.style.setProperty("width", "95%");
+  f.page.getComputedStyle = () => { throw new Error("Layout unavailable"); };
+  assert.deepEqual(f.content.command({ type: MESSAGE.mount,
+    iframeUrl: "safari-web-extension://test-extension/embedded-sidechat.html",
+    tabId: 11, windowId: 3, instanceId: "owner", width: 420 }), { ok: false, error: "Layout unavailable" });
+  assert.equal(f.document.documentElement.children.length, 1);
+  assert.equal(f.document.documentElement.style.getPropertyValue("width"), "95%");
+  assert.equal(f.listeners.has("resize"), false);
 });

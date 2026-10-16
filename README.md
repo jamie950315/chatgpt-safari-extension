@@ -1,37 +1,43 @@
 # ChatGPT for Safari — native development port
 
-Click the **ChatGPT** toolbar button on an HTTP/HTTPS page to open native side
-chat beside Safari. Sign in once in that window. Its persistent WebKit profile
-is separate from ordinary Safari, so Safari cookies and existing tabs stay intact.
+Click the **ChatGPT** toolbar button on an HTTP/HTTPS page to open the original
+ChatGPT side chat inside that Safari window. Drag the divider to resize it;
+close the sidebar to restore the page's space.
 
 Open `dist/ChatGPT for Safari.app` to enable the extension in Safari Settings.
 This is a local Apple Development-signed build, not an official OpenAI Safari
 extension or a notarized release.
 
-## Side chat uses the original ChatGPT interface
+## Side chat shares the Safari window
 
-The containing app hosts the original
-`https://chatgpt.com/?surface=browser_side_chat` as a top-level WKWebView in an
-AppKit sidecar window. It does not embed a blocked ChatGPT iframe or remove CSP.
+A closed-shadow sidebar reserves page width and compensates viewport-fixed
+controls. Its extension-owned wrapper contains a separate, unprivileged local
+provider frame. The native HTTPS relay is adapted from Jamie's Margina project;
+provider scripts never run in the extension's privileged context.
+
+With the user's explicit authorization, the relay shares only the containing
+app's own minimal secure HTTP-only ChatGPT session in memory. An official
+session check must pass. It never reads Safari or Margina cookies, writes
+credentials to disk, or deletes the original app-owned WebKit profile.
 
 Safari's native tabs/scripting APIs provide the owning page, selected text, and
-tab-mention candidates. The original website's Chrome-only host boundary is
-replaced with a native connection that implements its context, submission,
-account, and invalidation contract. The website still constructs its own
-conversation requests.
+tab-mention candidates. An exact-parent, capability-bound MessageChannel adapts
+the original website's host boundary. Account and owner changes invalidate
+context. The original website still renders the conversation, composer, and
+constructs its own conversation requests.
 
-This adapter is bound to the inspected website deployment: runtime
-`633146.1f9c264032.js`, host factories `aH` and `Kxt`. A changed or already
-executed factory is reported as an adapter failure. Do not substitute a fake
-Chrome origin, alter `window.parent`, or silently fall back to an ordinary
-website launcher.
+Each fresh HTML response identifies its actual module runtime. The host adapter
+hooks the inspected `aH` and `Kxt` factories before original entry modules run;
+public module URLs must remain canonical so both use the same module instance.
+The relay forwards the actual browser User-Agent, retains script CSP protection,
+and narrowly adapts local framing/reporting directives. Never fake a Chrome
+origin, alter browser ancestry, strip CSP, or replace conversation requests.
 
-The macOS package uses Safari's supported **Manifest V2 persistent background
-page**, with the real `browserAction` toolbar API. The original Manifest V3
-service worker stopped answering cold-start side-chat requests. A persistent
-background fixes that lifecycle rather than requiring the user to reload chat.
-The preparation script preserves the original CSP literals, sandbox pages,
-resource inventory, and host-permission set in the version conversion.
+The macOS package uses a **Manifest V2 persistent background page**, with the
+real `browserAction` toolbar API. Safari's MV3 worker stopped answering
+cold-start side-chat requests. Preparation retains the sandbox and original
+host permissions, adding only the embedded wrapper resource and scoped local
+provider frame policy.
 
 ## Control existing Safari tabs and logins
 
@@ -71,7 +77,7 @@ an authenticated loopback channel.
 
 **Automation uses an isolated Safari session.** Its tabs and website logins are
 separate from ordinary Safari tabs. Enable Safari **Develop → Allow Remote
-Automation and External Agents** before using it. The native side-chat profile
+Automation and External Agents** before using it. The app-owned ChatGPT session
 is also separate from the automation profile.
 
 Use this separate backend for clean-session tests rather than existing logins.
@@ -95,12 +101,10 @@ tabs, or `safari_native` for isolated tests.
   the old document/snapshot was then rejected before input.
 - Safari → native messaging → XPC → signature-verified OpenAI host: protocol-2
   hello, desktop discovery, tab listing, and agent-tab creation passed.
-- Native side-chat guest and signed-in prompt/response passed. The original
-  signed-in UI attached selected text from the actual owning Safari page; a
-  prompt that did not contain the text received that exact text as its answer.
-  Closing and reopening the native window retained the conversation and login.
-  The installed persistent-background build also passed a cold launch and a
-  selected-text conversation without using Reload.
+- The former native sidecar passed signed-in conversation and owning-page
+  selection checks. The new embedded route has passed installed inline mount,
+  page reflow, fixed-control compensation, and official session validation.
+  Signed-in embedded conversation/context acceptance is still in progress.
 - Native MCP input, click, and link navigation passed through the signed
   companion. Both input and click events were trusted browser events.
 - A fresh Codex app-server client loaded 19 tools and called
@@ -109,8 +113,8 @@ tabs, or `safari_native` for isolated tests.
   `safari_native` and completed real page reading, input, button click, and link
   navigation through those tools, then closed its test tab and stopped its session.
 
-The background restores polling only for the native window's matching saved
-owner after a background reload; it does not reopen a window or restart a quit app.
+The background restores only the companion's matching saved owner. Closing the
+sidebar releases browser context while retaining its in-memory provider session.
 
 ## Build and focused checks
 
@@ -138,7 +142,8 @@ cookies, native message contents, or authorization tokens belong in logs or Git.
   preparation derives the persistent macOS manifest from it.
 - `scripts/prepare-safari.py`: exact upstream transformations.
 - `native/`: original-host XPC transport, companion client, Safari automation.
-- `companion/`: AppKit side chat, website host adapter, authenticated IPC.
+- `companion/`: embedded provider controller/relay, website host adapter,
+  app-owned sign-in profile, and authenticated IPC.
 - `automation/`: desktop MCP stdio entry point and configuration.
 - `safari/ChatGPT for Safari/`: containing app, extension, and Xcode project.
 

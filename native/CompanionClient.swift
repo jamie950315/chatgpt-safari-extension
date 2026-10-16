@@ -45,9 +45,9 @@ final class CompanionClient {
                 return
             }
             let action = command["action"] as? String
-            if action != "open" && action != "automation" && action != "live" {
+            if action != "open" && action != "embeddedOpen" && action != "automation" && action != "live" {
                 let running = !NSRunningApplication.runningApplications(withBundleIdentifier: "dev.jamie.chatgpt-safari").isEmpty
-                if action == "close" && !running { reply(["ok": true]); return }
+                if ["close", "embeddedClose"].contains(action ?? "") && !running { reply(["ok": true]); return }
                 reply(["ok": false, "error": ["code": running ? "COMPANION_UNAVAILABLE" : "COMPANION_NOT_RUNNING",
                     "message": running ? "The Safari companion control service is unavailable." : "The Safari companion was closed."]])
                 return

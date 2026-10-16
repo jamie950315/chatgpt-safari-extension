@@ -9,7 +9,7 @@
     "32": "images/icon32.png",
     "128": "images/icon128.png"
   },
-  "content_security_policy": "script-src 'self'; object-src 'none'; connect-src 'self' http://127.0.0.1:* http://localhost:* ws://127.0.0.1:* ws://localhost:* https://ab.chatgpt.com https://chatgpt.com https://api.openai.com https://api.openai.org https://*.blob.core.windows.net https://*.oaiusercontent.com https://*.s3.ap-northeast-1.amazonaws.com https://*.s3.ap-northeast-2.amazonaws.com https://*.s3.ap-south-1.amazonaws.com https://*.s3.ap-southeast-1.amazonaws.com https://*.s3.ap-southeast-2.amazonaws.com https://*.s3.ca-central-1.amazonaws.com https://*.s3.eu-central-1.amazonaws.com https://*.s3.eu-south-2.amazonaws.com https://*.s3.eu-west-1.amazonaws.com https://*.s3.eu-west-2.amazonaws.com https://*.s3.us-east-1.amazonaws.com https://*.s3.us-east-2.amazonaws.com https://*.s3.us-west-1.amazonaws.com; font-src 'self' https://cdn.openai.com;",
+  "content_security_policy": "script-src 'self'; object-src 'none'; connect-src 'self' http://127.0.0.1:* http://localhost:* ws://127.0.0.1:* ws://localhost:* https://ab.chatgpt.com https://chatgpt.com https://api.openai.com https://api.openai.org https://*.blob.core.windows.net https://*.oaiusercontent.com https://*.s3.ap-northeast-1.amazonaws.com https://*.s3.ap-northeast-2.amazonaws.com https://*.s3.ap-south-1.amazonaws.com https://*.s3.ap-southeast-1.amazonaws.com https://*.s3.ap-southeast-2.amazonaws.com https://*.s3.ca-central-1.amazonaws.com https://*.s3.eu-central-1.amazonaws.com https://*.s3.eu-south-2.amazonaws.com https://*.s3.eu-west-1.amazonaws.com https://*.s3.eu-west-2.amazonaws.com https://*.s3.us-east-1.amazonaws.com https://*.s3.us-east-2.amazonaws.com https://*.s3.us-west-1.amazonaws.com; font-src 'self' https://cdn.openai.com; frame-src 'self' https://chatgpt.com http://*.localhost:*;",
   "minimum_chrome_version": "116",
   "permissions": [
     "alarms",
@@ -53,7 +53,8 @@
   "web_accessible_resources": [
     "images/cursor-chat.png",
     "codex-work-sidepanel.html",
-    "diagnostics.html"
+    "diagnostics.html",
+    "embedded-sidechat.html"
   ],
   "background": {
     "scripts": [

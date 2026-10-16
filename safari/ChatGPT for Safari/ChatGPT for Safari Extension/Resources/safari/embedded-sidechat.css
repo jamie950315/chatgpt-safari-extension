@@ -1,0 +1,5 @@
+:root { color-scheme: light dark; font: 14px -apple-system, BlinkMacSystemFont, sans-serif; }
+html, body, #surface { width: 100%; height: 100%; margin: 0; overflow: hidden; background: light-dark(#fff, #212121); }
+#status { padding: 28px 22px; line-height: 1.5; color: light-dark(#555, #ccc); }
+#status[role="alert"] { color: light-dark(#a82929, #ffb4ab); }
+iframe { width: 100%; height: 100%; border: 0; display: block; }

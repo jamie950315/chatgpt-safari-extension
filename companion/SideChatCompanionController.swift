@@ -206,7 +206,8 @@ final class SideChatCompanionController: NSObject, WKScriptMessageHandlerWithRep
         waiting.translatesAutoresizingMaskIntoConstraints = false
         root.addSubview(waiting)
         let config = WKWebViewConfiguration()
-        // A persistent app-owned profile; Safari cookies are never imported or exported.
+        // Persistent app-owned profile. Embedded chat may share its authorized minimal
+        // session in memory; Safari/Margina profiles remain independent.
         config.websiteDataStore = .default()
         config.userContentController.addScriptMessageHandler(self, contentWorld: .page, name: "chatgptSidechat")
         if let scriptURL = Bundle.main.url(forResource: "SideChatBridge", withExtension: "js"),

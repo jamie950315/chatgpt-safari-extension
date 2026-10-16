@@ -28,9 +28,9 @@ class SafariPreparationTests(unittest.TestCase):
         self.assertEqual(result["browser_action"], original["action"])
         self.assertEqual(result["commands"]["_execute_browser_action"], original["commands"]["_execute_action"])
         self.assertEqual(result["content_scripts"], original["content_scripts"])
-        self.assertEqual(result["content_security_policy"], original["content_security_policy"]["extension_pages"])
+        self.assertEqual(result["content_security_policy"], original["content_security_policy"]["extension_pages"] + " frame-src 'self' https://chatgpt.com http://*.localhost:*;")
         self.assertEqual(result["sandbox"]["content_security_policy"], original["content_security_policy"]["sandbox"])
-        self.assertEqual(result["web_accessible_resources"], [r for group in original["web_accessible_resources"] for r in group["resources"]])
+        self.assertEqual(result["web_accessible_resources"], [r for group in original["web_accessible_resources"] for r in group["resources"]] + ["embedded-sidechat.html"])
 
     def test_changed_upstream_fails_instead_of_silently_skipping_a_guard(self):
         source = module.SOURCE.read_text().replace("chrome.debugger.onDetach.addListener", "changed")

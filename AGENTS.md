@@ -8,16 +8,24 @@ This is a development-signed conversion of Chrome extension 1.26.1005.11759.
 
 ## Current implementation
 
-- The production toolbar uses an AppKit sidecar with a top-level ChatGPT
-  WKWebView in a key-capable nonactivating panel. Its profile persists
-  independently of Safari; never import cookies.
-  The old content-sidebar source remains as preserved tested infrastructure,
-  not the production route.
-- `companion/SideChatBridge.js` replaces the inspected website's Chrome-only
-  host boundary (`aH` and `Kxt`, runtime `633146.1f9c264032.js`). Keep exact
-  deployment checks, real origin/WebView identity, account scope, and owner
-  invalidation. Do not fake Chrome origins or browser ancestry, strip CSP, or
-  replace the original conversation UI/request construction.
+- The production toolbar mounts a closed-shadow page sidebar, extension wrapper,
+  and isolated local provider iframe inside the Safari window. Never replace it
+  with a floating AppKit panel. Preserve root reflow, fixed-control compensation,
+  and authored-style restoration on close; use acknowledged isolated scripting,
+  not unreliable tabs.sendMessage delivery.
+- `companion/relay/` is a provider-only HTTPS relay adapted from Margina. Keep its
+  loopback/Host/Origin/capability, framing, MIME, redirect, and streaming checks.
+  Provider scripts never execute in the privileged extension wrapper.
+- Explicit user authorization permits memory-only sharing of this app's own
+  minimal secure HTTP-only ChatGPT session after an official session probe.
+  Never read Safari/Margina cookies, persist credentials, or delete the original
+  app-owned WebKit profile. The old native view remains for its sign-in profile.
+- `companion/SideChatBridge.js` adapts the original host boundary (`aH` and `Kxt`).
+  Resolve the runtime from fresh HTML, install before original entry execution,
+  and preserve canonical public module URLs (including known async chunks).
+  Forward the actual browser User-Agent. Keep exact real frame/parent identity,
+  account scope, and owner invalidation. Do not fake Chrome ancestry, strip CSP,
+  or replace the original conversation UI/request construction.
 - `native/BridgeService.swift` handles the signed extension's native messages.
   The original OpenAI host transport and companion operations are separate.
   Keep XPC client, process signing, and precise origin checks; never log native
@@ -49,7 +57,7 @@ This is a development-signed conversion of Chrome extension 1.26.1005.11759.
   an error that invites repeating a delivered navigation.
 - `Resources/safari/sidebar-adapter.js` is the sole toolbar/sidebar state owner.
   Its companion binding brokers real Safari context/selection/tab mentions and
-  releases ownership when the native window closes.
+  releases ownership when the inline sidebar closes.
 - The macOS manifest uses a persistent MV2 background document. MV3's worker
   stalled cold-start context requests in installed Safari. Derive the manifest
   from `vendor/manifest.safari-input.json`, preserve CSP/permissions/resources,
@@ -66,8 +74,10 @@ Build with `./scripts/build-safari.sh`; output is
 and team `N3JN8G9YWK`. The app is Universal, not notarized. The containing app is
 unsandboxed for its native runtime; the Safari extension stays sandboxed.
 
-Native hello, desktop discovery/tab listing/creation, guest and signed-in side
-chat, and actual owning-page selection passed. The original signed-in UI
+Native hello, desktop discovery/tab listing/creation, former native side chat,
+and actual owning-page selection passed. Embedded-route installed mount/reflow
+and official session validation passed; its signed-in conversation/context
+acceptance is still in progress. The original signed-in UI
 answered with selected text that was absent from the prompt, including after
 a cold launch without Reload. Closing/reopening the sidecar retained the
 conversation. Real Safari-native input/click/navigation passed; a fresh Codex

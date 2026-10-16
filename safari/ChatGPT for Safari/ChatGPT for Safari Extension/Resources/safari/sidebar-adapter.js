@@ -16,7 +16,15 @@
     "codex-work-sidepanel.html",
     "waiting-room.html",
     "side-panel-loading.html",
+    "embedded-sidechat.html",
   ]);
+
+  // This function is serialized by Safari into the owning isolated world.
+  function callSidebarController(message) {
+    const controller = globalThis.__chatgptSafariSidebarContent;
+    if (!controller) return { ok: false, code: "SIDEBAR_CONTROLLER_MISSING" };
+    return controller.command(message);
+  }
 
   function integer(value, label) {
     if (!Number.isSafeInteger(value) || value < 0) {
@@ -52,6 +60,8 @@
     const openByWindow = new Map();
     const optionsByTab = new Map();
     const mediaTabs = new Map();
+    const embedded = options.companion?.embedded === true;
+    const usesContent = !options.companion || embedded;
     let defaults = { enabled: true, path: "codex-work-sidepanel.html" };
     let panelBehavior = { openPanelOnActionClick: false };
     let queue = Promise.resolve();
@@ -78,9 +88,13 @@
         let restored;
         try { restored = await options.companion.restore(Array.from(openByWindow.values())); }
         catch (error) { reportError(error); }
-        // The native companion has one window. Retain only its authenticated owner.
+        // The companion retains one authenticated context owner.
         for (const [windowId, state] of openByWindow) {
           if (state.instanceId !== restored?.instanceId) openByWindow.delete(windowId);
+          else if (embedded) {
+            try { await mountContent(state); }
+            catch (error) { openByWindow.delete(windowId); reportError(error); }
+          }
         }
         await save();
       }
@@ -128,33 +142,55 @@
       return tab;
     }
 
-    async function mount(state) {
-      if (options.companion) return options.companion.open(state);
-      await api.scripting.executeScript({
-        target: { tabId: state.tabId, frameIds: [0] },
-        files: ["safari/sidebar-content.js"],
+    async function contentCommand(state, message, installIfMissing) {
+      const target = { tabId: state.tabId, frameIds: [0] };
+      const execute = () => api.scripting.executeScript({
+        target, world: "ISOLATED", func: callSidebarController, args: [message],
       });
-      const result = await api.tabs.sendMessage(state.tabId, {
+      let entries = await execute();
+      let result = entries?.find(entry => entry.frameId === 0)?.result;
+      if (result?.code === "SIDEBAR_CONTROLLER_MISSING" && installIfMissing) {
+        await api.scripting.executeScript({ target, world: "ISOLATED", files: ["safari/sidebar-content.js"] });
+        entries = await execute();
+        result = entries?.find(entry => entry.frameId === 0)?.result;
+      }
+      if (result?.ok !== true || result.instanceId !== state.instanceId) {
+        throw new Error(result?.error || "Safari did not acknowledge the owning sidebar command");
+      }
+      return result;
+    }
+
+    async function mountContent(state) {
+      return contentCommand(state, {
         type: MESSAGE.mount,
-        iframeUrl: api.runtime.getURL(state.path),
+        iframeUrl: api.runtime.getURL(embedded ? "embedded-sidechat.html" : state.path),
         tabId: state.tabId,
         windowId: state.windowId,
         instanceId: state.instanceId,
         width: state.width,
-      }, { frameId: 0 });
-      if (result?.ok !== true || result.instanceId !== state.instanceId) {
-        throw new Error(result?.error || "Safari did not mount the sidebar in the owning tab");
+      }, true);
+    }
+
+    async function unmountContent(state) {
+      return contentCommand(state, { type: MESSAGE.unmount, instanceId: state.instanceId }, false);
+    }
+
+    async function mount(state) {
+      if (options.companion) await options.companion.open(state);
+      if (!usesContent) return;
+      try { await mountContent(state); }
+      catch (error) {
+        if (embedded) {
+          try { await options.companion.close(state); }
+          catch (closeError) { throw new AggregateError([error, closeError], "The embedded sidebar could not release its failed owner"); }
+        }
+        throw error;
       }
     }
 
     async function closeState(state, reason, alreadyUnmounted = false) {
+      if (usesContent && !alreadyUnmounted) await unmountContent(state);
       if (options.companion) await options.companion.close(state);
-      else if (!alreadyUnmounted) {
-        const result = await api.tabs.sendMessage(state.tabId, {
-          type: MESSAGE.unmount, instanceId: state.instanceId,
-        }, { frameId: 0 });
-        if (result?.ok !== true) throw new Error("Safari did not close the sidebar in the owning tab");
-      }
       const created = mediaTabs.get(state.instanceId);
       if (created) {
         mediaTabs.delete(state.instanceId);
@@ -189,7 +225,7 @@
       } catch (error) {
         if (!existing) {
           openByWindow.delete(windowId);
-              await save();
+          await save();
         } else if (previousPath !== state.path) {
           state.path = previousPath;
           await save();
@@ -289,9 +325,9 @@
       if (message.type === MESSAGE.authorize || message.type === MESSAGE.operation) {
         (async () => {
           await ready;
-          const expectedUrl = api.runtime.getURL("codex-work-sidepanel.html");
+          const expectedUrl = api.runtime.getURL(embedded ? "embedded-sidechat.html" : "codex-work-sidepanel.html");
           const state = openByWindow.get(message.windowId);
-          if (sender.url !== expectedUrl || sender.tab?.id !== message.tabId
+          if (sender.url !== expectedUrl || sender.tab?.id !== message.tabId || sender.tab?.windowId !== message.windowId
             || state?.tabId !== message.tabId || state.instanceId !== message.instanceId) {
             throw new Error("This frame does not own an active Safari sidebar");
           }
@@ -326,6 +362,11 @@
 
     async function performFrameOperation(state, tab, operation, payload = {}) {
       switch (operation) {
+      case "companionRequest":
+        if (!embedded || typeof options.companion.frameRequest !== "function") {
+          throw new Error("The embedded ChatGPT companion is unavailable");
+        }
+        return options.companion.frameRequest(state, payload);
       case "getOwner":
         if (payload.tabId !== state.tabId) throw new Error("The sidebar can only read its owning tab");
         return tab;
@@ -391,7 +432,7 @@
     options.companion?.onClosed.addListener(state => {
       serialize(async () => {
         const current = openByWindow.get(state.windowId);
-        if (current?.instanceId === state.instanceId) await closeState(current, "native_window", true);
+        if (current?.instanceId === state.instanceId) await closeState(current, "native_window", !embedded);
       }).catch(reportError);
     });
     api.tabs.onRemoved.addListener((tabId) => {
@@ -423,7 +464,7 @@
       }).catch(reportError);
     });
 
-    return { sidePanel, ready, messages: MESSAGE, origin: extensionOrigin(api.runtime) };
+    return { sidePanel, ready, mountContent, unmountContent, messages: MESSAGE, origin: extensionOrigin(api.runtime) };
   }
 
   const exported = { createSidebarAdapter, extensionOrigin, MESSAGE };

@@ -32,6 +32,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 self.automation.handle(action, reply: reply)
             } else if ["live", "livePoll", "liveResolve", "liveInput"].contains(command["action"] as? String ?? ""), let self {
                 self.live.handle(command, reply: reply)
+            } else if (command["action"] as? String)?.hasPrefix("embedded") == true {
+                EmbeddedSideChatController.shared.handle(command: command, reply: reply)
             } else {
                 SideChatCompanionController.shared.handle(command: command, reply: reply)
             }
@@ -71,6 +73,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationWillTerminate(_ notification: Notification) {
+        EmbeddedSideChatController.shared.stop()
         automation.close()
         live.close()
         companionServer.stop()

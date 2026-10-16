@@ -71,12 +71,12 @@ def prepare_manifest(original: dict) -> dict:
     policy = manifest["content_security_policy"]
     if set(policy) != {"extension_pages", "sandbox"}:
         raise ValueError("Unexpected upstream content security policies")
-    manifest["content_security_policy"] = policy["extension_pages"]
+    manifest["content_security_policy"] = policy["extension_pages"] + " frame-src 'self' https://chatgpt.com http://*.localhost:*;"
     manifest["sandbox"]["content_security_policy"] = policy["sandbox"]
     resources = manifest["web_accessible_resources"]
     if not all(set(group) == {"matches", "resources"} and group["matches"] == ["<all_urls>"] for group in resources):
         raise ValueError("A scoped web-accessible resource group cannot be flattened")
-    manifest["web_accessible_resources"] = [resource for group in resources for resource in group["resources"]]
+    manifest["web_accessible_resources"] = [resource for group in resources for resource in group["resources"]] + ["embedded-sidechat.html"]
     return manifest
 
 

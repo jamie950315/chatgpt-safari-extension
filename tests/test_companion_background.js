@@ -2,13 +2,13 @@ const test = require("node:test");
 const assert = require("node:assert/strict");
 const { createCompanion } = require("../safari/ChatGPT for Safari/ChatGPT for Safari Extension/Resources/safari/companion-background.js");
 
-function fixture() {
+function fixture(options = {}) {
   const tab = { id: 11, windowId: 3, url: "https://example.com/", status: "complete" };
   const calls = [], scripts = [];
   let afterCapture;
   let response = { ok: true, requests: [] };
   const api = {
-    runtime: { async sendNativeMessage(_, value) { calls.push(value.command); return typeof response === "function" ? response(value.command) : response; } },
+    runtime: { getURL: path => "safari-web-extension://actual-owner" + path, async sendNativeMessage(_, value) { calls.push(value.command); return typeof response === "function" ? response(value.command) : response; } },
     tabs: { async get() { return { ...tab }; }, onUpdated: { addListener() {} } },
     windows: { async get() { return { left: 100, top: 100, width: 1000, height: 800 }; } },
     scripting: { async executeScript(value) { scripts.push(value); afterCapture?.(); return [{ documentId: "doc", result: { selectedText: "selected test text", revision: 2 } }]; } },
@@ -17,7 +17,7 @@ function fixture() {
     ChatGPTSafariHooks: { async getInstanceId() { return "browser-instance"; }, async getTabMentions() { return [{ id: 11, title: "Test" }]; } },
     ChatGPTSafariSidebarFunctions: { selection() {}, removeSelection() {} },
   };
-  return { api, tab, calls, scripts, binding: createCompanion(api, environment), setAfterCapture(value) { afterCapture = value; }, setResponse(value) { response = value; } };
+  return { api, tab, calls, scripts, binding: createCompanion(api, environment, options), setAfterCapture(value) { afterCapture = value; }, setResponse(value) { response = value; } };
 }
 const owner = { tabId: 11, windowId: 3, instanceId: "owner-token" };
 
@@ -102,4 +102,23 @@ test("native requests reject stale owners, moved/private tabs, and navigation du
     await assert.rejects(f.binding.context(owner, true), /changed during selection/);
     await assert.rejects(f.binding.handleRequest(owner, { ownerToken: owner.instanceId, method: "openInBrowser", params: { url: "https://evil.example/" } }), /Only ChatGPT/);
   } finally { await f.binding.close(owner); }
+});
+
+test("embedded frames use the relay lifecycle and retain owner-bound browser authority", async () => {
+  const f = fixture({ embedded: true });
+  f.setResponse(command => ({ ok: true, requests: [], ...(command.action === "embeddedEntry"
+    ? { entry: { providerURL: "test-entry", bridgeToken: "test-token" } } : {}) }));
+  await f.binding.open(owner);
+  try {
+    assert.equal(f.binding.embedded, true);
+    assert.equal(f.calls[0].action, "embeddedOpen");
+    assert.equal(f.calls[0].parentExtensionOrigin, "safari-web-extension://actual-owner");
+    assert.equal(f.calls.some(call => call.action === "open"), false);
+    assert.deepEqual(await f.binding.frameRequest(owner, { operation: "entry" }), { providerURL: "test-entry", bridgeToken: "test-token" });
+    const context = await f.binding.frameRequest(owner, { operation: "host", method: "context", params: { includeSelection: true } });
+    assert.equal(context.context.selectedText, "selected test text");
+    await assert.rejects(f.binding.frameRequest({ ...owner, instanceId: "old" }, { operation: "entry" }), /owner has changed/);
+    await assert.rejects(f.binding.frameRequest(owner, { operation: "host", method: "execute", params: {} }), /Unknown native/);
+  } finally { await f.binding.close(owner); }
+  assert.equal(f.calls.at(-1).action, "embeddedClose");
 });

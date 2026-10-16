@@ -8,6 +8,7 @@ class MockCustomEvent extends MockEvent {}
 function fixture(options = {}) {
   const listeners = new Map(), documentListeners = new Map(), attributes = new Map();
   const requests = [], messages = [], events = [];
+  const actualOrigin = options.relay ? "http://chatgpt-provider-test.localhost:1234" : "https://chatgpt.com";
   const on = (map, type, callback) => { if (!map.has(type)) map.set(type, []); map.get(type).push(callback); };
   const off = (map, type, callback) => map.set(type, (map.get(type) || []).filter(item => item !== callback));
   const emit = (map, event) => { for (const callback of map.get(event.type) || []) callback(event); };
@@ -28,9 +29,20 @@ function fixture(options = {}) {
   };
   window.top = window;
   window.parent = window;
+  if (options.relay) {
+    window.top = {};
+    window.parent = { postMessage: (data, origin) => messages.push({ data, targetOrigin: origin }) };
+    window.ChatGPTSafariProviderRelay = {
+      providerOrigin: actualOrigin, parentExtensionOrigin: "safari-web-extension://actual-owner",
+      bridgeToken: "test-owner-token-at-least-32-characters", runtimeURL: "https://chatgpt.com/cdn/assets/633146.c3403bd103.js",
+      report: async () => {},
+      importURL: value => value.replace("https://chatgpt.com", actualOrigin),
+      upstreamURL: value => value.replace(actualOrigin, "https://chatgpt.com"),
+    };
+  }
   window.postMessage = (data, targetOrigin) => {
     messages.push({ data, targetOrigin });
-    emit(listeners, { type: "message", data, source: window, origin: "https://chatgpt.com", isTrusted: true });
+    emit(listeners, { type: "message", data, source: window, origin: actualOrigin, isTrusted: true });
   };
   const document = {
     documentElement: {
@@ -39,13 +51,15 @@ function fixture(options = {}) {
     },
     addEventListener: (type, callback) => on(documentListeners, type, callback),
   };
-  const sandbox = { window, document, location: { origin: "https://chatgpt.com", href: "https://chatgpt.com/?surface=browser_side_chat" },
-    URL, Event: MockEvent, CustomEvent: MockCustomEvent, Date, console, setTimeout, clearTimeout,
+  const sandbox = { window, document, location: { origin: actualOrigin, href: actualOrigin + "/?surface=browser_side_chat" },
+    URL, Event: MockEvent, CustomEvent: MockCustomEvent, Date, console: { ...console }, setTimeout, clearTimeout, setInterval, clearInterval, queueMicrotask,
     crypto: require("node:crypto").webcrypto, __testRuntime: options.runtime };
-  const runtimeImport = 'import("https://chatgpt.com/cdn/assets/633146.1f9c264032.js")';
+  const runtimeImport = 'import(relayMode ? relay.importURL(runtimeURL) : runtimeURL)';
   const input = options.runtime ? source.replace(runtimeImport, "Promise.resolve({ __webpack_require__: globalThis.__testRuntime })") : source;
   vm.runInNewContext(input, sandbox);
   return { window, document, requests, messages, events, attributes,
+    ready: sandbox.__CHATGPT_SAFARI_ADAPTER_READY__,
+    emitMessage: event => emit(listeners, { type: "message", ...event }),
     gesture: trusted => emit(documentListeners, new MockEvent("pointerdown", { isTrusted: trusted })) };
 }
 const flush = () => new Promise(resolve => setImmediate(resolve));
@@ -65,6 +79,43 @@ test("top-level side chat routes original context and capability messages withou
   f.window.postMessage({ type: "unrelated", value: "ordinary message" }, "https://chatgpt.com");
   assert.equal(f.messages.at(-1).data.value, "ordinary message");
   assert.equal(f.requests.length, 2);
+});
+
+test("isolated provider uses its real parent/origin and a capability-bound channel", async () => {
+  const runtime = { m: {}, c: {}, d(exports, getters) {
+    for (const [name, get] of Object.entries(getters)) Object.defineProperty(exports, name, { get });
+  } };
+  const f = fixture({ relay: true, runtime });
+  await f.ready;
+  const relay = f.window.ChatGPTSafariProviderRelay;
+  const sent = [];
+  const port = { postMessage: value => sent.push(value), close() {} };
+  const connect = { source: f.window.parent, origin: relay.parentExtensionOrigin,
+    data: { type: "chatgpt-safari-provider:connect", token: relay.bridgeToken }, ports: [port] };
+  f.emitMessage({ ...connect, origin: "https://unrelated.example" });
+  assert.equal(port.onmessage, undefined);
+  f.emitMessage({ ...connect, origin: "safari-web-extension://ACTUAL-OWNER" });
+  assert.equal(typeof port.onmessage, "function");
+  assert.equal(sent[0].type, "ready");
+  assert.equal(f.messages.length, 0);
+  runtime.m.aH = (module, exports, require) => require.d(exports, { a: () => () => undefined });
+  runtime.m.Kxt = () => {};
+  const originExports = {}, connectionExports = {};
+  runtime.m.aH({}, originExports, runtime);
+  assert.equal(originExports.a(f.window), relay.parentExtensionOrigin);
+  assert.equal(originExports.a(f.window.parent), undefined);
+  runtime.m.Kxt({}, connectionExports, runtime);
+  const connection = new connectionExports.BrowserSideChatConnection({ pageWindow: f.window, getAuthScope: () => "account-a" });
+  const waiting = connection.getContext();
+  await flush();
+  const request = sent.find(value => value.method === "context");
+  assert.ok(request);
+  port.onmessage({ data: { type: "reply", id: request.id,
+    result: { context: { instanceId: "browser-a", tabId: 10, windowId: 20, url: "https://example.com" } } } });
+  assert.equal((await waiting).tabId, 10);
+  assert.equal(f.requests.length, 0);
+  connection.dispose();
+  f.window.dispatchEvent(new MockEvent("pagehide"));
 });
 test("tab mentions require a recent trusted gesture and publish the upstream temporary DOM contract", async () => {
   const f = fixture();

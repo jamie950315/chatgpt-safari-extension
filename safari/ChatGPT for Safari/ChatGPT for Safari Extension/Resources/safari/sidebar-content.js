@@ -1,46 +1,162 @@
-/* Mount the upstream ChatGPT side panel inside its owning Safari page. */
+/* Mount ChatGPT in its owning Safari page without a separate native window. */
 (function (root) {
   "use strict";
   const TYPE = "chatgpt-safari-sidebar:";
   const BOOTSTRAP_PREFIX = "chatgpt-safari-sidebar:";
-  const PATHS = new Set(["/codex-work-sidepanel.html", "/waiting-room.html", "/side-panel-loading.html"]);
+  const PATHS = new Set(["/codex-work-sidepanel.html", "/waiting-room.html", "/side-panel-loading.html", "/embedded-sidechat.html"]);
+
+  // Like Margina, reserve root width and adjust viewport-fixed controls rather
+  // than wrapping the body, which would change sticky/fixed containing blocks.
+  function createFixedLayout(document, page) {
+    const candidates = new Set(), changed = new Map(), scans = [];
+    let reserved = 0, timer;
+    function restore() {
+      for (const [element, properties] of changed) {
+        for (const [name, item] of properties) {
+          if (element.style.getPropertyValue(name) !== item.applied
+            || element.style.getPropertyPriority(name) !== "important") continue;
+          if (item.value) element.style.setProperty(name, item.value, item.priority);
+          else element.style.removeProperty(name);
+        }
+      }
+      changed.clear();
+    }
+    function set(element, name, value) {
+      let properties = changed.get(element);
+      if (!properties) changed.set(element, properties = new Map());
+      if (!properties.has(name)) properties.set(name, {
+        value: element.style.getPropertyValue(name), priority: element.style.getPropertyPriority(name), applied: value,
+      });
+      else properties.get(name).applied = value;
+      element.style.setProperty(name, value, "important");
+      properties.get(name).applied = element.style.getPropertyValue(name);
+    }
+    function enqueue(element) {
+      if (!element || element.nodeType !== 1) return;
+      candidates.add(element);
+      for (let parent = element; parent; parent = parent.parentElement) {
+        if (scans.some(scan => scan.root === parent)) return;
+      }
+      for (let index = scans.length - 1; index >= 0; index--) {
+        for (let parent = scans[index].root.parentElement; parent; parent = parent.parentElement) {
+          if (parent === element) { scans.splice(index, 1); break; }
+        }
+      }
+      scans.push({ root: element, walker: document.createTreeWalker(element, 1) });
+    }
+    function schedule() {
+      if (!reserved || timer != null) return;
+      timer = page.setTimeout(() => { timer = undefined; refresh(); }, 50);
+    }
+    const observer = new page.MutationObserver(records => {
+      for (const record of records) {
+        if (record.type === "attributes") enqueue(record.target);
+        else for (const node of record.addedNodes) enqueue(node);
+      }
+      schedule();
+    });
+    function viewportFixed(element) {
+      for (let parent = element.parentElement; parent; parent = parent.parentElement) {
+        const style = page.getComputedStyle(parent);
+        if ((style.transform && style.transform !== "none") || (style.perspective && style.perspective !== "none")
+          || (style.filter && style.filter !== "none") || /paint|layout|strict|content/.test(style.contain || "")
+          || /transform|perspective|filter/.test(style.willChange || "")) return false;
+      }
+      return true;
+    }
+    function refresh() {
+      observer.disconnect();
+      restore();
+      let budget = 350;
+      while (scans.length && budget > 0) {
+        const element = scans[0].walker.nextNode();
+        if (!element) { scans.shift(); continue; }
+        budget--;
+        if (page.getComputedStyle(element).position === "fixed") candidates.add(element);
+      }
+      const available = Math.max(1, page.innerWidth - reserved);
+      for (const element of candidates) {
+        if (!element.isConnected) { candidates.delete(element); continue; }
+        const style = page.getComputedStyle(element);
+        if (style.position !== "fixed") { candidates.delete(element); continue; }
+        if (!viewportFixed(element)) continue;
+        const rect = element.getBoundingClientRect();
+        if (rect.width <= 0 || rect.right <= available || rect.left >= page.innerWidth) continue;
+        if (rect.width > available) {
+          set(element, "box-sizing", "border-box");
+          set(element, "min-width", "0px");
+          set(element, "max-width", `${available}px`);
+        }
+        const right = Number.parseFloat(style.right);
+        if (Number.isFinite(right)) set(element, "right", `${right + reserved}px`);
+        const adjusted = element.getBoundingClientRect();
+        const left = Number.parseFloat(page.getComputedStyle(element).left);
+        const shift = adjusted.left < 0 ? -adjusted.left : Math.min(0, available - adjusted.right);
+        if (Number.isFinite(left) && shift) set(element, "left", `${left + shift}px`);
+      }
+      if (document.body) observer.observe(document.body, {
+        subtree: true, childList: true, attributes: true, attributeFilter: ["class", "style"],
+      });
+      else if (document.documentElement) observer.observe(document.documentElement, { childList: true });
+      if (scans.length) schedule();
+    }
+    return {
+      apply(width) {
+        if (!reserved) enqueue(document.body);
+        reserved = width;
+        refresh();
+      },
+      rescan() { enqueue(document.body); if (reserved) refresh(); },
+      clear() {
+        reserved = 0;
+        observer.disconnect();
+        if (timer != null) page.clearTimeout(timer);
+        timer = undefined;
+        restore(); candidates.clear(); scans.length = 0;
+      },
+    };
+  }
 
   function createSidebarContent(api, page = root) {
     const document = page.document;
     let mounted;
-    let savedWidth;
-    let reservedWidth;
+    const rootProperties = new Map();
+    const fixedLayout = createFixedLayout(document, page);
 
     function reserveWidth(width) {
       const style = document.documentElement.style;
-      if (!savedWidth || (reservedWidth != null
-        && (style.getPropertyValue("width") !== reservedWidth
-          || style.getPropertyPriority("width") !== "important"))) {
-        savedWidth = {
-          value: style.getPropertyValue("width"),
-          priority: style.getPropertyPriority("width"),
-        };
+      for (const [name, applied] of [["width", `calc(100% - ${width}px)`], ["min-width", "0px"], ["margin-right", `${width}px`]]) {
+        const previous = rootProperties.get(name);
+        if (!previous || style.getPropertyValue(name) !== previous.applied || style.getPropertyPriority(name) !== "important") {
+          rootProperties.set(name, { value: style.getPropertyValue(name), priority: style.getPropertyPriority(name), applied });
+        } else previous.applied = applied;
+        style.setProperty(name, applied, "important");
+        rootProperties.get(name).applied = style.getPropertyValue(name);
       }
-      style.setProperty("width", `calc(100% - ${width}px)`, "important");
-      reservedWidth = style.getPropertyValue("width");
+      fixedLayout.apply(width);
     }
 
     function restoreWidth() {
-      if (!savedWidth) return;
+      fixedLayout.clear();
       const style = document.documentElement.style;
-      if (style.getPropertyValue("width") === reservedWidth
-        && style.getPropertyPriority("width") === "important") {
-        if (savedWidth.value) style.setProperty("width", savedWidth.value, savedWidth.priority);
-        else style.removeProperty("width");
+      for (const [name, item] of rootProperties) {
+        if (style.getPropertyValue(name) !== item.applied || style.getPropertyPriority(name) !== "important") continue;
+        if (item.value) style.setProperty(name, item.value, item.priority);
+        else style.removeProperty(name);
       }
-      savedWidth = undefined;
-      reservedWidth = undefined;
+      rootProperties.clear();
+    }
+
+    function widthBounds() {
+      const viewport = page.innerWidth || 1024;
+      const minimum = Math.min(320, Math.max(0, viewport - 24));
+      const maximum = Math.max(minimum, Math.min(720, viewport - 360));
+      return { minimum, maximum };
     }
 
     function clampWidth(value) {
-      const viewport = page.innerWidth || 1024;
-      const maximum = Math.min(1200, Math.max(280, viewport - 96));
-      return Math.round(Math.min(maximum, Math.max(280, Number.isFinite(value) ? value : 420)));
+      const { minimum, maximum } = widthBounds();
+      return Math.round(Math.min(maximum, Math.max(minimum, Number.isFinite(value) ? value : 420)));
     }
 
     function unmount(instanceId) {
@@ -64,6 +180,7 @@
       }
       if (!document.documentElement) throw new Error("The Safari page is not ready for a sidebar");
       if (mounted?.instanceId === message.instanceId && mounted.path === target.pathname) {
+        mounted.applyWidth(message.width);
         return { ok: true, instanceId: mounted.instanceId };
       }
       if (mounted) unmount(mounted.instanceId);
@@ -127,15 +244,20 @@
       let width = clampWidth(message.width);
       function applyWidth(next) {
         width = clampWidth(next);
+        const { minimum, maximum } = widthBounds();
         host.style.setProperty("width", `${width}px`, "important");
         resize.setAttribute("aria-valuenow", String(width));
+        resize.setAttribute("aria-valuemin", String(minimum));
+        resize.setAttribute("aria-valuemax", String(maximum));
+        resize.setAttribute("aria-valuetext", `${width} pixels`);
         reserveWidth(width);
       }
       function saveWidth() {
         api.runtime.sendMessage({ type: TYPE + "resized", instanceId: message.instanceId, width })
           .catch((error) => console.error("ChatGPT Safari sidebar width was not saved", error));
       }
-      function pointerMove(event) { if (dragging) applyWidth(page.innerWidth - event.clientX); }
+      let dragStart;
+      function pointerMove(event) { if (dragging) applyWidth(dragStart.width + dragStart.x - event.clientX); }
       let dragging = false;
       function pointerUp() {
         if (!dragging) return;
@@ -146,6 +268,7 @@
       resize.addEventListener("pointerdown", (event) => {
         if (event.button !== 0) return;
         dragging = true;
+        dragStart = { width, x: event.clientX };
         frame.style.pointerEvents = "none";
         resize.setPointerCapture?.(event.pointerId);
         event.preventDefault();
@@ -160,7 +283,9 @@
         event.preventDefault();
       });
       function onResize() { applyWidth(width); }
+      function onLoad() { fixedLayout.rescan(); }
       page.addEventListener("resize", onResize);
+      page.addEventListener("load", onLoad);
       close.addEventListener("click", () => {
         const instanceId = message.instanceId;
         if (unmount(instanceId)) {
@@ -170,22 +295,26 @@
       });
       mounted = {
         host, path: target.pathname, instanceId: message.instanceId,
-        cleanup() { page.removeEventListener("resize", onResize); },
+        applyWidth,
+        cleanup() { page.removeEventListener("resize", onResize); page.removeEventListener("load", onLoad); },
       };
-      document.documentElement.append(host);
-      applyWidth(width);
+      try {
+        document.documentElement.append(host);
+        applyWidth(width);
+      } catch (error) {
+        unmount(message.instanceId);
+        throw error;
+      }
       return { ok: true, instanceId: message.instanceId };
     }
 
-    api.runtime.onMessage.addListener((message, sender, respond) => {
-      if (sender.id !== api.runtime.id || !message) return false;
-      if (message.type !== TYPE + "mount" && message.type !== TYPE + "unmount") return false;
+    function command(message) {
       try {
-        respond(message.type === TYPE + "mount"
-          ? mount(message) : { ok: unmount(message.instanceId) });
-      } catch (error) { respond({ ok: false, error: error.message }); }
-      return false;
-    });
+        if (message?.type === TYPE + "mount") return mount(message);
+        if (message?.type === TYPE + "unmount") return { ok: unmount(message.instanceId), instanceId: message.instanceId };
+        throw new Error("Unknown ChatGPT sidebar command");
+      } catch (error) { return { ok: false, error: error.message }; }
+    }
     const announce = () => api.runtime.sendMessage({ type: TYPE + "ready" })
       .catch((error) => console.error("ChatGPT Safari sidebar page was not registered", error));
     if (document.documentElement) announce();
@@ -195,10 +324,10 @@
       });
       observer.observe(document, { childList: true });
     }
-    return { mount, unmount };
+    return { mount, unmount, command };
   }
 
-  if (typeof module === "object" && module.exports) module.exports = { createSidebarContent };
+  if (typeof module === "object" && module.exports) module.exports = { createSidebarContent, createFixedLayout };
   const api = root.browser || root.chrome;
   if (api?.runtime?.id && root.document && root.top === root && !root.__chatgptSafariSidebarContent) {
     root.__chatgptSafariSidebarContent = createSidebarContent(api);

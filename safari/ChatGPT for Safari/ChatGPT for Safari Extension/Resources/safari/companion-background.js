@@ -1,12 +1,16 @@
-/* Native side-chat window; Safari remains the authority for browser context. */
+/* Owner-bound native relay; Safari remains the authority for browser context. */
 (function (root) {
   "use strict";
-  function createCompanion(api, environment = root) {
+  function createCompanion(api, environment = root, options = {}) {
+    const embedded = options.embedded === true;
     let owner;
     let polling = false;
     let timer;
     const closeListeners = new Set();
     const send = async command => {
+      if (embedded && ["status", "poll", "update"].includes(command.action)) {
+        command = { ...command, action: "embedded" + command.action[0].toUpperCase() + command.action.slice(1) };
+      }
       const result = await api.runtime.sendNativeMessage("dev.jamie.chatgpt-safari", { operation: "companion", command });
       if (result?.ok !== true) {
         const error = new Error(typeof result?.error === "string" ? result.error : result?.error?.message || "The Safari companion did not respond");
@@ -105,10 +109,36 @@
     async function update(state, action) {
       const value = await context(state);
       const window = await api.windows.get(state.windowId);
-      await send({ action, ownerToken: state.instanceId, context: value, capabilities,
+      await send({ action: embedded && action === "open" ? "embeddedOpen" : action,
+        ...(embedded ? { parentExtensionOrigin: (() => { const u = new URL(api.runtime.getURL("/")); return u.protocol + "//" + u.host.toLowerCase(); })() } : {}),
+        ownerToken: state.instanceId, context: value, capabilities,
         bounds: { left: window.left, top: window.top, width: window.width, height: window.height } });
     }
     const binding = {
+      embedded,
+      async frameRequest(state, payload) {
+        if (!embedded) throw new Error("The embedded side chat is not enabled");
+        await ownedTab(state);
+        if (!payload || typeof payload !== "object") throw new Error("Invalid side-chat frame request");
+        if (payload.operation === "entry") {
+          const response = await send({ action: "embeddedEntry", ownerToken: state.instanceId });
+          return response.entry;
+        }
+        if (payload.operation !== "host" || typeof payload.method !== "string") throw new Error("Unknown embedded side-chat operation");
+        const params = payload.params || {};
+        if (JSON.stringify(params).length > 96000) throw new Error("The side-chat request is too large");
+        if (payload.method === "capabilities") {
+          return { capabilities, browserContext: { instanceId: await environment.ChatGPTSafariHooks.getInstanceId() } };
+        }
+        const result = await handleRequest(state, { ownerToken: state.instanceId, method: payload.method, params });
+        if (payload.method === "locationChanged") {
+          await send({ action: "embeddedLocation", ownerToken: state.instanceId, url: params.url });
+        } else if (payload.method === "authStateChanged") {
+          if (!["expired", "logout_requested", "signed_in", "signed_out"].includes(params.state)) throw new Error("Invalid ChatGPT authentication state");
+          await send({ action: "embeddedAuth", ownerToken: state.instanceId, state: params.state });
+        }
+        return result;
+      },
       onClosed: { addListener(listener) { closeListeners.add(listener); }, removeListener(listener) { closeListeners.delete(listener); } },
       async restore(states) {
         let response;
@@ -134,7 +164,7 @@
       },
       async close(state) {
         if (owner?.instanceId !== state.instanceId) return;
-        await send({ action: "close", ownerToken: state.instanceId });
+        await send({ action: embedded ? "embeddedClose" : "close", ownerToken: state.instanceId });
         owner = undefined;
         clearInterval(timer);
         timer = undefined;
@@ -153,5 +183,5 @@
   }
   if (typeof module === "object" && module.exports) module.exports = { createCompanion };
   const api = root.browser || root.chrome;
-  if (api?.runtime?.id) root.ChatGPTSafariSidebarOptions = { companion: createCompanion(api) };
+  if (api?.runtime?.id) root.ChatGPTSafariSidebarOptions = { companion: createCompanion(api, root, { embedded: true }) };
 })(globalThis);

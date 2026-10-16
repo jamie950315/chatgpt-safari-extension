@@ -40,6 +40,12 @@
 		7D22E83D3081CAC200CD05F6 /* js-kernel-offscreen.html in Resources */ = {isa = PBXBuildFile; fileRef = 7D22E82E3081CAC200CD05F6 /* js-kernel-offscreen.html */; };
 		7D22E83E3081CAC200CD05F6 /* codex-work-sidepanel.html in Resources */ = {isa = PBXBuildFile; fileRef = 7D22E82F3081CAC200CD05F6 /* codex-work-sidepanel.html */; };
 		7D22E83F3081CAC200CD05F6 /* assets in Resources */ = {isa = PBXBuildFile; fileRef = 7D22E8303081CAC200CD05F6 /* assets */; };
+		A04000100010001000100001 /* EmbeddedSideChatController.swift in Sources */ = {isa = PBXBuildFile; fileRef = A04000100010001000100002 /* EmbeddedSideChatController.swift */; };
+		A04000200010001000100001 /* embedded-sidechat.html in Resources */ = {isa = PBXBuildFile; fileRef = A04000200010001000100002 /* embedded-sidechat.html */; };
+		A04000300010001000100001 /* ChatGPTProviderRelay.swift in Sources */ = {isa = PBXBuildFile; fileRef = A04000300010001000100002 /* ChatGPTProviderRelay.swift */; };
+		A04000400010001000100001 /* ProviderRelayCore.swift in Sources */ = {isa = PBXBuildFile; fileRef = A04000400010001000100002 /* ProviderRelayCore.swift */; };
+		A04000500010001000100001 /* ProviderRelayPolicy.swift in Sources */ = {isa = PBXBuildFile; fileRef = A04000500010001000100002 /* ProviderRelayPolicy.swift */; };
+		A04000600010001000100001 /* ProviderBrowser.js in Resources */ = {isa = PBXBuildFile; fileRef = A04000600010001000100002 /* ProviderBrowser.js */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
@@ -101,6 +107,12 @@
 		7D22E82E3081CAC200CD05F6 /* js-kernel-offscreen.html */ = {isa = PBXFileReference; lastKnownFileType = text.html; name = "js-kernel-offscreen.html"; path = "Resources/js-kernel-offscreen.html"; sourceTree = "<group>"; };
 		7D22E82F3081CAC200CD05F6 /* codex-work-sidepanel.html */ = {isa = PBXFileReference; lastKnownFileType = text.html; name = "codex-work-sidepanel.html"; path = "Resources/codex-work-sidepanel.html"; sourceTree = "<group>"; };
 		7D22E8303081CAC200CD05F6 /* assets */ = {isa = PBXFileReference; lastKnownFileType = folder; name = assets; path = Resources/assets; sourceTree = "<group>"; };
+		A04000100010001000100002 /* EmbeddedSideChatController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "../../companion/EmbeddedSideChatController.swift"; sourceTree = SOURCE_ROOT; };
+		A04000200010001000100002 /* embedded-sidechat.html */ = {isa = PBXFileReference; lastKnownFileType = text.html; path = "ChatGPT for Safari Extension/Resources/embedded-sidechat.html"; sourceTree = SOURCE_ROOT; };
+		A04000300010001000100002 /* ChatGPTProviderRelay.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "../../companion/relay/ChatGPTProviderRelay.swift"; sourceTree = SOURCE_ROOT; };
+		A04000400010001000100002 /* ProviderRelayCore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "../../companion/relay/ProviderRelayCore.swift"; sourceTree = SOURCE_ROOT; };
+		A04000500010001000100002 /* ProviderRelayPolicy.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "../../companion/relay/ProviderRelayPolicy.swift"; sourceTree = SOURCE_ROOT; };
+		A04000600010001000100002 /* ProviderBrowser.js */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.javascript; path = "../../companion/relay/ProviderBrowser.js"; sourceTree = SOURCE_ROOT; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -127,6 +139,12 @@
 				A03000300010001000100002 /* SafariAutomation.swift */,
 				A03000200010001000100002 /* CompanionControlServer.swift */,
 				A03000100010001000100002 /* SideChatCompanionController.swift */,
+				A04000600010001000100002 /* ProviderBrowser.js */,
+				A04000500010001000100002 /* ProviderRelayPolicy.swift */,
+				A04000400010001000100002 /* ProviderRelayCore.swift */,
+				A04000300010001000100002 /* ChatGPTProviderRelay.swift */,
+				A04000200010001000100002 /* embedded-sidechat.html */,
+				A04000100010001000100002 /* EmbeddedSideChatController.swift */,
 				7D22E8143081CAC200CD05F6 /* ChatGPT for Safari Extension */,
 				7D22E7F63081CAC000CD05F6 /* Products */,
 			);
@@ -284,6 +302,7 @@
 				7D22E8033081CAC000CD05F6 /* Script.js in Resources */,
 				7D22E7FD3081CAC000CD05F6 /* Main.html in Resources */,
 				A03000400010001000100001 /* SideChatBridge.js in Resources */,
+				A04000600010001000100001 /* ProviderBrowser.js in Resources */,
 				7D22E80A3081CAC200CD05F6 /* Assets.xcassets in Resources */,
 				7D22E8013081CAC000CD05F6 /* Style.css in Resources */,
 			);
@@ -298,6 +317,7 @@
 				7D22E8383081CAC200CD05F6 /* _metadata in Resources */,
 				7D22E83C3081CAC200CD05F6 /* manifest.json in Resources */,
 				A01000100010001000100001 /* diagnostics.html in Resources */,
+				A04000200010001000100001 /* embedded-sidechat.html in Resources */,
 				A02000100010001000100001 /* safari in Resources */,
 				7D22E8343081CAC200CD05F6 /* images in Resources */,
 				7D22E8353081CAC200CD05F6 /* waiting-room.html in Resources */,
@@ -322,6 +342,10 @@
 				A03000300010001000100001 /* SafariAutomation.swift in Sources */,
 				A03000200010001000100001 /* CompanionControlServer.swift in Sources */,
 				A03000100010001000100001 /* SideChatCompanionController.swift in Sources */,
+				A04000500010001000100001 /* ProviderRelayPolicy.swift in Sources */,
+				A04000400010001000100001 /* ProviderRelayCore.swift in Sources */,
+				A04000300010001000100001 /* ChatGPTProviderRelay.swift in Sources */,
+				A04000100010001000100001 /* EmbeddedSideChatController.swift in Sources */,
 				7D22E7F93081CAC000CD05F6 /* AppDelegate.swift in Sources */,
 			);
 		};
