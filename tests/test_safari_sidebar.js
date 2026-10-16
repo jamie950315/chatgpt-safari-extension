@@ -58,6 +58,7 @@ function fixture(options = {}) {
     declarativeNetRequest: { async updateSessionRules(args) { rules.push(args); } },
     action: { onClicked: event() },
   };
+  if (options.browserActionOnly) { api.browserAction = api.action; delete api.action; }
   const adapter = createSidebarAdapter(api, { reportError: (error) => { throw error; }, ...options });
   function request(message, sender) {
     return new Promise((resolve) => {
@@ -131,6 +132,14 @@ test("the toolbar enables its owning tab before opening and has one toggle owner
   f.api.action.onClicked.emit(f.tabs.get(11));
   await f.adapter.sidePanel.getOptions({ tabId: 11 });
   assert.equal(f.storage.chatgptSafariSidebarStateV1.openPanels.length, 0);
+});
+
+test("the persistent Safari toolbar uses the real browserAction namespace", async () => {
+  const f = fixture({ browserActionOnly: true });
+  await f.adapter.sidePanel.setPanelBehavior({ openPanelOnActionClick: true });
+  f.api.browserAction.onClicked.emit(f.tabs.get(11));
+  await f.adapter.sidePanel.getOptions({ tabId: 11 });
+  assert.equal(f.storage.chatgptSafariSidebarStateV1.openPanels.length, 1);
 });
 
 test("selection scripts run in the background only for the authorized sidebar owner", async () => {

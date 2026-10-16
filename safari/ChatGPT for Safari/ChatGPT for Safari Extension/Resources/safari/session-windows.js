@@ -2,6 +2,7 @@
 (function (root) {
   "use strict";
   function createSessionWindows(api) {
+    const action = api.browserAction || api.action;
     const key = "chatgptSafariSessionWindowsV1";
     const sessions = new Map();
     let queue = Promise.resolve();
@@ -19,7 +20,7 @@
       return pending;
     }
     async function label(state, tabId) {
-      await api.action.setTitle({ tabId, title: state.title ? `ChatGPT — ${state.title}` : "ChatGPT" });
+      await action.setTitle({ tabId, title: state.title ? `ChatGPT — ${state.title}` : "ChatGPT" });
     }
     const manager = {
       createTab(sessionId, preferredWindowId) {
@@ -83,7 +84,7 @@
             let changed = false;
             for (const id of released) if (state.tabs.delete(id)) {
               changed = true;
-              await api.action.setTitle({ tabId: id, title: "ChatGPT" });
+              await action.setTitle({ tabId: id, title: "ChatGPT" });
             }
             // Deliverables keep their window; later agent tabs get a new one.
             if (changed) state.windowId = null;

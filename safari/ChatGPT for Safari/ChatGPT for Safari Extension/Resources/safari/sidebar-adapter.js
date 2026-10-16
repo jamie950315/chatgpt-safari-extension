@@ -45,6 +45,7 @@
   }
 
   function createSidebarAdapter(api, options = {}) {
+    const action = api.browserAction || api.action;
     const reportError = options.reportError || ((error) => console.error(error));
     const onOpened = createEvent(reportError);
     const onClosed = createEvent(reportError);
@@ -328,7 +329,7 @@
       case "getOwner":
         if (payload.tabId !== state.tabId) throw new Error("The sidebar can only read its owning tab");
         return tab;
-      case "getUserSettings": return api.action.getUserSettings();
+      case "getUserSettings": return action.getUserSettings();
       case "getCommands": return api.commands.getAll();
       case "focusOwner":
         if (payload.tabId !== state.tabId || payload.options?.active !== true
@@ -410,7 +411,7 @@
         if (getOptionsUnlocked(tabId).enabled) await openUnlocked({ tabId, windowId });
       }).catch(reportError);
     });
-    api.action.onClicked.addListener((tab) => {
+    action.onClicked.addListener((tab) => {
       serialize(async () => {
         if (!panelBehavior.openPanelOnActionClick) return;
         const state = openByWindow.get(tab.windowId);

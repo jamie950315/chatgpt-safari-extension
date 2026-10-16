@@ -2,6 +2,8 @@
 """Apply version-bound Safari adaptations to preserved upstream resources."""
 
 from pathlib import Path
+import copy
+import json
 
 ROOT = Path(__file__).resolve().parent.parent
 SOURCE = ROOT / "vendor/background.chrome.js"
@@ -37,6 +39,7 @@ REPLACEMENTS = {
         ("chrome.webNavigation.onCreatedNavigationTarget?.addListener", 1),
     "const r=await chrome.debugger.getTargets();":
         ("if(chrome.debugger==null)return;const r=await chrome.debugger.getTargets();", 1),
+    "chrome.action.": ("chrome.browserAction.", 11),
 }
 
 
@@ -55,6 +58,28 @@ def bounded_function(source: str, start: str, end: str) -> str:
     return source[source.index(start):source.index(end)]
 
 
+def prepare_manifest(original: dict) -> dict:
+    """Use Safari's supported persistent background without changing authority."""
+    if original["manifest_version"] != 3:
+        raise ValueError("The preserved Safari input manifest must use version 3")
+    manifest = copy.deepcopy(original)
+    manifest["manifest_version"] = 2
+    manifest["background"] = {"scripts": ["background.js"], "persistent": True}
+    manifest["browser_action"] = manifest.pop("action")
+    manifest["commands"]["_execute_browser_action"] = manifest["commands"].pop("_execute_action")
+    manifest["permissions"] += manifest.pop("host_permissions")
+    policy = manifest["content_security_policy"]
+    if set(policy) != {"extension_pages", "sandbox"}:
+        raise ValueError("Unexpected upstream content security policies")
+    manifest["content_security_policy"] = policy["extension_pages"]
+    manifest["sandbox"]["content_security_policy"] = policy["sandbox"]
+    resources = manifest["web_accessible_resources"]
+    if not all(set(group) == {"matches", "resources"} and group["matches"] == ["<all_urls>"] for group in resources):
+        raise ValueError("A scoped web-accessible resource group cannot be flattened")
+    manifest["web_accessible_resources"] = [resource for group in resources for resource in group["resources"]]
+    return manifest
+
+
 def sidebar_functions() -> str:
     source = (ROOT / "vendor/chunks/codex-work-sidepanel-16q48QQM.js").read_text()
     workspace = (ROOT / "vendor/chunks/google-workspace-BnXIlG7d.js").read_text()
@@ -70,6 +95,8 @@ def sidebar_functions() -> str:
 
 if __name__ == "__main__":
     resources = TARGET.parent
+    manifest = prepare_manifest(json.loads((ROOT / "vendor/manifest.safari-input.json").read_text()))
+    (resources / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
     adapters = ["native-transport.js", "diagnostics-background.js", "sidechat-preload-background.js", "companion-background.js", "sidebar-adapter.js", "session-windows.js"]
     TARGET.write_text(sidebar_functions() + "\n".join((resources / "safari" / name).read_text() for name in adapters)
                       + "\n" + prepare(SOURCE.read_text()))
@@ -108,4 +135,4 @@ if __name__ == "__main__":
             raise ValueError(f"Unexpected sidebar operation: {old}")
         source = source.replace(old, new)
     chunk.write_text(source)
-    print("Prepared Safari transport, content sidebar, and bounded upstream adaptations.")
+    print("Prepared Safari transport, persistent background, and native side-chat adapters.")

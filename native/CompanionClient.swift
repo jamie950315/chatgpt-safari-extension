@@ -56,6 +56,8 @@ final class CompanionClient {
                 let application = try appURL()
                 DispatchQueue.main.async {
                     let config = NSWorkspace.OpenConfiguration()
+                    // Service startup does not request activation. The sidecar
+                    // manages its own key-capable panel.
                     config.activates = false
                     NSWorkspace.shared.open([URL(string: "chatgpt-safari://service")!], withApplicationAt: application, configuration: config) { _, error in
                         if let error {

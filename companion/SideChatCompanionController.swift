@@ -2,6 +2,12 @@ import AppKit
 import WebKit
 import CoreFoundation
 
+/// A key-capable nonactivating panel for browser-adjacent chat.
+private final class SideChatInputPanel: NSPanel {
+    override var canBecomeKey: Bool { true }
+    override var canBecomeMain: Bool { false }
+}
+
 /// Owns the top-level ChatGPT view. The Safari extension remains the owner of tab data.
 final class SideChatCompanionController: NSObject, WKScriptMessageHandlerWithReply,
                                          WKNavigationDelegate, WKUIDelegate, NSWindowDelegate {
@@ -14,6 +20,8 @@ final class SideChatCompanionController: NSObject, WKScriptMessageHandlerWithRep
     private var ownerToken: String?
     private var capabilities: [String: Bool] = [:]
     private var requests: [[String: Any]] = []
+    private var pollCount = 0
+    private var resolveCount = 0
     private var pending: [String: PendingReply] = [:]
     private var authWindows: [NSWindow] = []
     private var documentReady = false
@@ -116,6 +124,7 @@ final class SideChatCompanionController: NSObject, WKScriptMessageHandlerWithRep
                     reply(["ok": true, "state": status])
                 }
             case "poll":
+                pollCount += 1
                 if ownerToken == nil, window?.isVisible != true {
                     reply(["ok": true, "closed": true, "requests": [], "state": state()]); return
                 }
@@ -127,6 +136,7 @@ final class SideChatCompanionController: NSObject, WKScriptMessageHandlerWithRep
                 requests.removeAll()
                 reply(["ok": true, "requests": batch, "state": state()])
             case "resolve":
+                resolveCount += 1
                 guard command["ownerToken"] as? String == ownerToken, ownerToken != nil else {
                     throw SideChatError("The side chat owner changed")
                 }
@@ -157,20 +167,24 @@ final class SideChatCompanionController: NSObject, WKScriptMessageHandlerWithRep
         precondition(Thread.isMainThread)
         if window == nil { createWindow() }
         window?.makeKeyAndOrderFront(nil)
-        NSApp.activate(ignoringOtherApps: true)
         updateOwner()
     }
 
     private func createWindow() {
         let frame = NSScreen.main?.visibleFrame ?? NSRect(x: 100, y: 100, width: 1280, height: 800)
         let size = NSSize(width: min(460, frame.width), height: max(460, frame.height - 48))
-        let panel = NSWindow(contentRect: NSRect(x: frame.maxX - size.width - 12, y: frame.minY + 24,
+        let panel = SideChatInputPanel(contentRect: NSRect(x: frame.maxX - size.width - 12, y: frame.minY + 24,
                                                  width: size.width, height: size.height),
-                             styleMask: [.titled, .closable, .miniaturizable, .resizable],
+                             styleMask: [.titled, .closable, .miniaturizable, .resizable, .nonactivatingPanel],
                              backing: .buffered, defer: false)
         panel.title = "ChatGPT — Safari Side Chat"
         panel.minSize = NSSize(width: 360, height: 420)
         panel.isReleasedWhenClosed = false
+        panel.isFloatingPanel = false
+        panel.level = .normal
+        panel.hidesOnDeactivate = false
+        panel.becomesKeyOnlyIfNeeded = false
+        panel.collectionBehavior = [.moveToActiveSpace, .fullScreenAuxiliary, .canJoinAllApplications]
         panel.delegate = self
         panel.identifier = NSUserInterfaceItemIdentifier("ChatGPTSafariSideChat")
         let root = NSView()
@@ -273,9 +287,11 @@ final class SideChatCompanionController: NSObject, WKScriptMessageHandlerWithRep
         var result: [String: Any] = ["visible": window?.isVisible ?? false,
             "ownerAvailable": context != nil, "documentReady": documentReady,
             "pendingRequests": pending.count, "url": webView?.url?.absoluteString ?? "",
+            "pollCount": pollCount, "resolveCount": resolveCount,
             "appActive": NSApp?.isActive ?? false, "appHidden": NSApp?.isHidden ?? false,
             "windowKey": window?.isKeyWindow ?? false, "windowMain": window?.isMainWindow ?? false,
-            "windowOcclusionVisible": window?.occlusionState.contains(.visible) ?? false]
+            "windowOcclusionVisible": window?.occlusionState.contains(.visible) ?? false,
+            "windowOnActiveSpace": window?.isOnActiveSpace ?? false]
         if let lastError { result["error"] = lastError }
         if let ownerToken { result["ownerToken"] = ownerToken }
         if let webView {
@@ -467,9 +483,14 @@ final class SideChatCompanionController: NSObject, WKScriptMessageHandlerWithRep
         let view = WKWebView(frame: NSRect(x: 0, y: 0, width: 520, height: 700), configuration: configuration)
         view.navigationDelegate = self
         view.uiDelegate = self
-        let auth = NSWindow(contentRect: view.frame, styleMask: [.titled, .closable, .resizable], backing: .buffered, defer: false)
+        let auth = SideChatInputPanel(contentRect: view.frame, styleMask: [.titled, .closable, .resizable, .nonactivatingPanel], backing: .buffered, defer: false)
         auth.title = "Sign in to ChatGPT"
         auth.isReleasedWhenClosed = false
+        auth.isFloatingPanel = false
+        auth.level = .normal
+        auth.hidesOnDeactivate = false
+        auth.becomesKeyOnlyIfNeeded = false
+        auth.collectionBehavior = [.moveToActiveSpace, .fullScreenAuxiliary, .canJoinAllApplications]
         auth.delegate = self
         auth.contentView = view
         auth.center()

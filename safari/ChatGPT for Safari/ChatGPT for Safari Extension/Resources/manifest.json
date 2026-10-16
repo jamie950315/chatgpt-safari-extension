@@ -1,6 +1,6 @@
 {
   "update_url": "https://clients2.google.com/service/update2/crx",
-  "manifest_version": 3,
+  "manifest_version": 2,
   "name": "ChatGPT",
   "description": "Control your browser with ChatGPT.",
   "version": "1.26.1005.11759",
@@ -9,13 +9,7 @@
     "32": "images/icon32.png",
     "128": "images/icon128.png"
   },
-  "content_security_policy": {
-    "extension_pages": "script-src 'self'; object-src 'none'; connect-src 'self' http://127.0.0.1:* http://localhost:* ws://127.0.0.1:* ws://localhost:* https://ab.chatgpt.com https://chatgpt.com https://api.openai.com https://api.openai.org https://*.blob.core.windows.net https://*.oaiusercontent.com https://*.s3.ap-northeast-1.amazonaws.com https://*.s3.ap-northeast-2.amazonaws.com https://*.s3.ap-south-1.amazonaws.com https://*.s3.ap-southeast-1.amazonaws.com https://*.s3.ap-southeast-2.amazonaws.com https://*.s3.ca-central-1.amazonaws.com https://*.s3.eu-central-1.amazonaws.com https://*.s3.eu-south-2.amazonaws.com https://*.s3.eu-west-1.amazonaws.com https://*.s3.eu-west-2.amazonaws.com https://*.s3.us-east-1.amazonaws.com https://*.s3.us-east-2.amazonaws.com https://*.s3.us-west-1.amazonaws.com; font-src 'self' https://cdn.openai.com;",
-    "sandbox": "sandbox allow-scripts; default-src 'none'; script-src 'self' 'unsafe-eval'; worker-src blob:; connect-src 'none';"
-  },
-  "host_permissions": [
-    "<all_urls>"
-  ],
+  "content_security_policy": "script-src 'self'; object-src 'none'; connect-src 'self' http://127.0.0.1:* http://localhost:* ws://127.0.0.1:* ws://localhost:* https://ab.chatgpt.com https://chatgpt.com https://api.openai.com https://api.openai.org https://*.blob.core.windows.net https://*.oaiusercontent.com https://*.s3.ap-northeast-1.amazonaws.com https://*.s3.ap-northeast-2.amazonaws.com https://*.s3.ap-south-1.amazonaws.com https://*.s3.ap-southeast-1.amazonaws.com https://*.s3.ap-southeast-2.amazonaws.com https://*.s3.ca-central-1.amazonaws.com https://*.s3.eu-central-1.amazonaws.com https://*.s3.eu-south-2.amazonaws.com https://*.s3.eu-west-1.amazonaws.com https://*.s3.eu-west-2.amazonaws.com https://*.s3.us-east-1.amazonaws.com https://*.s3.us-east-2.amazonaws.com https://*.s3.us-west-1.amazonaws.com; font-src 'self' https://cdn.openai.com;",
   "minimum_chrome_version": "116",
   "permissions": [
     "alarms",
@@ -36,25 +30,18 @@
     "topSites",
     "webNavigation",
     "contextMenus",
-    "sidePanel"
+    "sidePanel",
+    "<all_urls>"
   ],
-  "action": {
-    "default_icon": {
-      "16": "images/icon16.png",
-      "32": "images/icon32.png",
-      "48": "images/icon48.png"
-    },
-    "default_title": "ChatGPT"
-  },
   "commands": {
-    "_execute_action": {
+    "open-codex-side-panel": {
+      "description": "Open ChatGPT side panel"
+    },
+    "_execute_browser_action": {
       "suggested_key": {
         "default": "Ctrl+Shift+Period",
         "mac": "Command+Shift+Period"
       }
-    },
-    "open-codex-side-panel": {
-      "description": "Open ChatGPT side panel"
     }
   },
   "optional_permissions": [
@@ -64,24 +51,21 @@
     "default_path": "side-panel-loading.html"
   },
   "web_accessible_resources": [
-    {
-      "matches": [
-        "<all_urls>"
-      ],
-      "resources": [
-        "images/cursor-chat.png",
-        "codex-work-sidepanel.html",
-        "diagnostics.html"
-      ]
-    }
+    "images/cursor-chat.png",
+    "codex-work-sidepanel.html",
+    "diagnostics.html"
   ],
   "background": {
-    "service_worker": "background.js"
+    "scripts": [
+      "background.js"
+    ],
+    "persistent": true
   },
   "sandbox": {
     "pages": [
       "js-kernel.html"
-    ]
+    ],
+    "content_security_policy": "sandbox allow-scripts; default-src 'none'; script-src 'self' 'unsafe-eval'; worker-src blob:; connect-src 'none';"
   },
   "content_scripts": [
     {
@@ -129,5 +113,13 @@
       ],
       "world": "ISOLATED"
     }
-  ]
+  ],
+  "browser_action": {
+    "default_icon": {
+      "16": "images/icon16.png",
+      "32": "images/icon32.png",
+      "48": "images/icon48.png"
+    },
+    "default_title": "ChatGPT"
+  }
 }

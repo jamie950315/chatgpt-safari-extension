@@ -26,6 +26,13 @@ executed factory is reported as an adapter failure. Do not substitute a fake
 Chrome origin, alter `window.parent`, or silently fall back to an ordinary
 website launcher.
 
+The macOS package uses Safari's supported **Manifest V2 persistent background
+page**, with the real `browserAction` toolbar API. The original Manifest V3
+service worker stopped answering cold-start side-chat requests. A persistent
+background fixes that lifecycle rather than requiring the user to reload chat.
+The preparation script preserves the original CSP literals, sandbox pages,
+resource inventory, and host-permission set in the version conversion.
+
 ## Desktop control uses Safari-native tools
 
 The `safari_native` MCP server exposes Apple's actual Safari automation tools:
@@ -57,14 +64,18 @@ backend; Safari does not expose `chrome.debugger`. Use `safari_native` instead.
   signed-in UI attached selected text from the actual owning Safari page; a
   prompt that did not contain the text received that exact text as its answer.
   Closing and reopening the native window retained the conversation and login.
+  The installed persistent-background build also passed a cold launch and a
+  selected-text conversation without using Reload.
 - Native MCP input, click, and link navigation passed through the signed
   companion. Both input and click events were trusted browser events.
 - A fresh Codex app-server client loaded 19 tools and called
   `safari_session_status` successfully. This is distinct from an already-running
-  chat's cached tool catalog.
+  chat's cached tool catalog. The active desktop conversation subsequently loaded
+  `safari_native` and completed real page reading, input, button click, and link
+  navigation through those tools, then closed its test tab and stopped its session.
 
 The background restores polling only for the native window's matching saved
-owner after a worker reload; it does not reopen a window or restart a quit app.
+owner after a background reload; it does not reopen a window or restart a quit app.
 
 ## Build and focused checks
 
@@ -88,6 +99,8 @@ cookies, native message contents, or authorization tokens belong in logs or Git.
 
 - `chatgpt.crx` and `unpacked/`: ignored, unmodified original download.
 - `vendor/`: preserved upstream inputs for version-bound preparation.
+- `vendor/manifest.safari-input.json`: the preserved MV3 Safari resource manifest;
+  preparation derives the persistent macOS manifest from it.
 - `scripts/prepare-safari.py`: exact upstream transformations.
 - `native/`: original-host XPC transport, companion client, Safari automation.
 - `companion/`: AppKit side chat, website host adapter, authenticated IPC.

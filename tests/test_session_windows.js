@@ -2,7 +2,7 @@ const test = require("node:test");
 const assert = require("node:assert/strict");
 const { createSessionWindows } = require("../safari/ChatGPT for Safari/ChatGPT for Safari Extension/Resources/safari/session-windows.js");
 
-function fixture(failCreate = false) {
+function fixture(failCreate = false, browserActionOnly = false) {
   const tabs = new Map([[1, { id: 1, windowId: 1 }]]);
   const data = {}, titles = [], removed = [], removedListeners = [];
   let nextWindow = 10, nextTab = 11;
@@ -22,8 +22,15 @@ function fixture(failCreate = false) {
     } },
     action: { async setTitle(value) { titles.push(value); } },
   };
+  if (browserActionOnly) { api.browserAction = api.action; delete api.action; }
   return { manager: createSessionWindows(api), tabs, data, titles, removed, api, removedListeners };
 }
+
+test("persistent Safari session labels use native browserAction", async () => {
+  const f = fixture(false, true);
+  await f.manager.createTab("session");
+  assert.equal(f.titles[0].title, "ChatGPT");
+});
 
 test("agent tabs are created in a real session window without moving user tabs", async () => {
   const f = fixture();

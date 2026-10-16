@@ -5,10 +5,17 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     private let companionServer = CompanionControlServer()
     private let automation = SafariAutomation()
     private var serviceLaunch = false
+    private var launchFinished = false
+    private var pendingSideChat = false
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        launchFinished = true
         startCompanionServer()
         if serviceLaunch { hideSetupWindow() }
+        if pendingSideChat {
+            pendingSideChat = false
+            SideChatCompanionController.shared.show()
+        }
     }
 
     private func startCompanionServer() {
@@ -32,16 +39,15 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func application(_ application: NSApplication, open urls: [URL]) {
-        startCompanionServer()
         for url in urls where url.scheme == "chatgpt-safari" && url.query == nil && url.fragment == nil {
             guard url.path.isEmpty || url.path == "/" else { continue }
             if url.host == "service" {
                 serviceLaunch = true
-                hideSetupWindow()
-                DispatchQueue.main.async { self.hideSetupWindow() }
+                if launchFinished { hideSetupWindow() }
             }
             if url.host == "sidechat", url.path.isEmpty || url.path == "/" {
-                SideChatCompanionController.shared.show()
+                if launchFinished { SideChatCompanionController.shared.show() }
+                else { pendingSideChat = true }
             }
             // chatgpt-safari://service only wakes the private command listener.
         }
