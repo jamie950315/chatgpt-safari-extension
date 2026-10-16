@@ -10,8 +10,12 @@ extension or a notarized release. **The full conversion is not complete.**
   the original ChatGPT side-chat extension UI, not a replacement website launcher.
 - Safari native messaging reaches an embedded XPC service and the installed,
   signature-verified OpenAI native host. A real protocol-2 hello has passed from
-  the installed Safari extension. Full desktop browser discovery/control has
-  not passed.
+  the installed Safari extension. The desktop runtime discovers it as **Safari**,
+  lists real Safari tabs, and creates an agent tab in a real Safari window.
+  Navigation and page interaction remain blocked at debugger attachment.
+- Agent-created tabs use native Safari windows instead of Chrome tab groups.
+  Explicit preferred-window requests are honored; user tabs and popup tabs are
+  not moved. This restores tab creation, not CDP browser control.
 - The sidebar's **Open connection diagnostics** button opens its native-host
   test and background transport status. The test sends no page content.
 - ChatGPT's `frame-ancestors` policy currently rejects the nested Safari frame.
@@ -34,6 +38,13 @@ automation session cannot attach to existing Safari tabs or their login state.
 It is not wired into the original runtime. Browser control is not reported as
 supported merely because those isolated tests passed.
 
+Installed testing reached `chrome.debugger.attach` after successful desktop tab
+creation. The adapter now reports that missing capability explicitly. A complete
+port still needs a Safari-capable desktop execution backend and a supported host
+for the original ChatGPT side chat. Extension flags cannot supply either one:
+the native sidebar is compiled out, and the current desktop backend sends CDP
+requests rather than Safari WebDriver/MCP operations.
+
 The original package also requests Chrome APIs that Safari does not implement,
 including bookmarks, downloads, history, offscreen documents, sessions, tab
 groups, and top sites. Unsupported event registration is guarded; this is not a
@@ -44,7 +55,7 @@ complete implementation of those APIs.
 ```sh
 ./scripts/build-safari.sh
 python3 -m unittest discover -s tests -p 'test_prepare*.py'
-node --test tests/test_native_transport.js tests/test_safari_sidebar.js
+node --test tests/test_native_transport.js tests/test_safari_sidebar.js tests/test_session_windows.js
 ```
 
 Requirements: full Xcode, macOS, and the local Apple Development identity for
@@ -67,7 +78,7 @@ launched host must have OpenAI's signing identity.
 - `native/`: XPC transport, native framing, and host identity validation.
 - `safari/ChatGPT for Safari/`: containing app, extension, and Xcode project.
 - Extension `Resources/safari/`: native-port transport, owning-tab sidebar,
-  frame authorization, and fixed-operation background RPC. Privileged scripting
+  session-window management, frame authorization, and fixed-operation background RPC. Privileged scripting
   stays in the background: calling it directly from an embedded extension page
   caused WebKit to terminate the page process during installed testing.
 

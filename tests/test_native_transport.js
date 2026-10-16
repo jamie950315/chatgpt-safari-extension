@@ -9,8 +9,12 @@ const tick = () => new Promise(resolve => setImmediate(resolve));
 
 function setup(sendNativeMessage) {
   const runtime = { getURL: () => "safari-web-extension://test/", sendNativeMessage };
-  vm.runInNewContext(source, { chrome: { runtime }, location: { protocol: "safari-web-extension:" }, console: { warn() {}, error() {} } });
-  return runtime;
+  Object.defineProperty(runtime, "connectNative", {
+    value() { throw new Error("The Safari built-in native method must not be used"); }, writable: false,
+  });
+  const context = { chrome: { runtime }, location: { protocol: "safari-web-extension:" }, console: { warn() {}, error() {} } };
+  vm.runInNewContext(source, context);
+  return { ...runtime, connectNative: context.ChatGPTSafariConnectNative };
 }
 
 test("queued writes are ordered snapshots; poll delivers real reply objects; close emits once", async () => {

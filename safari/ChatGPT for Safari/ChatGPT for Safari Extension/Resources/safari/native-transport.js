@@ -31,7 +31,7 @@
     return response;
   }
 
-  runtime.connectNative = name => {
+  globalThis.ChatGPTSafariConnectNative = name => {
     if (name !== "com.openai.codexextension") {
       throw new Error("This Safari port only supports the installed production OpenAI native host.");
     }

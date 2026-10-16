@@ -8,8 +8,9 @@ installed build before declaring completion. This is a local development-signed
 conversion of Chrome extension 1.26.1005.11759, not an official Safari release.
 
 The current build has a content sidebar and an XPC native-host transport. An
-installed-Safari protocol-2 native hello passed. Full desktop discovery/control
-is unverified. ChatGPT's frame-ancestors policy rejects the nested Safari chat
+installed-Safari protocol-2 native hello, desktop discovery as Safari, real tab
+listing, and desktop-requested agent tab creation passed. Navigation fails at
+the unavailable CDP debugger attachment. ChatGPT's frame-ancestors policy rejects the nested Safari chat
 frame. Safari's native sidePanel implementation is compiled out on the tested
 Safari 27.0.1. Do not remove site security headers, substitute a website launcher,
 or call the visible sidebar shell a working chat.
@@ -28,6 +29,11 @@ Do not return empty CDP successes or equate standalone MCP probes with integrati
   Embedded extension frames use fixed-operation runtime RPC for privileged
   scripting/tab APIs. Direct scripting from those frames triggered WebKit IPC
   validation failure and page termination in installed testing.
+- `Resources/safari/session-windows.js` replaces the upstream internal tab-group
+  manager with real Safari window/tab creation. Preserve explicit preferred
+  windows and stable tab IDs; do not move user tabs or fabricate Chrome groups.
+  The upstream native connection calls `ChatGPTSafariConnectNative` directly:
+  assigning Safari's built-in `runtime.connectNative` did not replace its behavior.
 - `native/` bridges request/reply Safari messages to the existing OpenAI stdio
   host through an embedded XPC service. Keep code-signature checks and precise
   client/origin checks; never log native message contents or credentials.

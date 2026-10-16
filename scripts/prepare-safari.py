@@ -8,6 +8,16 @@ SOURCE = ROOT / "vendor/background.chrome.js"
 TARGET = ROOT / "safari/ChatGPT for Safari/ChatGPT for Safari Extension/Resources/background.js"
 
 REPLACEMENTS = {
+    'async function El(e,t){await oa(e,':
+        ('async function El(e,t){if(!chrome.debugger)throw new Error("Safari browser control is unavailable: the desktop runtime requires a CDP debugger, which Safari does not expose.");await oa(e,', 1),
+    'async function k_(e,t){await Pl(t,':
+        ('async function k_(e,t){if(!chrome.debugger)throw new Error("Safari browser control is unavailable: the desktop runtime requires a CDP debugger, which Safari does not expose.");await Pl(t,', 1),
+    "const n=await P_(r.length===0?t:void 0);":
+        ("const n=Yt(await this.tabGroups.createTab(this.sessionId,r.length===0?t:void 0));", 1),
+    'tabGroups=zg.getInstance();':
+        ('tabGroups=globalThis.ChatGPTSafariSessionWindows;', 1),
+    'chrome.runtime.connectNative(this.application)':
+        ('globalThis.ChatGPTSafariConnectNative(this.application)', 1),
     'function nc(){chrome.action.onClicked.addListener':
         ('function nc(){if(globalThis.ChatGPTSafariSidebar)return;chrome.action.onClicked.addListener', 1),
     'const f=new av(t);if(r)':
@@ -58,7 +68,7 @@ def sidebar_functions() -> str:
 
 if __name__ == "__main__":
     resources = TARGET.parent
-    adapters = ["native-transport.js", "diagnostics-background.js", "sidechat-preload-background.js", "sidebar-adapter.js"]
+    adapters = ["native-transport.js", "diagnostics-background.js", "sidechat-preload-background.js", "sidebar-adapter.js", "session-windows.js"]
     TARGET.write_text(sidebar_functions() + "\n".join((resources / "safari" / name).read_text() for name in adapters)
                       + "\n" + prepare(SOURCE.read_text()))
     origin = '(()=>{const u=new URL(chrome.runtime.getURL("/"));return u.protocol+"//"+u.host})()'
