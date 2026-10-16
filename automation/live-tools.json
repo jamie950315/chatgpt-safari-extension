@@ -1,0 +1,356 @@
+[
+  {
+    "name": "live_status",
+    "description": "Inspect the live Safari companion, connected profiles, and native input permission without opening an isolated automation session.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {},
+      "required": [],
+      "additionalProperties": false
+    },
+    "annotations": {
+      "readOnlyHint": true,
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": true
+    }
+  },
+  {
+    "name": "live_permissions",
+    "description": "Check macOS Accessibility permission for native input. Set prompt=true only when the user is ready to grant the companion access in System Settings.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "prompt": {
+          "type": "boolean",
+          "default": false
+        }
+      },
+      "required": [],
+      "additionalProperties": false
+    },
+    "annotations": {
+      "readOnlyHint": false,
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": true
+    }
+  },
+  {
+    "name": "live_list_tabs",
+    "description": "List ordinary Safari extension tabs, including existing logged-in pages. Return profile IDs and opaque handles for subsequent tools. This does not select or modify a tab.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {},
+      "required": [],
+      "additionalProperties": false
+    },
+    "annotations": {
+      "readOnlyHint": true,
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": true
+    }
+  },
+  {
+    "name": "live_read_page",
+    "description": "Read the chosen current Safari tab and get documentId, snapshotId and actionable node IDs. Reading does not copy cookies or change the website login. Password values are omitted.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "handle": {
+          "type": "string",
+          "minLength": 1
+        },
+        "maxLength": {
+          "type": "integer",
+          "minimum": 1000,
+          "maximum": 60000
+        }
+      },
+      "required": [
+        "handle"
+      ],
+      "additionalProperties": false
+    },
+    "annotations": {
+      "readOnlyHint": true,
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": true
+    }
+  },
+  {
+    "name": "live_interact",
+    "description": "Use real native input on nodes from the latest live_read_page snapshot. The companion selects the exact tab and rejects stale targets or changed focus. Read the resulting page to verify the effect; never replay a mutation automatically.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "handle": {
+          "type": "string",
+          "minLength": 1
+        },
+        "documentId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "snapshotId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "interactions": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 20,
+          "items": {
+            "oneOf": [
+              {
+                "type": "object",
+                "properties": {
+                  "type": {
+                    "type": "string",
+                    "enum": [
+                      "click"
+                    ]
+                  },
+                  "node": {
+                    "type": "string",
+                    "minLength": 1
+                  }
+                },
+                "required": [
+                  "type",
+                  "node"
+                ],
+                "additionalProperties": false
+              },
+              {
+                "type": "object",
+                "properties": {
+                  "type": {
+                    "type": "string",
+                    "enum": [
+                      "type"
+                    ]
+                  },
+                  "node": {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  "value": {
+                    "type": "string"
+                  },
+                  "replaceAll": {
+                    "type": "boolean",
+                    "default": false
+                  }
+                },
+                "required": [
+                  "type",
+                  "node",
+                  "value"
+                ],
+                "additionalProperties": false
+              },
+              {
+                "type": "object",
+                "properties": {
+                  "type": {
+                    "type": "string",
+                    "enum": [
+                      "key"
+                    ]
+                  },
+                  "node": {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  "key": {
+                    "type": "string",
+                    "minLength": 1
+                  }
+                },
+                "required": [
+                  "type",
+                  "node",
+                  "key"
+                ],
+                "additionalProperties": false
+              },
+              {
+                "type": "object",
+                "properties": {
+                  "type": {
+                    "type": "string",
+                    "enum": [
+                      "scroll"
+                    ]
+                  },
+                  "node": {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  "deltaX": {
+                    "type": "number"
+                  },
+                  "deltaY": {
+                    "type": "number"
+                  }
+                },
+                "required": [
+                  "type"
+                ],
+                "additionalProperties": false,
+                "anyOf": [
+                  {
+                    "required": [
+                      "deltaX"
+                    ]
+                  },
+                  {
+                    "required": [
+                      "deltaY"
+                    ]
+                  }
+                ]
+              }
+            ]
+          }
+        }
+      },
+      "required": [
+        "handle",
+        "documentId",
+        "snapshotId",
+        "interactions"
+      ],
+      "additionalProperties": false
+    },
+    "annotations": {
+      "readOnlyHint": false,
+      "destructiveHint": true,
+      "idempotentHint": false,
+      "openWorldHint": true
+    }
+  },
+  {
+    "name": "live_navigate",
+    "description": "Navigate an existing ordinary Safari tab while retaining that profile and website session. expectedUrl must exactly match the tab URL most recently observed. Navigation can discard an unsaved page draft.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "handle": {
+          "type": "string",
+          "minLength": 1
+        },
+        "url": {
+          "type": "string",
+          "minLength": 1
+        },
+        "expectedUrl": {
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "required": [
+        "handle",
+        "url",
+        "expectedUrl"
+      ],
+      "additionalProperties": false
+    },
+    "annotations": {
+      "readOnlyHint": false,
+      "destructiveHint": true,
+      "idempotentHint": false,
+      "openWorldHint": true
+    }
+  },
+  {
+    "name": "live_select_tab",
+    "description": "Select the existing Safari tab identified by a returned handle and last observed expectedUrl. This changes the foreground tab, not its login or URL.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "handle": {
+          "type": "string",
+          "minLength": 1
+        },
+        "expectedUrl": {
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "required": [
+        "handle",
+        "expectedUrl"
+      ],
+      "additionalProperties": false
+    },
+    "annotations": {
+      "readOnlyHint": false,
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": true
+    }
+  },
+  {
+    "name": "live_create_tab",
+    "description": "Create a normal Safari tab in an explicitly chosen connected profile, reusing its website logins. Obtain profileId from live_list_tabs; optionally choose one of that profile window IDs.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "profileId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "url": {
+          "type": "string",
+          "minLength": 1
+        },
+        "windowId": {
+          "type": "integer"
+        }
+      },
+      "required": [
+        "profileId",
+        "url"
+      ],
+      "additionalProperties": false
+    },
+    "annotations": {
+      "readOnlyHint": false,
+      "destructiveHint": false,
+      "idempotentHint": false,
+      "openWorldHint": true
+    }
+  },
+  {
+    "name": "live_close_tab",
+    "description": "Close the exact existing Safari tab only when explicitly asked by the user, or to clean up a scratch tab you created. expectedUrl must match its last observed URL. Closing may discard unsaved work.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "handle": {
+          "type": "string",
+          "minLength": 1
+        },
+        "expectedUrl": {
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "required": [
+        "handle",
+        "expectedUrl"
+      ],
+      "additionalProperties": false
+    },
+    "annotations": {
+      "readOnlyHint": false,
+      "destructiveHint": true,
+      "idempotentHint": false,
+      "openWorldHint": true
+    }
+  }
+]

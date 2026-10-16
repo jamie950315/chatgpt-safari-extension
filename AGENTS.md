@@ -28,6 +28,16 @@ This is a development-signed conversion of Chrome extension 1.26.1005.11759.
 - `automation/` exposes this same backend through the `safari_native` MCP server.
   Use real native tool results; do not emulate CDP with empty successes or DOM
   input events. Apple automation uses isolated tabs/logins, not existing tabs.
+- `safari_live` controls ordinary Safari's existing tabs and logins. Its broker
+  uses a separate profile/session-bound extension poll channel, independent of
+  side-chat ownership. Handles bind profile and tab; snapshots bind document,
+  URL, and node identity. Never replay a delivered command after a disconnect.
+- `native/SafariLiveInput.swift` uses public AX + CGEvent for trusted input.
+  Preserve real Accessibility checks, Safari foreground/window/page identity,
+  viewport mapping, native hit testing, and editable keyboard focus. Never use
+  this backend to bypass another tool's denied app access, or replace native
+  input with JavaScript-dispatched events. Test mutations on ordinary-profile
+  scratch pages; existing authenticated pages can be checked read-only.
 - `Resources/safari/sidebar-adapter.js` is the sole toolbar/sidebar state owner.
   Its companion binding brokers real Safari context/selection/tab mentions and
   releases ownership when the native window closes.
@@ -56,6 +66,12 @@ app-server consumer loaded 19 MCP tools and called session
 status. The active desktop conversation also used the registered MCP tools for
 real page reading, input, click, and navigation. Preserve saved-owner polling
 across background reload without reopening the native UI or restarting a quit app.
+
+Existing-profile `safari_live` tab listing, authenticated-page reading, stale
+snapshot rejection, and nine-tool desktop discovery passed. Native live input
+acceptance is pending the macOS Accessibility grant for the installed app;
+`live_status` reports its actual state. Do not count isolated-session input as
+existing-profile input evidence.
 
 Preserve original downloads, browser profiles, login state, drafts, and user
 tabs. Test only owned pages, do not restart Safari, and stop owned probes.

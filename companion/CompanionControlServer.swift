@@ -101,7 +101,7 @@ final class CompanionControlServer {
             case .reject(let status, let message):
                 self.respond(connection, status: status, object: ["ok": false, "error": message])
             case .command(let command):
-                self.setDeadline(connection, seconds: command["action"] as? String == "automation" ? 130 : 25)
+                self.setDeadline(connection, seconds: ["automation", "live"].contains(command["action"] as? String ?? "") ? 130 : 25)
                 DispatchQueue.main.async {
                     guard let handler = self.commandHandler else {
                         self.respond(connection, status: 503, object: ["ok": false, "error": "The companion is not ready"]); return

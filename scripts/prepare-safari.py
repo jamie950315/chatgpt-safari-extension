@@ -97,7 +97,7 @@ if __name__ == "__main__":
     resources = TARGET.parent
     manifest = prepare_manifest(json.loads((ROOT / "vendor/manifest.safari-input.json").read_text()))
     (resources / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
-    adapters = ["native-transport.js", "diagnostics-background.js", "sidechat-preload-background.js", "companion-background.js", "sidebar-adapter.js", "session-windows.js"]
+    adapters = ["native-transport.js", "diagnostics-background.js", "sidechat-preload-background.js", "companion-background.js", "live-background.js", "sidebar-adapter.js", "session-windows.js"]
     TARGET.write_text(sidebar_functions() + "\n".join((resources / "safari" / name).read_text() for name in adapters)
                       + "\n" + prepare(SOURCE.read_text()))
     origin = '(()=>{const u=new URL(chrome.runtime.getURL("/"));return u.protocol+"//"+u.host})()'

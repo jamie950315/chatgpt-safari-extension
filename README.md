@@ -33,7 +33,35 @@ background fixes that lifecycle rather than requiring the user to reload chat.
 The preparation script preserves the original CSP literals, sandbox pages,
 resource inventory, and host-permission set in the version conversion.
 
-## Desktop control uses Safari-native tools
+## Control existing Safari tabs and logins
+
+Use **`safari_live`** for the tabs already open in ordinary Safari. It lists the
+real tabs in each connected profile and reads their current pages without
+copying cookies or creating a separate login session.
+
+1. Call `live_list_tabs` and choose the returned tab handle.
+2. Call `live_read_page` for that handle.
+3. Pass its `documentId`, `snapshotId`, and node IDs to `live_interact` to type,
+   click, press a page key, or scroll. The tab is selected before input.
+
+The extension uses Safari's tabs/scripting APIs for targeting and reading.
+The signed containing app delivers trusted macOS mouse/keyboard events using
+Accessibility and CGEvent. Enable **ChatGPT for Safari** in **System Settings →
+Privacy & Security → Accessibility** for input. Reading, listing, and explicit
+tab navigation do not need that permission. Keep Safari frontmost during input.
+
+Page/document identity, window, viewport, hit target, and keyboard focus are
+checked before delivery. A stale snapshot, covered target, or focus change
+returns an error; input is never replayed automatically. Read the current page
+after an uncertain result. Current snapshots describe the top-level document;
+embedded frames are identified separately.
+
+See [the desktop control guide](automation/README.md) for tool examples and
+configuration. `safari_live` is registered alongside the existing `safari_native`
+server in this Mac's desktop configuration. A client with a cached tool catalog
+needs to reload MCP connections or start a new conversation.
+
+## Optional isolated automation
 
 The `safari_native` MCP server exposes Apple's actual Safari automation tools:
 read page content, type, click, navigate, handle tabs, and inspect requests.
@@ -45,19 +73,23 @@ separate from ordinary Safari tabs. Enable Safari **Develop → Allow Remote
 Automation and External Agents** before using it. The native side-chat profile
 is also separate from the automation profile.
 
-Use [the native automation guide](automation/README.md) for the launch command,
-desktop configuration, and a complete read/type/click/navigation example.
-The `safari_native` server is installed in this Mac's shared Codex/ChatGPT desktop
-MCP configuration. Reload the server or start a new client session after changing
-its configuration. [Official MCP configuration documentation](https://developers.openai.com/codex/mcp).
+Use this separate backend for clean-session tests rather than existing logins.
+The [MCP configuration reference](https://developers.openai.com/codex/mcp)
+describes client configuration and connection reloads.
 
 The original OpenAI native-host connection remains available: the desktop runtime
 discovers the extension as Safari, lists real tabs, and creates agent tabs using
 native Safari windows. Its legacy raw-CDP navigation path is not the control
-backend; Safari does not expose `chrome.debugger`. Use `safari_native` instead.
+backend; Safari does not expose `chrome.debugger`. Use `safari_live` for existing
+tabs, or `safari_native` for isolated tests.
 
 ## Installed acceptance
 
+- `safari_live` listed the ordinary Safari profile's existing tabs and read an
+  already signed-in Gemini page without changing its login or input. Its
+  document/snapshot guard rejected stale input before native delivery. A fresh
+  Codex app-server loaded its nine tools and called `live_status`. Native
+  mouse/keyboard acceptance still requires the macOS Accessibility grant.
 - Safari → native messaging → XPC → signature-verified OpenAI host: protocol-2
   hello, desktop discovery, tab listing, and agent-tab creation passed.
 - Native side-chat guest and signed-in prompt/response passed. The original

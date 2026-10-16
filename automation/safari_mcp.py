@@ -94,8 +94,12 @@ class Companion:
         return port, token
 
     def _post(self, command, credentials):
+        result = self._post_envelope({"action": "automation", "command": command}, credentials)
+        return self._unwrap_response(result)
+
+    def _post_envelope(self, envelope, credentials):
         port, token = credentials
-        payload = json.dumps({"action": "automation", "command": command}).encode()
+        payload = json.dumps(envelope).encode()
         request = urllib.request.Request(
             f"http://127.0.0.1:{port}/command", data=payload,
             headers={"Content-Type": "application/json", "Authorization": f"Bearer {token}"},
@@ -110,6 +114,9 @@ class Companion:
         result = json.loads(raw)
         if not isinstance(result, dict) or type(result.get("ok")) is not bool:
             raise RPCError(-32001, "The Safari companion returned an invalid response.")
+        return result
+
+    def _unwrap_response(self, result):
         if not result["ok"]:
             error = result.get("error", {})
             code = error.get("code", -32000)
@@ -136,10 +143,13 @@ class Companion:
         except (OSError, ValueError, urllib.error.URLError) as error:
             raise RPCError(-32002, "The Safari companion connection failed. The action was not retried; it may already have taken effect. Reopen the companion and inspect safari_session_status.") from error
 
+    def _launch_command(self):
+        return ["/usr/bin/open", "-b", "dev.jamie.chatgpt-safari", "chatgpt-safari://service"]
+
     def _launch_and_wait(self):
         try:
             subprocess.run(
-                ["/usr/bin/open", "-b", "dev.jamie.chatgpt-safari", "chatgpt-safari://service"],
+                self._launch_command(),
                 stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                 timeout=8, check=True,
             )

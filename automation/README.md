@@ -1,38 +1,102 @@
-# Control Safari with native tools
+# Control existing Safari tabs
 
-Use the `safari_native` MCP server to read a page, type, click, and navigate with
-Apple's Safari automation APIs. The signed companion app owns one persistent
-`/usr/bin/safaridriver --mcp` process. Both the extension and desktop MCP clients
-use that same process through the companion's authenticated loopback service.
-
-Safari opens an **isolated automation session**. Its tabs and website logins are
-separate from ordinary Safari tabs. Existing user tabs cannot be claimed. Enable
-Safari **Develop → Allow Remote Automation and External Agents** before use.
+Use **safari_live** for ordinary Safari tabs, including their existing website
+logins. It does not copy cookies or launch an isolated browser session. The
+extension reads and targets pages through Safari Web Extension APIs; the signed
+companion delivers real mouse and keyboard events through macOS Accessibility.
 
 ## Connect a desktop client
 
-Build and register `dist/ChatGPT for Safari.app` first. Add
-[`mcp-config.example.toml`](mcp-config.example.toml) to the existing Codex MCP
-configuration, preserving the other servers. Reload the client's MCP connections.
-For clients using JSON configuration, the same command is:
+Build and register `dist/ChatGPT for Safari.app`. Add
+[`mcp-config.example.toml`](mcp-config.example.toml) to the client's existing MCP
+configuration, preserving other servers. Reload its MCP connections.
+For JSON clients:
 
 ```json
 {
   "mcpServers": {
-    "safari_native": {
-      "command": "/Users/jamie/Downloads/chatgpt-safari-extension/automation/launch-safari-mcp",
+    "safari_live": {
+      "command": "/Users/jamie/Downloads/chatgpt-safari-extension/automation/launch-safari-live",
       "args": []
     }
   }
 }
 ```
 
-The entry point launches the companion with `chatgpt-safari://service` when needed;
-this service launch does not open the chat panel. It reads the current port and
-private token from the companion's mode-0600 descriptor in
-`~/Library/Application Support/ChatGPT Safari/companion-control.json`. It never
-starts its own Safari driver. Keep the repository at the configured location, or
-update the command after moving it.
+The launcher starts the signed companion service when a tool needs it; discovery
+(`initialize` and `tools/list`) does not start the app or an Apple driver. The
+private loopback descriptor is mode 0600. Extension polling never restarts an app
+the user quit. Keep this checkout at the configured path, or update the command
+if it moves.
+
+For real input, enable **ChatGPT for Safari** in **System Settings → Privacy &
+Security → Accessibility**. `live_permissions` with `{"prompt":true}` requests the
+normal macOS prompt; `live_status` reports the actual permission. Reading and tab
+navigation work without Accessibility permission.
+
+## Choose a real tab, then use its current snapshot
+
+1. Call `live_list_tabs`. Choose the returned `handle` by URL/title; preserve the
+   `profileId` when working across Safari profiles. Do not invent handles or
+   assume the active tab. Private tabs are excluded.
+2. Call `live_read_page` with `{"handle":"<returned handle>"}`. The result includes
+   page text, actionable nodes, `documentId`, and `snapshotId`.
+3. Pass those exact IDs into `live_interact`:
+
+   ```json
+   {
+     "handle": "<returned handle>",
+     "documentId": "<documentId from live_read_page>",
+     "snapshotId": "<snapshotId from live_read_page>",
+     "interactions": [
+       {"type":"type","node":"<input node>","value":"Safari live test","replaceAll":true},
+       {"type":"click","node":"<button node>"}
+     ]
+   }
+   ```
+
+   Safari selects the requested tab/window. Keep Safari frontmost and avoid
+   concurrent manual input. The result includes completed interactions and a
+   fresh page snapshot. Check the actual result rather than assuming a click
+   caused the intended effect.
+4. Use a link's current node with `click`, or call `live_navigate` with `handle`,
+   `url`, and the last observed `expectedUrl`. Read a new snapshot after navigation.
+
+`key` accepts Enter, Tab, Shift+Tab, Escape, Backspace, Delete, Space, arrow keys,
+Home/End, and PageUp/PageDown, not application shortcuts. `scroll` accepts pixel
+`deltaY`/`deltaX`, optionally targeting a current node. Page snapshots describe the
+top-level document and list embedded frames separately; node IDs do not cross
+frame or document boundaries. Password values are not included in snapshots.
+
+`live_create_tab` requires a returned `profileId` and URL. `live_select_tab` and
+`live_close_tab` require `handle` and `expectedUrl`. Close only tabs the user
+requested or scratch tabs you created; current tabs can contain unsaved work.
+
+## Recover without repeating input
+
+The broker permits one live command at a time across clients; concurrent requests
+return `LIVE_BUSY` without queueing a later mutation. Profile/background identity,
+URL, document, snapshot, element actionability, native window, page hit target,
+and keyboard focus are checked. A changed target aborts with an explicit error.
+A background restart invalidates delivered work instead of replaying it.
+
+Errors retain the native code and any partial-delivery information. After an
+uncertain result, read the current page and decide the next action; do not
+blindly repeat a click, form submission, or text entry. No mutation is retried by
+the MCP transport. Browser-generated dialogs remain Safari UI rather than DOM
+nodes in this backend.
+
+## Optional isolated Safari automation
+
+The separate `safari_native` server exposes Apple's actual automation tools
+through one companion-owned `/usr/bin/safaridriver --mcp` process. Its tabs and
+logins are isolated from ordinary Safari and from native side chat. Use it for
+clean-session tests, not to claim existing user tabs. Enable Safari **Develop →
+Allow Remote Automation and External Agents** before using this backend.
+
+Its entry point is `automation/launch-safari-mcp`, configured separately in the
+same example file. The following workflow and protocol apply only to that
+isolated backend.
 
 ## Read, type, click, and follow a link
 

@@ -1,5 +1,13 @@
 # Add this server to the desktop client's existing configuration; preserve all
 # other servers. Use the installed repository path if this checkout is moved.
+[mcp_servers.safari_live]
+command = "/Users/jamie/Downloads/chatgpt-safari-extension/automation/launch-safari-live"
+args = []
+enabled = true
+startup_timeout_sec = 45
+tool_timeout_sec = 150
+
+# Optional, separate isolated-session tools.
 [mcp_servers.safari_native]
 command = "/Users/jamie/Downloads/chatgpt-safari-extension/automation/launch-safari-mcp"
 args = []

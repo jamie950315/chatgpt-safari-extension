@@ -4,6 +4,11 @@ import Cocoa
 class AppDelegate: NSObject, NSApplicationDelegate {
     private let companionServer = CompanionControlServer()
     private let automation = SafariAutomation()
+    private let liveInput = SafariLiveInput()
+    private lazy var live = SafariLiveBroker { [weak self] command, reply in
+        guard let self else { reply(["ok": false, "error": ["code": "APP_CLOSED", "message": "The Safari companion was closed."]]); return }
+        self.liveInput.handle(command) { result in DispatchQueue.main.async { reply(result) } }
+    }
     private var serviceLaunch = false
     private var launchFinished = false
     private var pendingSideChat = false
@@ -25,6 +30,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                     reply(["ok": false, "error": "Invalid Safari automation command"]); return
                 }
                 self.automation.handle(action, reply: reply)
+            } else if ["live", "livePoll", "liveResolve", "liveInput"].contains(command["action"] as? String ?? ""), let self {
+                self.live.handle(command, reply: reply)
             } else {
                 SideChatCompanionController.shared.handle(command: command, reply: reply)
             }
@@ -65,6 +72,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationWillTerminate(_ notification: Notification) {
         automation.close()
+        live.close()
         companionServer.stop()
     }
 }
