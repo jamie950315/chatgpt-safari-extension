@@ -38,6 +38,15 @@ This is a development-signed conversion of Chrome extension 1.26.1005.11759.
   this backend to bypass another tool's denied app access, or replace native
   input with JavaScript-dispatched events. Test mutations on ordinary-profile
   scratch pages; existing authenticated pages can be checked read-only.
+- An explicit live interaction uses `AXFrontmost` once to focus only the
+  signature-verified Safari process/window. Later user focus changes abort the
+  batch. WebExtension windows.update and cooperative AppKit activation do not
+  establish native foreground ownership. Initialize/read dynamic Workspace
+  state on the main runloop and verify the actual AX focused application PID.
+- Native event posting is asynchronous: observe DOM focus after a native click
+  without replaying it. Page keys require an already focused node. A loading
+  document keeps its real tab handle and completed inputs (`pagePending`), not
+  an error that invites repeating a delivered navigation.
 - `Resources/safari/sidebar-adapter.js` is the sole toolbar/sidebar state owner.
   Its companion binding brokers real Safari context/selection/tab mentions and
   releases ownership when the native window closes.
@@ -67,11 +76,12 @@ status. The active desktop conversation also used the registered MCP tools for
 real page reading, input, click, and navigation. Preserve saved-owner polling
 across background reload without reopening the native UI or restarting a quit app.
 
-Existing-profile `safari_live` tab listing, authenticated-page reading, stale
-snapshot rejection, and nine-tool desktop discovery passed. Native live input
-acceptance is pending the macOS Accessibility grant for the installed app;
-`live_status` reports its actual state. Do not count isolated-session input as
-existing-profile input evidence.
+Existing-profile `safari_live` tab listing, authenticated-page reading, trusted
+Unicode input/clicks, fullscreen page keys, 500-pixel scrolling, same-tab native
+link navigation with retained session cookie, and stale-document rejection
+passed through fresh desktop MCP consumers. The installed app has Accessibility
+permission; `live_status` reports actual input and session state. These are
+ordinary-profile results, separate from isolated-session acceptance.
 
 Preserve original downloads, browser profiles, login state, drafts, and user
 tabs. Test only owned pages, do not restart Safari, and stop owned probes.

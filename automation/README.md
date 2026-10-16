@@ -33,6 +33,8 @@ For real input, enable **ChatGPT for Safari** in **System Settings → Privacy &
 Security → Accessibility**. `live_permissions` with `{"prompt":true}` requests the
 normal macOS prompt; `live_status` reports the actual permission. Reading and tab
 navigation work without Accessibility permission.
+After a new grant, macOS may require quitting and reopening the companion before
+event posting becomes available; keep Safari running.
 
 ## Choose a real tab, then use its current snapshot
 
@@ -55,15 +57,22 @@ navigation work without Accessibility permission.
    }
    ```
 
-   Safari selects the requested tab/window. Keep Safari frontmost and avoid
-   concurrent manual input. The result includes completed interactions and a
-   fresh page snapshot. Check the actual result rather than assuming a click
-   caused the intended effect.
+   Safari selects the requested tab/window. The companion uses public
+   Accessibility to activate that verified Safari window once. Keep Safari
+   frontmost and avoid concurrent manual input. The result includes completed
+   interactions and a fresh page snapshot. Check the actual result rather than
+   assuming a click caused the intended effect.
 4. Use a link's current node with `click`, or call `live_navigate` with `handle`,
    `url`, and the last observed `expectedUrl`. Read a new snapshot after navigation.
 
+If navigation is still loading after the bounded observation window, the result
+keeps the actual tab handle/status. An interaction returns `pagePending:true`
+with its completed inputs; call `live_read_page` instead of repeating the action.
+
 `key` accepts Enter, Tab, Shift+Tab, Escape, Backspace, Delete, Space, arrow keys,
-Home/End, and PageUp/PageDown, not application shortcuts. `scroll` accepts pixel
+Home/End, and PageUp/PageDown, not application shortcuts. Its node must already
+have page focus (for example, after typing or a native Tab); a key does not
+implicitly click the node. `scroll` accepts pixel
 `deltaY`/`deltaX`, optionally targeting a current node. Page snapshots describe the
 top-level document and list embedded frames separately; node IDs do not cross
 frame or document boundaries. Password values are not included in snapshots.

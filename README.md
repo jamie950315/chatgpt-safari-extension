@@ -48,7 +48,8 @@ The extension uses Safari's tabs/scripting APIs for targeting and reading.
 The signed containing app delivers trusted macOS mouse/keyboard events using
 Accessibility and CGEvent. Enable **ChatGPT for Safari** in **System Settings →
 Privacy & Security → Accessibility** for input. Reading, listing, and explicit
-tab navigation do not need that permission. Keep Safari frontmost during input.
+tab navigation do not need that permission. Each input batch activates its
+verified Safari window once; keep Safari frontmost while that batch runs.
 
 Page/document identity, window, viewport, hit target, and keyboard focus are
 checked before delivery. A stale snapshot, covered target, or focus change
@@ -86,10 +87,12 @@ tabs, or `safari_native` for isolated tests.
 ## Installed acceptance
 
 - `safari_live` listed the ordinary Safari profile's existing tabs and read an
-  already signed-in Gemini page without changing its login or input. Its
-  document/snapshot guard rejected stale input before native delivery. A fresh
-  Codex app-server loaded its nine tools and called `live_status`. Native
-  mouse/keyboard acceptance still requires the macOS Accessibility grant.
+  already signed-in Gemini page without changing its login or input. A fresh
+  Codex app-server loaded its nine tools and used the installed companion for
+  Unicode text entry and button clicks; the page reported trusted events.
+- In fullscreen ordinary Safari, native page keys, a 500-pixel scroll, and link
+  navigation passed. Navigation retained the same tab handle and session cookie;
+  the old document/snapshot was then rejected before input.
 - Safari → native messaging → XPC → signature-verified OpenAI host: protocol-2
   hello, desktop discovery, tab listing, and agent-tab creation passed.
 - Native side-chat guest and signed-in prompt/response passed. The original

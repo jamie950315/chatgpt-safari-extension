@@ -35,7 +35,8 @@ final class SafariLiveBroker {
                   current.profile == command["profileId"] as? String,
                   current.session == command["sessionId"] as? String,
                   let native = command["input"] as? [String: Any],
-                  ["click", "type", "key", "scroll"].contains(native["action"] as? String ?? "") else {
+                  ["click", "type", "key", "scroll", "focus"].contains(native["action"] as? String ?? ""),
+                  (native["action"] as? String != "focus" || current.command["action"] as? String == "interact") else {
                 reply(Self.failure("STALE_OPERATION", "The live Safari input no longer belongs to an active command.")); return
             }
             input(native, reply)

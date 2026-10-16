@@ -44,7 +44,8 @@ INSTRUCTIONS = (
     "asked to close or scratch tabs you created. Existing tabs may contain drafts "
     "and sensitive account data. After a transport failure inspect live_status "
     "and the target page; an action may already have taken effect. No mutation "
-    "is retried automatically."
+    "is retried automatically. A key interaction requires its node to already "
+    "have page focus; it never implicitly clicks the node."
 )
 
 

@@ -39,7 +39,8 @@
       const text = document.body?.innerText || "";
       return { ok: true, result: { url: location.href, title: document.title, documentId: state.documentId,
         snapshotId: state.snapshotId, text: text.slice(0, args.maxLength), truncated: text.length > args.maxLength, nodes,
-        frames: [...document.querySelectorAll("iframe")].map(x => ({ title: x.title, src: x.src })),
+        focusedNode: [...state.nodes].find(([, element]) => element === document.activeElement)?.[0] || null,
+        frames: [...document.querySelectorAll("iframe")].map(x => ({ title: x.title, src: x.src })), scroll: { x: scrollX, y: scrollY },
         scope: "top-frame", viewport: { width: innerWidth, height: innerHeight } } };
     }
     if (state.documentId !== args.documentId || state.snapshotId !== args.snapshotId || state.url !== location.href) {
@@ -49,8 +50,17 @@
     const element = args.node ? state.nodes.get(args.node) : document.documentElement;
     if (!element?.isConnected) return reject("STALE_TARGET", "This node is no longer in the page. Read the page again.");
     if (operation === "focused") {
-      return document.activeElement === element || element.contains(document.activeElement)
-        ? { ok: true, result: { focused: true } } : reject("FOCUS_CHANGED", "The intended page element did not receive focus. No text was entered.");
+      // Native event posting is asynchronous. Observe delivery without posting
+      // another click or changing focus ourselves.
+      return (async () => {
+        const deadline = Date.now() + 600;
+        do {
+          if (!element.isConnected || state.url !== location.href) return reject("STALE_TARGET", "The page changed while waiting for native focus.");
+          if (document.activeElement === element || element.contains(document.activeElement)) return { ok: true, result: { focused: true } };
+          await new Promise(resolve => setTimeout(resolve, 20));
+        } while (Date.now() < deadline);
+        return reject("FOCUS_CHANGED", "The intended page element did not receive focus. No text was entered.");
+      })();
     }
     if (operation === "pointCheck") {
       const hit = document.elementFromPoint(args.point.x, args.point.y);
@@ -65,7 +75,9 @@
       if (!visible(element) || element.disabled || element.getAttribute("aria-disabled") === "true") {
         return reject("NOT_ACTIONABLE", "The target is hidden or disabled.");
       }
-      if (args.type === "type" && !(element.matches("input:not([type=hidden]),textarea") || element.isContentEditable)) {
+      const textInput = element.tagName === "INPUT" && ["text", "search", "email", "url", "tel", "password", "number"].includes(element.type);
+      if (args.type === "type" && (!(textInput || element.matches("textarea") || element.isContentEditable) ||
+          element.readOnly || element.getAttribute("aria-readonly") === "true")) {
         return reject("NOT_EDITABLE", "The selected node is not an editable page element.");
       }
       const rect = element.getBoundingClientRect();
@@ -113,19 +125,22 @@
       return { ...describe(tab), ...value };
     }
     async function ready(tabId) {
+      let tab;
       for (let i = 0; i < 60; i++) {
-        const tab = await api.tabs.get(tabId);
+        tab = await api.tabs.get(tabId);
         if (tab.status === "complete") return tab;
         await delay(100);
       }
-      throw fail("PAGE_LOADING", "Safari is still loading this page. Read it after loading completes.");
+      // Keep the observed identity when loading outlives this bounded wait.
+      // Never turn a delivered navigation into an apparently failed mutation.
+      return tab;
     }
     async function focus(tab) {
       await api.tabs.update(tab.id, { active: true });
       await api.windows.update(tab.windowId, { focused: true });
       const fresh = await target(describe(tab).handle, tab.url);
       const window = await api.windows.get(tab.windowId);
-      if (!fresh.active || !window.focused) throw fail("FOCUS_CHANGED", "Safari did not focus the requested tab/window.");
+      if (!fresh.active) throw fail("FOCUS_CHANGED", "Safari did not select the requested tab.");
       return { left: window.left, top: window.top, width: window.width, height: window.height };
     }
     async function execute(request) {
@@ -154,14 +169,24 @@
       const nativeSteps = [];
       try {
         await page(tab, "check", args);
+        // Safari's windows.update selects its window but does not activate a
+        // background/fullscreen app. One explicit native activation precedes
+        // the batch; later user focus changes abort instead of being undone.
+        const selectedBounds = await focus(tab);
+        assertTime();
+        const activated = unwrap(await send({ action: "liveInput", id: request.id, profileId, sessionId,
+          input: { action: "focus", expectedUrl: tab.url, windowBounds: selectedBounds } }));
+        nativeSteps.push({ action: "focus", ...activated });
         for (const interaction of args.interactions) {
           assertTime();
           if (!["click", "type", "key", "scroll"].includes(interaction.type) ||
               (interaction.type !== "scroll" && typeof interaction.node !== "string")) throw fail("INVALID_ARGUMENT", "Each interaction requires a supported type and page node.");
           if (interaction.type === "type" && (typeof interaction.value !== "string" || interaction.value.length > 12000)) throw fail("INVALID_ARGUMENT", "Type requires text of at most 12000 UTF-16 code units.");
           if (interaction.type === "key" && !["Enter", "Tab", "Shift+Tab", "Escape", "Backspace", "Delete", "Space", "ArrowLeft", "ArrowRight", "ArrowUp", "ArrowDown", "Home", "End", "PageUp", "PageDown"].includes(interaction.key)) throw fail("UNSUPPORTED_KEY", "Use a supported page editing/navigation key, not an application shortcut.");
-          await target(args.handle, tab.url);
-          const windowBounds = await focus(tab);
+          const current = await target(args.handle, tab.url);
+          const window = await api.windows.get(tab.windowId);
+          if (!current.active || !window.focused) throw fail("FOCUS_CHANGED", "The selected Safari tab/window lost focus. No input was replayed.");
+          const windowBounds = { left: window.left, top: window.top, width: window.width, height: window.height };
           const geometry = await page(tab, "prepare", { ...args, ...interaction });
           const native = async (kind, extra = {}) => {
             assertTime(); await target(args.handle, tab.url); await page(tab, "check", args);
@@ -171,22 +196,28 @@
             nativeSteps.push({ action: kind, node: interaction.node, ...result });
             return result;
           };
-          if (interaction.type === "type" || interaction.type === "key") {
+          if (interaction.type === "type") {
             await native("click");
             await page(tab, "focused", { ...args, node: interaction.node });
           }
+          // A key must not implicitly click/activate a button or move a caret.
+          if (interaction.type === "key") await page(tab, "focused", { ...args, node: interaction.node });
           const result = await native(interaction.type, { text: interaction.value, replaceAll: interaction.replaceAll === true,
             key: interaction.key, deltaX: interaction.deltaX, deltaY: interaction.deltaY });
           completed.push({ type: interaction.type, node: interaction.node, result });
           await delay(80);
         }
+        const after = await ready(tab.id);
+        if (after.status !== "complete") return { completed, tab: describe(after), pagePending: true,
+          nextAction: "Read this handle with live_read_page to inspect the loading document. Do not repeat the interaction." };
+        return { completed, page: await read(after) };
       } catch (error) {
+        const details = error.data;
         error.data = { completed, nativeSteps, eventsPosted: error.eventsPosted, mayHavePostedInput: error.mayHavePostedInput,
-          outcome: nativeSteps.length || error.mayHavePostedInput ? "partial or uncertain; read current page before continuing" : "no native input confirmed" };
+          ...(details ? { details } : {}),
+          outcome: nativeSteps.some(step => step.eventsPosted > 0) || error.mayHavePostedInput ? "partial or uncertain; read current page before continuing" : "no native input confirmed" };
         throw error;
       }
-      const after = await ready(tab.id);
-      return { completed, page: await read(after) };
     }
     async function poll() {
       if (stopped || polling || !profileId) return;

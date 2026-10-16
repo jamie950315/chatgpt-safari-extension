@@ -19,6 +19,13 @@ struct SafariLiveInputGuards {
         }
 
         _ = try request()
+        let focusTarget: [String: Any] = ["action": "focus", "expectedUrl": "https://example.com/current?mode=live#field",
+                                          "windowBounds": ["left": 0, "top": 25, "width": 1200, "height": 900]]
+        let target = try SafariLiveInput.Target(focusTarget)
+        precondition(target.windowBounds == CGRect(x: 0, y: 25, width: 1200, height: 900))
+        rejects("INVALID_ARGUMENTS") { _ = try SafariLiveInput.Request(focusTarget) }
+        rejects("INVALID_ARGUMENTS") { _ = try SafariLiveInput.Target(focusTarget.merging(["expectedUrl": "file:///etc/passwd"], uniquingKeysWith: { _, rhs in rhs })) }
+        rejects("INVALID_ARGUMENTS") { _ = try SafariLiveInput.Target(focusTarget.merging(["windowBounds": ["left": 0, "top": 25, "width": true, "height": 900]], uniquingKeysWith: { _, rhs in rhs })) }
         rejects("INVALID_ARGUMENTS") { _ = try request(["expectedUrl": "file:///etc/passwd"]) }
         rejects("INVALID_ARGUMENTS") { _ = try request(["expectedUrl": "https://name:password@example.com"]) }
         rejects("INVALID_ARGUMENTS") { _ = try request(["viewport": ["width": 0, "height": 800]]) }
@@ -66,6 +73,38 @@ struct SafariLiveInputGuards {
             precondition(!(0xD800...0xDBFF).contains(chunk.last!))
         }
         precondition(SafariLiveInput.unicodeChunks("").isEmpty)
-        print("Safari live native argument guards, safe keys, viewport mapping, and Unicode event chunks passed. No input events were posted.")
+        let failure = SafariLiveInput.Failure(code: "WINDOW_NOT_FOUND", message: "No matching window.",
+                                              details: ["expectedWindowBounds": ["left": 0, "top": 25, "width": 1200, "height": 900],
+                                                        "observedSafariWindows": [["axWindowsStatus": 0, "windowCount": 1,
+                                                                                     "windows": [["frame": ["left": 0, "top": 0, "width": 1200, "height": 900]]]]]])
+        let response = SafariLiveInput.failureResponse(failure)
+        let serialized = try JSONSerialization.data(withJSONObject: response)
+        let restored = try JSONSerialization.jsonObject(with: serialized) as! [String: Any]
+        let nativeError = restored["error"] as! [String: Any]
+        precondition(nativeError["code"] as? String == "WINDOW_NOT_FOUND")
+        precondition(nativeError["data"] is [String: Any])
+        precondition(nativeError["eventsPosted"] as? Int == 0)
+        precondition(nativeError["mayHavePostedInput"] as? Bool == false)
+        let lockedSession = SafariLiveInput.sessionStatus(["CGSSessionScreenIsLocked": true,
+                                                           "kCGSSessionOnConsoleKey": true,
+                                                           "kCGSessionLoginDoneKey": true,
+                                                           "kCGSSessionUserNameKey": "must-not-be-returned"])
+        precondition(lockedSession["screenLocked"] == true)
+        precondition(lockedSession["sessionOnConsole"] == true)
+        precondition(lockedSession["sessionLoginDone"] == true)
+        precondition(lockedSession.count == 4)
+        let unknownSession = SafariLiveInput.sessionStatus([:])
+        precondition(unknownSession["screenLocked"] == nil, "A missing lock flag is unknown, not unlocked.")
+        precondition(SafariLiveInput.sessionStatus(nil) == ["sessionStateAvailable": false])
+        precondition(SafariLiveInput.sessionStatus(["CGSSessionScreenIsLocked": "true"])["screenLocked"] == nil)
+        let idleInput = SafariLiveInput.InputState(flags: [.maskAlphaShift, .maskSecondaryFn], leftMouseDown: false, rightMouseDown: false)
+        precondition(!idleInput.active && idleInput.heldModifiers.isEmpty)
+        let modifiers = SafariLiveInput.InputState(flags: [.maskCommand, .maskControl, .maskAlternate, .maskShift], leftMouseDown: false, rightMouseDown: false)
+        precondition(modifiers.active && modifiers.heldModifiers == ["Command", "Control", "Option", "Shift"])
+        let mouse = SafariLiveInput.InputState(flags: [], leftMouseDown: true, rightMouseDown: false)
+        precondition(mouse.active && mouse.heldModifiers.isEmpty)
+        precondition(mouse.data["leftMouseDown"] as? Bool == true)
+        precondition(mouse.data.count == 3, "Input diagnostics must not contain typed keys or text.")
+        print("Safari live native input/focus target guards, safe keys, viewport mapping, and Unicode event chunks passed. No activation or input events were posted.")
     }
 }
