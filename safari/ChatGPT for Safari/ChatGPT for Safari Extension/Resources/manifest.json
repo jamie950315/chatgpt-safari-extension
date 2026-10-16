@@ -1,6 +1,5 @@
 {
-"update_url": "https://clients2.google.com/service/update2/crx",
-
+  "update_url": "https://clients2.google.com/service/update2/crx",
   "manifest_version": 3,
   "name": "ChatGPT",
   "description": "Control your browser with ChatGPT.",
@@ -70,7 +69,9 @@
         "<all_urls>"
       ],
       "resources": [
-        "images/cursor-chat.png"
+        "images/cursor-chat.png",
+        "codex-work-sidepanel.html",
+        "diagnostics.html"
       ]
     }
   ],
@@ -83,6 +84,17 @@
     ]
   },
   "content_scripts": [
+    {
+      "matches": [
+        "http://*/*",
+        "https://*/*"
+      ],
+      "all_frames": false,
+      "run_at": "document_start",
+      "js": [
+        "safari/sidebar-content.js"
+      ]
+    },
     {
       "matches": [
         "https://chatgpt.com/*"
@@ -100,9 +112,8 @@
       "all_frames": true,
       "run_at": "document_start",
       "js": [
-        "content-scripts/codex-work-preload.js"
-      ],
-      "world": "MAIN"
+        "safari/sidechat-preload.js"
+      ]
     },
     {
       "matches": [

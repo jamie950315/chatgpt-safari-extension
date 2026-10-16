@@ -23,6 +23,7 @@ xcodebuild \
   }
 
 BUILT="$ROOT/build/DerivedData/Build/Products/Release/$APP"
+"$ROOT/scripts/build-bridge.sh" "$BUILT"
 codesign --verify --deep --strict "$BUILT"
 if [[ -e "$ROOT/dist/$APP" ]]; then
   BACKUP="$ROOT/dist/previous-$(date +%Y%m%d-%H%M%S)"

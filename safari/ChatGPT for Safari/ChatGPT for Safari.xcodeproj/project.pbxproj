@@ -7,6 +7,8 @@
 	objects = {
 
 /* Begin PBXBuildFile section */
+		A02000100010001000100001 /* safari in Resources */ = {isa = PBXBuildFile; fileRef = A02000100010001000100002 /* safari */; };
+		A01000100010001000100001 /* diagnostics.html in Resources */ = {isa = PBXBuildFile; fileRef = A01000100010001000100002 /* diagnostics.html */; };
 		7D22E7F93081CAC000CD05F6 /* AppDelegate.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7D22E7F83081CAC000CD05F6 /* AppDelegate.swift */; };
 		7D22E7FD3081CAC000CD05F6 /* Main.html in Resources */ = {isa = PBXBuildFile; fileRef = 7D22E7FB3081CAC000CD05F6 /* Main.html */; };
 		7D22E7FF3081CAC000CD05F6 /* Icon.png in Resources */ = {isa = PBXBuildFile; fileRef = 7D22E7FE3081CAC000CD05F6 /* Icon.png */; };
@@ -57,6 +59,8 @@
 /* End PBXCopyFilesBuildPhase section */
 
 /* Begin PBXFileReference section */
+		A02000100010001000100002 /* safari */ = {isa = PBXFileReference; lastKnownFileType = folder; name = safari; path = Resources/safari; sourceTree = "<group>"; };
+		A01000100010001000100002 /* diagnostics.html */ = {isa = PBXFileReference; lastKnownFileType = text.html; name = diagnostics.html; path = Resources/diagnostics.html; sourceTree = "<group>"; };
 		7D22E7F53081CAC000CD05F6 /* ChatGPT for Safari.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = "ChatGPT for Safari.app"; sourceTree = BUILT_PRODUCTS_DIR; };
 		7D22E7F83081CAC000CD05F6 /* AppDelegate.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppDelegate.swift; sourceTree = "<group>"; };
 		7D22E7FC3081CAC000CD05F6 /* Base */ = {isa = PBXFileReference; lastKnownFileType = text.html; name = Base; path = Base.lproj/Main.html; sourceTree = "<group>"; };
@@ -168,6 +172,8 @@
 				7D22E82B3081CAC200CD05F6 /* chunks */,
 				7D22E82C3081CAC200CD05F6 /* content-scripts */,
 				7D22E82D3081CAC200CD05F6 /* manifest.json */,
+				A01000100010001000100002 /* diagnostics.html */,
+				A02000100010001000100002 /* safari */,
 				7D22E82E3081CAC200CD05F6 /* js-kernel-offscreen.html */,
 				7D22E82F3081CAC200CD05F6 /* codex-work-sidepanel.html */,
 				7D22E8303081CAC200CD05F6 /* assets */,
@@ -272,6 +278,8 @@
 				7D22E8363081CAC200CD05F6 /* codex in Resources */,
 				7D22E8383081CAC200CD05F6 /* _metadata in Resources */,
 				7D22E83C3081CAC200CD05F6 /* manifest.json in Resources */,
+				A01000100010001000100001 /* diagnostics.html in Resources */,
+				A02000100010001000100001 /* safari in Resources */,
 				7D22E8343081CAC200CD05F6 /* images in Resources */,
 				7D22E8353081CAC200CD05F6 /* waiting-room.html in Resources */,
 				7D22E8323081CAC200CD05F6 /* js-kernel-host.html in Resources */,
