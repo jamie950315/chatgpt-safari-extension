@@ -1,0 +1,9 @@
+.DS_Store
+chatgpt.crx
+unpacked/
+build/
+dist/
+*.xcuserstate
+xcuserdata/
+*.xcscmblueprint
+__pycache__/
