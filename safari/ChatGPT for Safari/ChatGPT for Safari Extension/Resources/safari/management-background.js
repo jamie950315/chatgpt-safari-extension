@@ -209,7 +209,7 @@
         if (typeof personalData?.bookmarks !== "function") throw new Error("Safari's native bookmark capability is unavailable");
         const bookmark = async (operation, arguments_) => {
           await assertCurrent();
-          return personalData.bookmarks(operation, arguments_, owner);
+          return personalData.bookmarks(operation, arguments_, owner, { sessionId: metadata.session_id, turnId: metadata.turn_id, assertCurrent });
         };
         const handle = value => {
           if (typeof value !== "string" || !value || value.length > 256) throw new Error("Use a current native Safari bookmark handle");
@@ -441,7 +441,7 @@
       if (busy) throw new Error("Another Safari organization command is running. This command was not queued or executed");
       busy = true;
       try { return await execute(...args); } finally { busy = false; }
-    }, release(sessionId) { sessions.delete(sessionId); } };
+    }, release(sessionId) { personalData?.cancelBookmarks?.(sessionId); sessions.delete(sessionId); } };
   }
   if (typeof module === "object" && module.exports) module.exports = { createManagement };
   else Object.defineProperty(root, "ChatGPTSafariManagement", { value: { createManagement } });

@@ -42,10 +42,11 @@ function bookmarkFixture(lateSidebar = false) {
     const command = value.command.command;
     calls.push(value);
     if (command.action === "utilityEntry") return { ok: true, result: { url } };
-    events.push("native");
-    tabs.find(tab => tab.id === 2).url = "bookmarks://";
-    afterNative?.();
-    return response;
+    if (command.action === "bookmarksCancel") { events.push("cancel"); return { ok: true, result: { cancelled: true } }; }
+    events.push(command.action === "bookmarksContinue" ? "finalize" : "native");
+    tabs.find(tab => tab.id === 2).url = command.action === "bookmarksContinue" ? url : "bookmarks://";
+    afterNative?.(command);
+    return typeof response === "function" ? response(command) : response;
   } }, windows: {
     async getAll() { return [...windows.values()].map(value => ({ ...value })); },
     async create(options) {
@@ -64,7 +65,7 @@ function bookmarkFixture(lateSidebar = false) {
     async query(query) { return tabs.filter(tab => tab.windowId === query.windowId).map(value => ({ ...value })); },
     onUpdated: { addListener(listener) { updates.add(listener); }, removeListener(listener) { updates.delete(listener); } },
   } };
-  const sidebar = { async withAgentSelection(token, tab, operation) {
+  const sidebar = { async withAgentSelection(token, tab, operation, selectionScope) {
     assert.equal(token, owner.instanceId); assert.equal(tab.id, 2);
     const result = await operation({
       async select(target) {
@@ -73,6 +74,7 @@ function bookmarkFixture(lateSidebar = false) {
         duringSelect?.();
       },
       assertCurrent() { if (!restore) throw new Error("Safari selection changed"); },
+      confirmBookmarkUtility(tab) { assert.equal(selectionScope.nativeBookmarkCreate, url); assert.equal(tab.url, url); },
     });
     if (restore) {
       events.push("restore");
@@ -82,7 +84,8 @@ function bookmarkFixture(lateSidebar = false) {
   } };
   const data = createPersonalData(api, { async agentOwner() { return { ...owner }; } }, lateSidebar ? undefined : sidebar);
   if (lateSidebar) globalThis.ChatGPTSafariSidebar = sidebar;
-  return { data, owner, url, calls, events, tabs, windows, removed, updates, api,
+  const scope = { sessionId: "synthetic-session", turnId: "synthetic-turn", async assertCurrent() {} };
+  return { data, owner, url, calls, events, tabs, windows, removed, updates, api, scope,
     response(value) { response = value; }, createdId(value) { createdId = value; }, afterNative(value) { afterNative = value; },
     afterCreate(value) { afterCreate = value; }, duringSelect(value) { duringSelect = value; }, manualFocus() { restore = false; } };
 }
@@ -209,11 +212,11 @@ test("URL creation and bookmark deletions use the same one-shot native owner tra
     ["remove", ["owned-synthetic-bookmark"]], ["removeTree", ["owned-synthetic-folder"]], ["move", ["owned-synthetic-bookmark", { parentId: "owned-synthetic-folder" }]]]) {
     const f = bookmarkFixture();
     f.response({ ok: false, error: { code: "BOOKMARK_OPERATION_UNCONFIRMED", message: "Native result unconfirmed", data: { mutationApplied: true } } });
-    await assert.rejects(f.data.bookmarks(method, args), error => error.doNotReplay === true && error.mutationApplied === true);
+    await assert.rejects(f.data.bookmarks(method, args, undefined, f.scope), error => error.doNotReplay === true && error.mutationApplied === true);
     const native = f.calls.filter(call => call.command.command.action === "bookmarks");
     assert.equal(native.length, 1); assert.equal(native[0].command.command.method, method);
     assert.deepEqual(native[0].command.command.arguments, args);
-    assert.deepEqual(f.events.slice(-2), ["restore", "remove"]);
+    assert.deepEqual(f.events.slice(-2), method === "create" ? ["cancel", "remove"] : ["restore", "remove"]);
   }
 });
 
@@ -268,4 +271,81 @@ test("a tab changed after utility readiness cannot reach the native editor", asy
   f.duringSelect(() => { f.tabs[1].url = "https://example.test/user-after-ready"; });
   await assert.rejects(f.data.getBookmarks(), /changed before native/);
   assert.equal(f.events.includes("native"), false); assert.deepEqual(f.removed, []); assert.equal(f.updates.size, 0);
+});
+
+function stagedResponse(command) {
+  return { ok: true, result: { kind: "bookmark-create-staged", operationId: command.operationId,
+    receipt: "33333333-3333-4333-8333-333333333333", pendingTitle: `ChatGPT Safari Pending ${command.operationId}` } };
+}
+test("one original create awaits two scoped native stages in the same selection and exposes only the final record", async () => {
+  const f = bookmarkFixture();
+  const final = { id: "created-one", title: "Synthetic", url: "https://example.test/created", parentId: "owned-child", index: 0 };
+  f.response(command => command.action === "bookmarks" ? stagedResponse(command) : { ok: true,
+    result: { kind: "bookmark-create-complete", record: final, utilityRestored: true } });
+  const result = await f.data.bookmarks("create", [{ title: final.title, url: final.url, parentId: final.parentId }], f.owner, f.scope);
+  assert.deepEqual(result, final); assert.equal(JSON.stringify(result).includes("receipt"), false);
+  const start = f.calls.find(call => call.command.command.action === "bookmarks").command.command;
+  const continuation = f.calls.find(call => call.command.command.action === "bookmarksContinue").command.command;
+  assert.equal(continuation.operationId, start.operationId); assert.equal(continuation.sessionId, f.scope.sessionId);
+  assert.equal(continuation.turnId, f.scope.turnId); assert.equal(continuation.expectedUrl, start.expectedUrl);
+  assert.deepEqual(continuation.windowBounds, start.windowBounds); assert.equal(continuation.arguments, undefined);
+  assert.deepEqual(f.events.filter(value => typeof value === "string"), ["select", "native", "finalize", "restore", "remove"]);
+  assert.equal(f.calls.filter(call => call.command.command.action === "bookmarks").length, 1);
+});
+test("create accepts only a native-restored sole capability page and its real fresh tab identity", async () => {
+  for (const invalid of [false, "proof", "sibling", "document"]) {
+    const f = bookmarkFixture(), record = { id: "created-one", title: "Synthetic", url: "https://example.test/created" };
+    f.response(command => command.action === "bookmarks" ? stagedResponse(command)
+      : { ok: true, result: { kind: "bookmark-create-complete", record, utilityRestored: invalid !== "proof" } });
+    f.afterNative(command => {
+      if (command.action !== "bookmarksContinue") return;
+      f.tabs[1].id = 3;
+      if (invalid === "sibling") f.tabs.push({ ...f.tabs[1], id: 4 });
+      if (invalid === "document") f.tabs[1].url = "https://example.test/user";
+    });
+    const result = f.data.bookmarks("create", [{ title: record.title, url: record.url }], f.owner, f.scope);
+    if (invalid) await assert.rejects(result, error => error.doNotReplay === true);
+    else { assert.deepEqual(await result, record); assert.deepEqual(f.removed, [20]); }
+    assert.equal(f.calls.filter(call => call.command.command.action === "bookmarks").length, 1);
+    assert.equal(f.calls.filter(call => call.command.command.action === "bookmarksContinue").length, 1);
+    assert.equal(f.events.filter(value => value === "select").length, 1);
+  }
+});
+test("changed receipt, session, native document, window or owner cancels without focusing again or replaying Add", async () => {
+  for (const change of ["receipt", "turn", "document", "bounds", "owner", "selection", "cancel"]) {
+    const f = bookmarkFixture(); let authorizations = 0;
+    const scope = { ...f.scope, async assertCurrent() { if (change === "turn" && ++authorizations > 1) throw new Error("Original turn ended"); } };
+    f.response(command => { const response = stagedResponse(command); if (change === "receipt") response.result.receipt = "invalid"; return response; });
+    f.afterNative(() => {
+      if (change === "document") {
+        f.tabs[1].url = "https://example.test/user";
+        for (const listener of f.updates) listener(2, { url: f.tabs[1].url });
+      }
+      if (change === "bounds") f.windows.get(20).width += 100;
+      if (change === "owner") f.owner.accountScope = "changed";
+      if (change === "selection") f.manualFocus();
+      if (change === "cancel") f.data.cancelBookmarks(scope.sessionId);
+    });
+    await assert.rejects(f.data.bookmarks("create", [{ title: "Synthetic", url: "https://example.test/create" }], f.owner, scope), error => {
+      assert.equal(error.doNotReplay, true); assert.match(error.message, /Existing pending entry, if Add was applied: ChatGPT Safari Pending/); return true;
+    });
+    assert.equal(f.calls.filter(call => call.command.command.action === "bookmarks").length, 1);
+    assert.equal(f.calls.filter(call => call.command.command.action === "bookmarksContinue").length, 0);
+    assert.equal(f.calls.filter(call => call.command.command.action === "bookmarksCancel").length, 1);
+    assert.equal(f.events.filter(value => value === "select").length, 1);
+  }
+});
+test("continuation transport failure remains partial with an identifiable pending record and no Add replay", async () => {
+  const f = bookmarkFixture();
+  f.response(command => {
+    if (command.action === "bookmarks") return stagedResponse(command);
+    throw new Error("Companion disconnected after finalization delivery");
+  });
+  await assert.rejects(f.data.bookmarks("create", [{ title: "Synthetic", url: "https://example.test/create" }], f.owner, f.scope), error => {
+    assert.equal(error.doNotReplay, true); assert.match(error.message, /Existing pending entry/); assert.equal(error.message.includes("33333333"), false); return true;
+  });
+  assert.equal(f.calls.filter(call => call.command.command.action === "bookmarks").length, 1);
+  assert.equal(f.calls.filter(call => call.command.command.action === "bookmarksContinue").length, 1);
+  assert.equal(f.calls.filter(call => call.command.command.action === "bookmarksCancel").length, 1);
+  assert.deepEqual(f.removed, [20]);
 });

@@ -346,6 +346,92 @@ final class SafariLiveInput: @unchecked Sendable {
     private var currentAuthorization: (() -> Bool)?
     private var collectingModalObservation = false
     private var lastModalObservation: [String: Any]?
+    private final class BookmarkContinuation {
+        let gate: SafariBookmarks.ContinuationGate
+        let target: Target
+        private let lock = NSLock()
+        private var finish: ((SafariBookmarks.OperationDeadline) throws -> Any)?
+        init(gate: SafariBookmarks.ContinuationGate, target: Target) { self.gate = gate; self.target = target }
+        func install(_ action: @escaping (SafariBookmarks.OperationDeadline) throws -> Any) { lock.lock(); defer { lock.unlock() }; finish = action }
+        func consume() -> ((SafariBookmarks.OperationDeadline) throws -> Any)? { lock.lock(); defer { lock.unlock() }; let value = finish; finish = nil; return value }
+        func clear() { lock.lock(); defer { lock.unlock() }; finish = nil }
+    }
+    private let bookmarkContinuationLock = NSLock()
+    private var bookmarkContinuations: [UUID: BookmarkContinuation] = [:]
+    private var seenBookmarkOperations: Set<UUID> = []
+
+    private func registerBookmarkContinuation(_ command: [String: Any], profileIdentity: String,
+                                              deadline: SafariBookmarks.OperationDeadline) throws -> BookmarkContinuation {
+        let scope = try SafariBookmarks.ContinuationScope(command, profileIdentity: profileIdentity)
+        let target = try Target(command)
+        guard (0..<5).contains(Date().timeIntervalSince(scope.issuedAt)) else {
+            throw SafariBookmarks.Failure(code: "STALE_OPERATION", message: "The original bookmark creation request is no longer fresh. No Add command was started.")
+        }
+        bookmarkContinuationLock.lock(); defer { bookmarkContinuationLock.unlock() }
+        bookmarkContinuations = bookmarkContinuations.filter { Date() < $0.value.gate.overallExpiry }
+        guard !seenBookmarkOperations.contains(scope.operationID) else {
+            throw SafariBookmarks.Failure(code: "BOOKMARK_OPERATION_ALREADY_DELIVERED", message: "This bookmark operation was already accepted. Inspect its existing pending entry; do not repeat Add.", mutationApplied: true)
+        }
+        let value = BookmarkContinuation(gate: SafariBookmarks.ContinuationGate(scope: scope, now: deadline.issuedAt), target: target)
+        seenBookmarkOperations.insert(scope.operationID)
+        bookmarkContinuations[scope.operationID] = value
+        DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + 45) { [weak self, weak value] in
+            guard let self, let value else { return }
+            _ = value.gate.cancel(scope: scope); value.clear()
+            self.bookmarkContinuationLock.lock(); defer { self.bookmarkContinuationLock.unlock() }
+            if self.bookmarkContinuations[scope.operationID] === value { self.bookmarkContinuations.removeValue(forKey: scope.operationID) }
+        }
+        return value
+    }
+
+    func continueBookmarks(_ command: [String: Any], profileIdentity: String, isAuthorized: @escaping () -> Bool,
+                           reply: @escaping ([String: Any]) -> Void) {
+        do {
+            let scope = try SafariBookmarks.ContinuationScope(command, profileIdentity: profileIdentity)
+            bookmarkContinuationLock.lock()
+            let transaction = bookmarkContinuations[scope.operationID]
+            bookmarkContinuationLock.unlock()
+            guard let transaction, transaction.gate.scope == scope else {
+                throw SafariBookmarks.Failure(code: "BOOKMARK_CONTINUATION_EXPIRED", message: "The original bookmark transaction is no longer available. Inspect its pending entry; do not repeat Add.", mutationApplied: true)
+            }
+            if command["action"] as? String == "bookmarksCancel" {
+                _ = transaction.gate.cancel(scope: scope)
+                transaction.clear()
+                reply(["ok": true, "result": ["cancelled": true]])
+                return
+            }
+            guard let receipt = command["receipt"] as? String else { throw SafariBookmarks.Failure(code: "STALE_OPERATION", message: "The original bookmark continuation receipt is missing.", mutationApplied: true) }
+            let target = try Target(command)
+            guard target.expectedURL == transaction.target.expectedURL, target.windowBounds == transaction.target.windowBounds else {
+                throw SafariBookmarks.Failure(code: "STALE_OPERATION", message: "The bookmark continuation changed its exact original utility target. Do not repeat Add.", mutationApplied: true)
+            }
+            queue.async {
+                do {
+                    guard Self.onMain(isAuthorized) else { throw SafariBookmarks.Failure(code: "STALE_OPERATION", message: "The original bookmark owner is no longer available.", mutationApplied: true) }
+                    let deadline = try transaction.gate.beginFinalize(receipt: receipt, scope: scope)
+                    guard let finish = transaction.consume() else { throw SafariBookmarks.Failure(code: "STALE_OPERATION", message: "The original bookmark finalization is no longer available.", mutationApplied: true) }
+                    let result = try finish(deadline)
+                    guard transaction.gate.authorized(), Self.onMain(isAuthorized) else { throw SafariBookmarks.Failure(code: "STALE_OPERATION", message: "The original bookmark transaction ended before its final result could be returned.", mutationApplied: true) }
+                    transaction.gate.complete()
+                    reply(["ok": true, "result": result])
+                } catch let failure as SafariBookmarks.Failure {
+                    transaction.gate.fail(); transaction.clear()
+                    var data = failure.diagnostics?.data ?? [:]
+                    data["mutationApplied"] = true; data["doNotReplay"] = true
+                    reply(Self.failureResponse(Failure(code: failure.code, message: failure.message + " Inspect the existing entry named " + transaction.gate.marker + "; do not repeat Add.", details: data)))
+                } catch let failure as Failure {
+                    transaction.gate.fail(); transaction.clear()
+                    reply(Self.failureResponse(Failure(code: failure.code, message: failure.message + " Inspect the existing entry named " + transaction.gate.marker + "; do not repeat Add.", details: ["mutationApplied": true, "doNotReplay": true])))
+                } catch {
+                    transaction.gate.fail(); transaction.clear()
+                    reply(Self.failureResponse(Failure(code: "BOOKMARK_CREATE_UNCONFIRMED", message: "Bookmark finalization did not complete. Inspect the existing entry named " + transaction.gate.marker + "; do not repeat Add.", details: ["mutationApplied": true, "doNotReplay": true])))
+                }
+            }
+        } catch let failure as SafariBookmarks.Failure {
+            reply(Self.failureResponse(Failure(code: failure.code, message: failure.message, details: ["mutationApplied": failure.mutationApplied, "doNotReplay": failure.mutationApplied])))
+        } catch let failure as Failure { reply(Self.failureResponse(failure)) }
+        catch { reply(Self.failureResponse(Failure(code: "STALE_OPERATION", message: "The original bookmark continuation scope is invalid."))) }
+    }
 
     func acknowledgeClipboard(_ input: [String: Any]) { nativeClipboard.acknowledge(input) }
 
@@ -473,12 +559,20 @@ final class SafariLiveInput: @unchecked Sendable {
     func manageBookmarks(_ command: [String: Any], profileIdentity: String, deadline: SafariBookmarks.OperationDeadline,
                          isAuthorized: @escaping () -> Bool,
                          reply: @escaping ([String: Any]) -> Void) {
+        let transaction: BookmarkContinuation?
+        do { transaction = command["method"] as? String == "create" ? try registerBookmarkContinuation(command, profileIdentity: profileIdentity, deadline: deadline) : nil }
+        catch let failure as SafariBookmarks.Failure {
+            reply(Self.failureResponse(Failure(code: failure.code, message: failure.message, details: ["mutationApplied": failure.mutationApplied, "doNotReplay": failure.mutationApplied]))); return
+        } catch let failure as Failure { reply(Self.failureResponse(failure)); return }
+        catch { reply(Self.failureResponse(Failure(code: "STALE_OPERATION", message: "The bookmark operation scope is invalid."))); return }
         queue.async { [self] in
             var guardStage = "none"
+            var bookmarkFocusObservation: [String: Any] = [:]
+            var activeDeadline = deadline
             let queueWaitMS = max(0, min(1_000_000_000, Int(Date().timeIntervalSince(deadline.issuedAt) * 1000)))
             let previousAuthorization = currentAuthorization
             currentAuthorization = {
-                let status = deadline.authorization(ownerCurrent: isAuthorized())
+                let status = activeDeadline.authorization(ownerCurrent: isAuthorized() && (transaction?.gate.authorized() ?? true))
                 if status != .current { guardStage = status.rawValue }
                 return status == .current
             }
@@ -505,12 +599,41 @@ final class SafariLiveInput: @unchecked Sendable {
                 }
                 let app = AXUIElementCreateApplication(front.processIdentifier)
                 var editorPhase = false
+                var bookmarkSheetPhase = false
+                var verifiedEditorSurface: [AXUIElement]?
                 func stableWindow(postedButton: CGMouseButton? = nil) -> Bool {
-                    let authorization = deadline.authorization(ownerCurrent: Self.onMain(isAuthorized))
+                    let authorization = activeDeadline.authorization(ownerCurrent: Self.onMain(isAuthorized) && (transaction?.gate.authorized() ?? true))
                     guard authorization == .current else { guardStage = authorization.rawValue; return false }
                     guard self.frontmostApplication()?.processIdentifier == front.processIdentifier else { guardStage = "frontmost_process"; return false }
                     guard self.focusedApplicationPID() == front.processIdentifier else { guardStage = "focused_application"; return false }
-                    guard let focused = self.element(app, kAXFocusedWindowAttribute), CFEqual(focused, window) else { guardStage = "focused_window"; return false }
+                    guard let focused = self.element(app, kAXFocusedWindowAttribute) else { guardStage = "focused_window"; return false }
+                    if !CFEqual(focused, window) {
+                        // Safari exposes AddBookmarkSheet through AXChildren,
+                        // with both AXParent and AXWindow bound to its utility
+                        // window; its AXSheets attribute is empty. Prove that
+                        // actual attachment instead of assuming AXSheets.
+                        let nativeSurface = SafariBookmarks.editorSurfaceNodes(window, children: {
+                            (self.attribute($0, kAXChildrenAttribute) as? [AXUIElement] ?? []) + (self.attribute($0, "AXSheets") as? [AXUIElement] ?? [])
+                        }, role: { self.string($0, kAXRoleAttribute) }, identifier: { self.string($0, kAXIdentifierAttribute) }, equal: { CFEqual($0, $1) }) ?? []
+                        let attached = nativeSurface.filter { node in
+                            self.string(node, kAXRoleAttribute) == kAXSheetRole
+                                && self.element(node, kAXParentAttribute).map { CFEqual($0, window) } == true
+                                && self.element(node, kAXWindowAttribute).map { CFEqual($0, window) } == true
+                        }
+                        bookmarkFocusObservation = ["sheetPhase": bookmarkSheetPhase,
+                            "focusedIsSheet": self.string(focused, kAXRoleAttribute) == kAXSheetRole,
+                            "focusedIsBookmarkSheet": self.string(focused, kAXIdentifierAttribute) == "AddBookmarkSheet",
+                            "attachedSheetCount": min(attached.count, 2),
+                            "focusedMatchesAttachedSheet": attached.contains(where: { CFEqual($0, focused) }),
+                            "focusedParentMatchesWindow": self.element(focused, kAXParentAttribute).map { CFEqual($0, window) } ?? false,
+                            "focusedAXWindowMatchesWindow": self.element(focused, kAXWindowAttribute).map { CFEqual($0, window) } ?? false,
+                            "sheetInWindowSurface": nativeSurface.contains(where: { CFEqual($0, focused) })]
+                        guard SafariBookmarks.acceptsAddBookmarkSheet(phaseAllowed: bookmarkSheetPhase,
+                            role: self.string(focused, kAXRoleAttribute), identifier: self.string(focused, kAXIdentifierAttribute),
+                            attachedCount: attached.count, exactFocusedAttachment: attached.contains(where: { CFEqual($0, focused) })) else {
+                            guardStage = "focused_window"; return false
+                        }
+                    }
                     guard self.string(window, kAXIdentifierAttribute) == identifier else { guardStage = "window_identity"; return false }
                     guard let bounds = self.frame(window), Self.close(bounds, target.windowBounds, tolerance: 8) else { guardStage = "window_bounds"; return false }
                     let input = self.inputState(.combinedSessionState)
@@ -536,6 +659,7 @@ final class SafariLiveInput: @unchecked Sendable {
                 func editorObservation() -> (readiness: SafariBookmarks.EditorReadiness, addressKind: String, outlineCount: Int,
                                               addressMatchesOutline: Bool, titleMatchesOutline: Bool, hasWebArea: Bool, documentKind: String, surfaceComplete: Bool) {
                     let surface = surfaceNodes(), nodes = surface ?? []
+                    verifiedEditorSurface = surface
                     let address = nodes.first { string($0, kAXIdentifierAttribute) == "WEB_BROWSER_ADDRESS_AND_SEARCH_FIELD" }.flatMap { string($0, kAXValueAttribute) }
                     let outlines = nodes.filter { string($0, kAXIdentifierAttribute) == "Bookmarks" && string($0, kAXRoleAttribute) == kAXOutlineRole }
                     let label = outlines.count == 1 ? string(outlines[0], kAXDescriptionAttribute) : nil
@@ -560,6 +684,14 @@ final class SafariLiveInput: @unchecked Sendable {
                 }
                 let valid = { stableWindow() && boundPage() }
                 let validWithPostedButton = { (button: CGMouseButton) in stableWindow(postedButton: button) && boundPage() }
+                let currentEditorSurface = { (button: CGMouseButton?) -> [AXUIElement]? in
+                    // No cross-action cache: each call discards the previous
+                    // array and obtains the exact surface during this native
+                    // authorization check, synchronously before the action.
+                    verifiedEditorSurface = nil
+                    guard editorPhase, stableWindow(postedButton: button), boundPage() else { return nil }
+                    return verifiedEditorSurface
+                }
                 func openEditor() throws {
                     guard valid(), let menuBar = element(app, kAXMenuBarAttribute),
                           let menu = nativeNodes(menuBar).first(where: { string($0, kAXIdentifierAttribute) == "SafariBookmarksMenu" }),
@@ -589,7 +721,7 @@ final class SafariLiveInput: @unchecked Sendable {
                     }
                     throw Failure(code: "BOOKMARK_EDITOR_UNAVAILABLE", message: "Safari did not expose the exact temporary window's native bookmarks editor. Native editor result: addressKind=\(observation.addressKind), documentKind=\(observation.documentKind), outlineCount=\(observation.outlineCount), windowStable=\(windowStable), addressMatchesOutline=\(observation.addressMatchesOutline), titleMatchesOutline=\(observation.titleMatchesOutline), hasWebArea=\(observation.hasWebArea), surfaceComplete=\(observation.surfaceComplete), guardStage=\(guardStage).")
                 }
-                func utilityPage(_ operation: () throws -> Void) throws {
+                func loadUtilityPage() throws {
                     guard valid(), let address = nativeNodes(window).first(where: { string($0, kAXIdentifierAttribute) == "WEB_BROWSER_ADDRESS_AND_SEARCH_FIELD" }),
                           AXUIElementSetAttributeValue(address, kAXFocusedAttribute as CFString, kCFBooleanTrue) == .success else {
                         throw Failure(code: "BOOKMARK_CREATE_UNAVAILABLE", message: "Safari could not focus the temporary window's native address field.")
@@ -614,21 +746,65 @@ final class SafariLiveInput: @unchecked Sendable {
                         Thread.sleep(forTimeInterval: 0.025)
                     }
                     guard loaded, valid() else { throw Failure(code: "BOOKMARK_CREATE_UNAVAILABLE", message: "Safari did not load the exact capability-bound bookmark utility page.") }
-                    try operation()
-                    try openEditor()
+                }
+                func utilityPage(_ operation: () throws -> Void) throws {
+                    try loadUtilityPage()
+                    var operationError: Error?
+                    do {
+                        bookmarkSheetPhase = true
+                        defer { bookmarkSheetPhase = false }
+                        do { try operation() } catch { operationError = error }
+                    }
+                    // Reentry is view restoration, not a replay of Add.
+                    // Retain the original failure if the one Add transaction
+                    // failed; owner/focus/deadline checks still gate reentry.
+                    do { try openEditor() }
+                    catch { if let operationError { throw operationError }; throw error }
+                    if let operationError { throw operationError }
                 }
                 try openEditor()
                 guard valid() else { throw Failure(code: "FOCUS_CHANGED", message: "The temporary bookmarks window changed. No bookmark command was replayed.") }
                 let result = try bookmarks.perform(method: method, args: args, window: window, profileIdentity: profileIdentity,
                     utilityURL: target.expectedURL, withUtilityPage: utilityPage,
-                    assertCurrentWithPostedButton: validWithPostedButton, assertCurrent: valid)
+                    assertCurrentWithPostedButton: validWithPostedButton, currentEditorSurface: currentEditorSurface,
+                    stageCreation: transaction != nil, creationMarker: transaction?.gate.marker, assertCurrent: valid)
+                if let pending = result as? SafariBookmarks.PendingCreation, let transaction {
+                    transaction.install { [self] nextDeadline in
+                        activeDeadline = nextDeadline
+                        let previous = currentAuthorization
+                        currentAuthorization = { isAuthorized() && transaction.gate.authorized() }
+                        defer { currentAuthorization = previous }
+                        // Never focusTarget/select here: this continuation must
+                        // still own the exact original foreground window.
+                        guard valid() else { throw Failure(code: "FOCUS_CHANGED", message: "The original bookmark transaction lost foreground, window or editor ownership before finalization.") }
+                        let finalized = try bookmarks.perform(method: "__finalizeCreate", args: [], window: window, profileIdentity: profileIdentity,
+                            assertCurrentWithPostedButton: validWithPostedButton, currentEditorSurface: currentEditorSurface,
+                            pendingCreation: pending, assertCurrent: valid)
+                        guard bookmarks.lastRestorationConfirmed else { throw Failure(code: "BOOKMARK_RESTORATION_UNCONFIRMED", message: "The created bookmark was finalized, but the original native view restoration was not confirmed.") }
+                        // Safari temporarily unloads the utility's API tab
+                        // identity while its native editor is visible. Return
+                        // to the exact capability page under this same native
+                        // foreground/window lease before the extension binds
+                        // the fresh ordinary tab and restores its sidebar.
+                        try loadUtilityPage()
+                        guard valid() else { throw Failure(code: "BOOKMARK_RESTORATION_UNCONFIRMED", message: "The finalized bookmark's exact utility page was not restored. Do not repeat Add.") }
+                        return ["kind": "bookmark-create-complete", "record": finalized, "utilityRestored": true]
+                    }
+                    let receipt = try transaction.gate.issueReceipt()
+                    reply(["ok": true, "result": ["kind": "bookmark-create-staged", "receipt": receipt,
+                        "operationId": transaction.gate.scope.operationID.uuidString, "pendingTitle": transaction.gate.marker]])
+                    return
+                }
                 guard bookmarks.lastRestorationConfirmed else {
                     throw Failure(code: "BOOKMARK_RESTORATION_UNCONFIRMED", message: "The bookmark command finished, but the editor's temporary expansion could not be restored. Inspect current state before repeating it. Native guard stage: \(guardStage), queueWaitMS=\(queueWaitMS).",
                                   details: ["mutationApplied": ["update", "createFolder", "create", "remove", "removeTree", "move"].contains(method), "doNotReplay": true])
                 }
                 reply(["ok": true, "result": result])
             } catch let failure as SafariBookmarks.Failure {
+                transaction?.gate.fail(); transaction?.clear()
                 var details = failure.diagnostics?.data ?? [:]
+                for (key, value) in failure.timings { details[key.rawValue] = value }
+                for (key, value) in bookmarkFocusObservation { details[key] = value }
                 details["guardStage"] = guardStage
                 details["queueWaitMS"] = queueWaitMS
                 details["elapsedMS"] = max(0, min(1_000_000_000, Int(Date().timeIntervalSince(deadline.issuedAt) * 1000)))
@@ -636,11 +812,12 @@ final class SafariLiveInput: @unchecked Sendable {
                 details["doNotReplay"] = failure.mutationApplied
                 reply(Self.failureResponse(Failure(code: failure.code, message: failure.message, details: details)))
             } catch let failure as Failure {
+                transaction?.gate.fail(); transaction?.clear()
                 reply(Self.failureResponse(["FOCUS_CHANGED", "STALE_OPERATION", "BOOKMARK_DEADLINE_EXPIRED"].contains(failure.code)
                     ? Failure(code: failure.code, message: failure.message + " Native guard stage: \(guardStage), queueWaitMS=\(queueWaitMS).",
                               eventsPosted: failure.eventsPosted, details: failure.details) : failure))
             }
-            catch { reply(Self.failureResponse(Failure(code: "BOOKMARK_OPERATION_FAILED", message: "Safari's native bookmark operation failed."))) }
+            catch { transaction?.gate.fail(); transaction?.clear(); reply(Self.failureResponse(Failure(code: "BOOKMARK_OPERATION_FAILED", message: "Safari's native bookmark operation failed."))) }
         }
     }
 
@@ -680,6 +857,11 @@ final class SafariLiveInput: @unchecked Sendable {
         }
         result["inputState"] = inputStatesData()
         result["clipboard"] = nativeClipboard.recoveryStatus()
+        bookmarkContinuationLock.lock()
+        let bookmarkPhases = bookmarkContinuations.values.map { ($0.gate.phase, $0.gate.authorized()) }
+        bookmarkContinuationLock.unlock()
+        result["bookmarkContinuation"] = ["active": bookmarkPhases.filter { $0.1 }.count,
+            "awaitingReceipt": bookmarkPhases.filter { $0.0 == .awaitingFinalize && $0.1 }.count]
         if let lastModalObservation { result["nativeModal"] = lastModalObservation }
         if let focusedPID {
             result["accessibilitySafariFrontmost"] = safariApplications().contains { $0.processIdentifier == focusedPID }

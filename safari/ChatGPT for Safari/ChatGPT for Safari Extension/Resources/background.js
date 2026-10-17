@@ -674,14 +674,16 @@ function m(t,o,e){if(location.origin!==t||o!=null&&location.href!==o)return{sele
       // that boundary. Never copy bookmark titles, URLs, handles or inventories.
       const data = error.data || {}, safe = {};
       if (["BOOKMARK_OPERATION_UNCONFIRMED", "FOCUS_CHANGED", "BOOKMARK_DEADLINE_EXPIRED", "STALE_OPERATION"].includes(error.code)) safe.code = error.code;
-      if (["expansion", "restoration", "inventory", "confirmation", "url_focus", "url_commit", "title_focus", "title_commit",
+      if (["expansion", "restoration", "inventory", "confirmation", "source_reveal", "destination_reveal", "url_focus", "url_commit", "title_focus", "title_commit",
         "folder_focus", "folder_commit", "delete_menu", "delete_completion"].includes(data.stage)) safe.stage = data.stage;
       if (["none", "owner", "deadline", "owner_and_deadline", "frontmost_process", "focused_application", "focused_window",
         "window_identity", "window_bounds", "input", "editor_surface", "editor_identity", "utility_identity"].includes(data.guardStage)) safe.guardStage = data.guardStage;
-      for (const key of ["waitMS", "queueWaitMS", "elapsedMS", "expansionMS", "inventoryMS"]) {
+      for (const key of ["waitMS", "queueWaitMS", "elapsedMS", "expansionMS", "inventoryMS", "attachedSheetCount",
+        "initialExpansionMS", "initialInventoryMS", "utilityMS", "reentryExpansionMS", "reentryInventoryMS", "updateMS", "finalInventoryMS"]) {
         if (Number.isSafeInteger(data[key]) && data[key] >= 0 && data[key] <= 1_000_000_000) safe[key] = data[key];
       }
-      for (const key of ["focusedElementMatches", "fieldFocused", "valueMatches", "mutationApplied", "doNotReplay"]) {
+      for (const key of ["focusedElementMatches", "fieldFocused", "valueMatches", "mutationApplied", "doNotReplay", "sheetPhase",
+        "focusedIsSheet", "focusedIsBookmarkSheet", "focusedMatchesAttachedSheet", "focusedParentMatchesWindow", "focusedAXWindowMatchesWindow", "sheetInWindowSurface"]) {
         if (typeof data[key] === "boolean") safe[key] = data[key];
       }
       if (Object.keys(safe).length) error.message += ` Native bookmark result: ${JSON.stringify(safe)}.`;
@@ -690,6 +692,7 @@ function m(t,o,e){if(location.origin!==t||o!=null&&location.href!==o)return{sele
   }
   function createPersonalData(api, companion, sidebar = root.ChatGPTSafariSidebar) {
     let bookmarksBusy = false;
+    const activeCreations = new Map();
     const currentOwner = async owner => {
       if (!sameOwner(await companion.agentOwner(), owner)) throw new Error("The original side-chat owner changed; personal data was not returned");
     };
@@ -697,6 +700,13 @@ function m(t,o,e){if(location.origin!==t||o!=null&&location.href!==o)return{sele
       action: "personalData", ownerToken: owner.instanceId, profileId: owner.profileId,
       command: { ...command, profileId: owner.profileId },
     } });
+    const cancelCreation = transaction => {
+      transaction.revoked = true;
+      if (transaction.delivered && !transaction.complete && !transaction.cancelSent && transaction.cancelCommand) {
+        transaction.cancelSent = true;
+        void send(transaction.owner, transaction.cancelCommand).catch(() => {});
+      }
+    };
     async function readyTab(tabId, windowId, url, owner, navigation) {
       const check = async () => {
         await currentOwner(owner);
@@ -743,15 +753,20 @@ function m(t,o,e){if(location.origin!==t||o!=null&&location.href!==o)return{sele
         })]);
       } finally { clearTimeout(timeout); api.tabs.onUpdated?.removeListener(listener); }
     }
-    async function bookmarks(method, args = [], expectedOwner) {
+    async function bookmarks(method, args = [], expectedOwner, originalScope) {
       if (bookmarksBusy) throw new Error("Another native Safari bookmark operation is running; this request was not queued");
       if (!["getTree", "search", "get", "getChildren", "getSubTree", "update", "createFolder", "create", "remove", "removeTree", "move"].includes(method)
         || !Array.isArray(args) || args.length > 2) throw new Error("This native Safari bookmark method is unsupported");
       // The sidebar adapter initializes after this background module.
       const activeSidebar = sidebar || root.ChatGPTSafariSidebar;
       if (typeof activeSidebar?.withAgentSelection !== "function") throw new Error("Safari's owner-bound bookmark selection is unavailable");
+      if (method === "create" && (!originalScope || typeof originalScope.sessionId !== "string" || !originalScope.sessionId
+        || typeof originalScope.turnId !== "string" || !originalScope.turnId || typeof originalScope.assertCurrent !== "function")) {
+        throw new Error("URL bookmark creation requires the exact original agent session and turn");
+      }
       bookmarksBusy = true;
       let owner, windowId, tabId, url, nativeDelivered = false, navigationWatcher;
+      let creation;
       const navigation = { untouched: true, committed: false };
       const mutation = ["update", "createFolder", "create", "remove", "removeTree", "move"].includes(method);
       try {
@@ -809,11 +824,65 @@ function m(t,o,e){if(location.origin!==t||o!=null&&location.href!==o)return{sele
               throw new Error("Safari did not return actual bookmark-window bounds");
             }
             selection.assertCurrent();
+            let scope = {};
+            if (method === "create") {
+              await originalScope.assertCurrent();
+              const operationId = root.crypto.randomUUID().toUpperCase();
+              scope = { operationId, sessionId: originalScope.sessionId, turnId: originalScope.turnId, issuedAtMs: Date.now() };
+              creation = { owner, ...scope, revoked: false, delivered: false, complete: false,
+                pendingTitle: `ChatGPT Safari Pending ${operationId}`,
+                cancelCommand: { action: "bookmarksCancel", expectedUrl: url, windowBounds, ...scope } };
+              activeCreations.set(operationId, creation);
+              creation.timer = setTimeout(() => cancelCreation(creation), 45000);
+            }
             nativeDelivered = true;
-            const response = await send(owner, { action: "bookmarks", expectedUrl: url, windowBounds, method, arguments: args });
+            if (creation) creation.delivered = true;
+            let response = await send(owner, { action: "bookmarks", expectedUrl: url, windowBounds, method, arguments: args, ...scope });
+            if (creation && response?.ok === true) {
+              const pending = response.result;
+              if (pending?.kind !== "bookmark-create-staged" || pending.operationId !== creation.operationId
+                || pending.pendingTitle !== creation.pendingTitle || typeof pending.receipt !== "string"
+                || !/^[a-f0-9-]{36}$/iu.test(pending.receipt)) throw new Error("The one-shot native bookmark receipt is invalid; Add was not repeated");
+              await currentOwner(owner);
+              await originalScope.assertCurrent();
+              selection.assertCurrent();
+              if (creation.revoked || !navigation.untouched) throw new Error("The original bookmark transaction was cancelled or its document changed; Add was not repeated");
+              // Native bookmarks:// temporarily has no ordinary API tab.
+              // The consumed receipt owns that exact original native editor;
+              // do not invent or reacquire a tab identity between stages.
+              const currentWindow = await api.windows.get(windowId);
+              if (currentWindow.incognito || !currentWindow.focused
+                || ["left", "top", "width", "height"].some(key => currentWindow[key] !== windowBounds[key])) {
+                throw new Error("The exact original bookmark utility window or native document changed before finalization; Add was not repeated");
+              }
+              // Continue the same original selection; never select/focus again
+              // to hide a manual foreground change between the two stages.
+              response = await send(owner, { action: "bookmarksContinue", expectedUrl: url, windowBounds, receipt: pending.receipt, ...scope });
+              await originalScope.assertCurrent();
+              if (creation.revoked) throw new Error("The original bookmark transaction was cancelled before its final result");
+              if (response?.ok === true) {
+                const complete = response.result;
+                if (complete?.kind !== "bookmark-create-complete" || complete.utilityRestored !== true || !complete.record
+                  || typeof selection.confirmBookmarkUtility !== "function") throw new Error("The native bookmark result did not prove utility restoration; Add was not repeated");
+                const siblings = await api.tabs.query({ windowId }), restoredWindow = await api.windows.get(windowId);
+                if (siblings.length !== 1 || restoredWindow.incognito || !restoredWindow.focused
+                  || ["left", "top", "width", "height"].some(key => restoredWindow[key] !== windowBounds[key])) {
+                  throw new Error("The restored bookmark utility is no longer the sole tab in its original window; Add was not repeated");
+                }
+                const restored = await api.tabs.get(siblings[0].id);
+                if (restored.windowId !== windowId || restored.url !== url || restored.incognito || !restored.active
+                  || restored.status === "loading" || restored.pendingUrl != null && restored.pendingUrl !== "" && restored.pendingUrl !== url) {
+                  throw new Error("Safari did not restore the exact capability-bound bookmark utility page; Add was not repeated");
+                }
+                selection.confirmBookmarkUtility(restored);
+                tabId = restored.id;
+                creation.complete = true;
+                response = { ok: true, result: complete.record };
+              }
+            }
             return response?.ok === true ? { value: response.result } : { error: nativeFailure(response, "Safari's native bookmark operation failed", true) };
           } catch (error) { return { error }; }
-        });
+        }, method === "create" ? { nativeBookmarkCreate: url } : {});
         await currentOwner(owner);
         if (outcome.error) throw outcome.error;
         return outcome.value;
@@ -821,9 +890,15 @@ function m(t,o,e){if(location.origin!==t||o!=null&&location.href!==o)return{sele
         if (nativeDelivered && mutation) {
           error.doNotReplay = true;
           error.message += ". The native bookmark command was delivered once. Inspect current bookmarks before continuing; do not replay it.";
+          if (creation && !creation.complete) error.message += ` Existing pending entry, if Add was applied: ${creation.pendingTitle}. Do not repeat Add.`;
         }
         throw error;
       } finally {
+        if (creation) {
+          clearTimeout(creation.timer);
+          activeCreations.delete(creation.operationId);
+          if (!creation.complete) cancelCreation(creation);
+        }
         // Close only our untouched, sole-tab utility window, after the owner
         // was restored. A focus change, user tab, navigation or account change
         // leaves it in place instead of closing or refocusing the user's work.
@@ -846,6 +921,9 @@ function m(t,o,e){if(location.origin!==t||o!=null&&location.href!==o)return{sele
     }
     return Object.freeze({
       bookmarks,
+      cancelBookmarks(sessionId) {
+        for (const transaction of activeCreations.values()) if (transaction.sessionId === sessionId) cancelCreation(transaction);
+      },
       getBookmarks: () => bookmarks("getTree"),
       async history(request) {
         const owner = await companion.agentOwner();
@@ -2974,7 +3052,7 @@ function m(t,o,e){if(location.origin!==t||o!=null&&location.href!==o)return{sele
         if (typeof personalData?.bookmarks !== "function") throw new Error("Safari's native bookmark capability is unavailable");
         const bookmark = async (operation, arguments_) => {
           await assertCurrent();
-          return personalData.bookmarks(operation, arguments_, owner);
+          return personalData.bookmarks(operation, arguments_, owner, { sessionId: metadata.session_id, turnId: metadata.turn_id, assertCurrent });
         };
         const handle = value => {
           if (typeof value !== "string" || !value || value.length > 256) throw new Error("Use a current native Safari bookmark handle");
@@ -3206,7 +3284,7 @@ function m(t,o,e){if(location.origin!==t||o!=null&&location.href!==o)return{sele
       if (busy) throw new Error("Another Safari organization command is running. This command was not queued or executed");
       busy = true;
       try { return await execute(...args); } finally { busy = false; }
-    }, release(sessionId) { sessions.delete(sessionId); } };
+    }, release(sessionId) { personalData?.cancelBookmarks?.(sessionId); sessions.delete(sessionId); } };
   }
   if (typeof module === "object" && module.exports) module.exports = { createManagement };
   else Object.defineProperty(root, "ChatGPTSafariManagement", { value: { createManagement } });
@@ -3791,7 +3869,7 @@ function m(t,o,e){if(location.origin!==t||o!=null&&location.href!==o)return{sele
     let selectionTrace = { phase: "idle", events: [], before: [], after: [] };
     const inventoryIds = tabs => tabs.slice(0, 256).map(tab => ({ tabId: tab.id, windowId: tab.windowId, active: tab.active === true }));
     function traceSelection(type, fields = {}) {
-      if (!agentSelection?.groupMove) return;
+      if (!agentSelection?.groupMove && !agentSelection?.bookmarkCreate) return;
       const event = { type };
       for (const key of ["tabId", "windowId", "oldWindowId", "newWindowId"]) {
         if (Number.isSafeInteger(fields[key])) event[key] = fields[key];
@@ -4014,9 +4092,20 @@ function m(t,o,e){if(location.origin!==t||o!=null&&location.href!==o)return{sele
           throw new Error("The Safari agent sidebar owner is no longer available");
         }
         const value = { owner, ownerTab: current, targetTab, expected: [], cancelled: false, expectedWindow: targetTab.windowId, inUse: true };
+        if (scope.nativeBookmarkCreate != null) {
+          const utility = new URL(scope.nativeBookmarkCreate);
+          if (targetTab.windowId === owner.windowId || targetTab.url !== utility.href || utility.protocol !== "http:"
+            || !/^chatgpt-utility-[a-f0-9-]{36}\.localhost$/iu.test(utility.hostname)
+            || !utility.port || !/^\/bookmarks\/[a-f0-9-]{36}$/iu.test(utility.pathname)
+            || utility.username || utility.password || utility.search || utility.hash) throw new Error("The native bookmark lifecycle requires its exact separate utility page");
+          value.bookmarkCreate = { url: utility.href, ids: new Set([targetTab.id]), liveIds: new Set([targetTab.id]),
+            unassigned: new Set(), removed: false, complete: false };
+          selectionTrace = { phase: "native", action: "bookmarkCreate", events: [], before: inventoryIds([targetTab]), after: [] };
+        }
         value.assertCurrent = () => {
           if (value.cancelled || agentSelection !== value || openByWindow.get(owner.windowId) !== owner) {
-            const error = new Error("Safari selection changed during the agent command. Read the current page before continuing; do not repeat input.");
+            const reason = value.cancelReason || "owner_or_selection";
+            const error = new Error(`Safari selection changed during the agent command. Read the current page before continuing; do not repeat input. Selection check: ${reason}.`);
             error.code = "FOCUS_CHANGED";
             throw error;
           }
@@ -4031,6 +4120,22 @@ function m(t,o,e){if(location.origin!==t||o!=null&&location.href!==o)return{sele
           }
           await api.windows.update(tab.windowId, { focused: true });
           value.assertCurrent();
+        };
+        value.confirmBookmarkUtility = tab => {
+          value.assertCurrent();
+          const transition = value.bookmarkCreate;
+          if (!transition || transition.complete || tab.windowId !== targetTab.windowId || tab.url !== transition.url
+            || !tab.active || tab.incognito || tab.status === "loading"
+            || tab.pendingUrl != null && tab.pendingUrl !== "" && tab.pendingUrl !== transition.url) {
+            throw new Error("The original native bookmark utility page was not restored");
+          }
+          // This is only the disposable capability page, not a claimed user
+          // tab or a persistent alias. Native completion proves the original
+          // AX window; the caller supplies its sole fresh real API tab.
+          transition.complete = true;
+          value.targetTab = { ...tab };
+          selectionTrace.phase = "verified";
+          selectionTrace.after = inventoryIds([tab]);
         };
         value.holdDialog = (kind = "dialog") => {
           value.assertCurrent();
@@ -4242,7 +4347,7 @@ function m(t,o,e){if(location.origin!==t||o!=null&&location.href!==o)return{sele
         if (!selection.dialogHeld && !selection.cancelled && !movedOwner && !restoredOwner && openByWindow.get(selection.owner.windowId) === selection.owner) {
           const verified = selection.owner.tabId !== targetTab.id ? selection.verifiedNativeSelection : undefined;
           try {
-            const current = await api.tabs.get(verified?.tabId ?? targetTab.id);
+            const current = await api.tabs.get(verified?.tabId ?? selection.targetTab.id);
             const window = await api.windows.get(verified?.windowId ?? targetTab.windowId);
             const unchanged = !verified || (current.windowId === verified.windowId && current.index === verified.index
               && current.title === verified.title && current.url === verified.url);
@@ -4267,6 +4372,10 @@ function m(t,o,e){if(location.origin!==t||o!=null&&location.href!==o)return{sele
         }
         return result;
       } finally {
+        if (selection.bookmarkCreate && !selection.bookmarkCreate.complete) {
+          selectionTrace.phase = "rejected";
+          selectionTrace.failure = { stage: selection.cancelReason || "native_or_restoration" };
+        }
         selection.inUse = false;
         if (!selection.dialogHeld || selection.cancelled) {
           clearTimeout(selection.dialogTimer);
@@ -4489,6 +4598,14 @@ function m(t,o,e){if(location.origin!==t||o!=null&&location.href!==o)return{sele
     api.tabs.onRemoved.addListener((tabId, details) => {
       traceSelection("tabRemoved", { tabId, windowId: details?.windowId });
       const transition = agentSelection?.groupMove;
+      const bookmark = agentSelection?.bookmarkCreate;
+      if (bookmark && !bookmark.complete && !agentSelection.cancelled
+        && (bookmark.ids.has(tabId) || bookmark.unassigned.has(tabId))
+        && [agentSelection.targetTab.windowId, -1].includes(details?.windowId)) {
+        bookmark.removed = true;
+        bookmark.liveIds.delete(tabId);
+        return;
+      }
       if (transition?.create && !agentSelection.cancelled && transition.before.has(tabId) && details?.windowId === -1) {
         // Switching native collections may unload every source API identity,
         // including the owner. Only this native lease may reconcile them.
@@ -4504,7 +4621,11 @@ function m(t,o,e){if(location.origin!==t||o!=null&&location.href!==o)return{sele
         transition.targetRemoval = { tabId };
         return;
       }
-      if (agentSelection && [agentSelection.owner.tabId, agentSelection.targetTab.id].includes(tabId)) agentSelection.cancelled = true;
+      if (agentSelection && [agentSelection.owner.tabId, agentSelection.targetTab.id].includes(tabId)) {
+        agentSelection.cancelReason ||= tabId === agentSelection.owner.tabId ? "owner_removed"
+          : details?.windowId === -1 ? "target_removed_virtual" : "target_removed_window";
+        agentSelection.cancelled = true;
+      }
       serialize(() => removeTab(tabId)).catch(reportError);
     });
     async function activateTab({ tabId, windowId }, alreadyUnmounted = false) {
@@ -4531,6 +4652,11 @@ function m(t,o,e){if(location.origin!==t||o!=null&&location.href!==o)return{sele
         const expected = agentSelection.cancelled ? -1
           : agentSelection.expected.findIndex(item => item.tabId === tabId && item.windowId === windowId);
         if (expected >= 0) { agentSelection.expected.splice(expected, 1); return; }
+        const bookmark = agentSelection.bookmarkCreate;
+        if (bookmark && !bookmark.complete && !agentSelection.cancelled && bookmark.ids.has(tabId)
+          && windowId === agentSelection.targetTab.windowId) return;
+        if (bookmark && !bookmark.complete && !agentSelection.cancelled && bookmark.unassigned.has(tabId)
+          && [agentSelection.targetTab.windowId, -1].includes(windowId)) return;
         const transition = agentSelection.groupMove;
         const flow = transition?.create;
         if (!agentSelection.cancelled && flow && !flow.restoringOwner && windowId === agentSelection.targetTab.windowId) {
@@ -4548,15 +4674,41 @@ function m(t,o,e){if(location.origin!==t||o!=null&&location.href!==o)return{sele
         }
         if (transition) transition.handled = true;
         parkedOwner = flow?.observed === true;
+        agentSelection.cancelReason ||= tabId === agentSelection.targetTab.id && windowId === agentSelection.expectedWindow
+          ? "target_activated" : tabId === agentSelection.owner.tabId ? "owner_activated" : "other_tab_activated";
         agentSelection.cancelled = true;
       }
       serialize(() => activateTab({ tabId, windowId }, parkedOwner)).catch(reportError);
     });
     api.windows?.onFocusChanged?.addListener(windowId => {
       traceSelection("windowFocusChanged", { windowId });
-      if (agentSelection && windowId !== agentSelection.expectedWindow) agentSelection.cancelled = true;
+      if (agentSelection && windowId !== agentSelection.expectedWindow) {
+        agentSelection.cancelReason ||= windowId === -1 ? "window_focus_none" : "other_window_focused";
+        agentSelection.cancelled = true;
+      }
     });
-    api.tabs.onCreated?.addListener(tab => traceSelection("tabCreated", { tabId: tab.id, windowId: tab.windowId }));
+    api.tabs.onCreated?.addListener(tab => {
+      traceSelection("tabCreated", { tabId: tab.id, windowId: tab.windowId });
+      const selection = agentSelection, bookmark = selection?.bookmarkCreate;
+      if (!bookmark || bookmark.complete || selection.cancelled) return;
+      // Safari reports a detached API placeholder before removing the
+      // utility tab when opening its native editor. It grants no tab authority;
+      // only native completion plus the sole exact returned capability page
+      // can identify a terminal real tab.
+      if (tab.windowId === -1) {
+        if (bookmark.unassigned.size < 8) bookmark.unassigned.add(tab.id);
+        else { selection.cancelReason ||= "utility_lifecycle_overflow"; selection.cancelled = true; }
+        return;
+      }
+      if (tab.windowId !== selection.targetTab.windowId) return;
+      if (bookmark.removed && bookmark.liveIds.size === 0 && tab.url === bookmark.url && !tab.incognito
+        && (tab.pendingUrl == null || tab.pendingUrl === "" || tab.pendingUrl === bookmark.url)) {
+        bookmark.ids.add(tab.id); bookmark.liveIds.add(tab.id);
+      } else {
+        selection.cancelReason ||= "utility_sibling_created";
+        selection.cancelled = true;
+      }
+    });
     api.tabs.onDetached?.addListener((tabId, details) => {
       traceSelection("tabDetached", { tabId, oldWindowId: details.oldWindowId });
       createTransfer(tabId, details.oldWindowId);
@@ -4566,8 +4718,21 @@ function m(t,o,e){if(location.origin!==t||o!=null&&location.href!==o)return{sele
       createTransfer(tabId, details.newWindowId);
     });
     api.windows?.onCreated?.addListener(window => traceSelection("windowCreated", { windowId: window.id }));
-    api.windows?.onRemoved?.addListener(windowId => traceSelection("windowRemoved", { windowId }));
+    api.windows?.onRemoved?.addListener(windowId => {
+      traceSelection("windowRemoved", { windowId });
+      const selection = agentSelection;
+      if (selection?.bookmarkCreate && windowId === selection.targetTab.windowId) {
+        selection.cancelReason ||= "utility_window_removed"; selection.cancelled = true;
+      }
+    });
     api.tabs.onUpdated?.addListener((tabId, change) => {
+      const selection = agentSelection, bookmark = selection?.bookmarkCreate;
+      if (bookmark?.ids.has(tabId) && !bookmark.complete
+        && (change.url != null && ![bookmark.url, "bookmarks://"].includes(change.url)
+          || change.pendingUrl != null && change.pendingUrl !== "" && ![bookmark.url, "bookmarks://"].includes(change.pendingUrl))) {
+        selection.cancelReason ||= "utility_navigation_changed";
+        selection.cancelled = true;
+      }
       if (!embedded || change.status !== "complete") return;
       serialize(async () => {
         const state = Array.from(openByWindow.values()).find(item => item.tabId === tabId);

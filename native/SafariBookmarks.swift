@@ -10,9 +10,12 @@ final class SafariBookmarks {
         let message: String
         var mutationApplied = false
         var diagnostics: Diagnostics? = nil
+        var timings: [TimingStage: Int] = [:]
     }
+    enum TimingStage: String { case initialExpansionMS, initialInventoryMS, utilityMS, reentryExpansionMS, reentryInventoryMS, updateMS, finalInventoryMS }
     enum NativeStage: String {
         case expansion, restoration, inventory, confirmation
+        case sourceReveal = "source_reveal", destinationReveal = "destination_reveal"
         case urlFocus = "url_focus", urlCommit = "url_commit"
         case titleFocus = "title_focus", titleCommit = "title_commit"
         case folderFocus = "folder_focus", folderCommit = "folder_commit"
@@ -63,17 +66,111 @@ final class SafariBookmarks {
         let expected: [Record]
         let replacements: [Identity: Identity]
     }
+    struct PendingCreation {
+        let window: AXUIElement
+        let profileIdentity: String
+        let marker: String
+        let staged: Identity
+        let final: Identity
+        let expectedStaged: [Record]
+        let expectedFinal: [Record]
+        let originallyExpanded: Set<Identity>
+    }
     enum EditorReadiness { case waiting, ready, changed }
     enum EditorAuthorization: String { case current, owner, deadline; case ownerAndDeadline = "owner_and_deadline" }
     struct OperationDeadline {
         let issuedAt: Date
         let expiresAt: Date
         init(now: Date = Date()) { issuedAt = now; expiresAt = now.addingTimeInterval(20) }
+        init(now: Date, overallExpiry: Date) { issuedAt = now; expiresAt = min(now.addingTimeInterval(20), overallExpiry) }
         func authorization(ownerCurrent: Bool, now: Date = Date()) -> EditorAuthorization {
             let expired = now >= expiresAt
             if !ownerCurrent { return expired ? .ownerAndDeadline : .owner }
             return expired ? .deadline : .current
         }
+    }
+    struct ContinuationScope: Equatable {
+        let operationID: UUID
+        let owner: String
+        let profileIdentity: String
+        let session: String
+        let turn: String
+        let issuedAt: Date
+        init(_ command: [String: Any], profileIdentity: String) throws {
+            guard let raw = command["operationId"] as? String, let operation = UUID(uuidString: raw),
+                  let owner = command["_bookmarkOwnerToken"] as? String, let session = command["sessionId"] as? String,
+                  let turn = command["turnId"] as? String, let issued = command["issuedAtMs"] as? NSNumber,
+                  CFGetTypeID(issued) != CFBooleanGetTypeID(), issued.doubleValue.isFinite, issued.doubleValue > 0,
+                  [owner, session, turn, profileIdentity].allSatisfy({ !$0.isEmpty && $0.utf8.count <= 512 }) else {
+                throw Failure(code: "STALE_OPERATION", message: "Bookmark creation requires its exact original owner, profile, session, turn and operation scope.")
+            }
+            operationID = operation; self.owner = owner; self.profileIdentity = profileIdentity; self.session = session; self.turn = turn
+            issuedAt = Date(timeIntervalSince1970: issued.doubleValue / 1000)
+        }
+    }
+    final class ContinuationGate {
+        enum Phase: String { case adding, awaitingFinalize = "awaiting_finalize", finalizing, completed, failed, cancelled }
+        let scope: ContinuationScope
+        private var receipt: String? = UUID().uuidString
+        let overallExpiry: Date
+        let marker: String
+        private let lock = NSLock()
+        private var state = Phase.adding
+        private var phaseExpiry: Date
+        init(scope: ContinuationScope, now: Date = Date()) {
+            self.scope = scope; overallExpiry = now.addingTimeInterval(45); phaseExpiry = now.addingTimeInterval(20)
+            marker = "ChatGPT Safari Pending " + scope.operationID.uuidString
+        }
+        var phase: Phase { lock.lock(); defer { lock.unlock() }; return state }
+        func authorized(now: Date = Date()) -> Bool {
+            lock.lock(); defer { lock.unlock() }
+            return [.adding, .awaitingFinalize, .finalizing].contains(state) && now < phaseExpiry && now < overallExpiry
+        }
+        func issueReceipt(now: Date = Date()) throws -> String {
+            lock.lock(); defer { lock.unlock() }
+            guard state == .adding, now < phaseExpiry, now < overallExpiry, let receipt else { throw Self.unavailable(marker) }
+            state = .awaitingFinalize; phaseExpiry = min(now.addingTimeInterval(5), overallExpiry)
+            return receipt
+        }
+        func beginFinalize(receipt: String, scope: ContinuationScope, now: Date = Date()) throws -> OperationDeadline {
+            lock.lock(); defer { lock.unlock() }
+            guard self.scope == scope, receipt == self.receipt, state == .awaitingFinalize,
+                  now < phaseExpiry, now < overallExpiry else { throw Self.unavailable(marker) }
+            state = .finalizing
+            self.receipt = nil
+            let deadline = OperationDeadline(now: now, overallExpiry: overallExpiry)
+            phaseExpiry = deadline.expiresAt
+            return deadline
+        }
+        func complete() { lock.lock(); defer { lock.unlock() }; state = .completed; receipt = nil }
+        func fail() { lock.lock(); defer { lock.unlock() }; if state != .cancelled { state = .failed }; receipt = nil }
+        func cancel(scope: ContinuationScope) -> Bool {
+            lock.lock(); defer { lock.unlock() }
+            guard scope == self.scope else { return false }
+            if state != .completed { state = .cancelled }
+            receipt = nil
+            return true
+        }
+        private static func unavailable(_ marker: String) -> Failure {
+            Failure(code: "BOOKMARK_CONTINUATION_EXPIRED", message: "The one-shot bookmark continuation expired, changed scope or was already consumed. Inspect the existing entry named " + marker + "; do not repeat Add.", mutationApplied: true)
+        }
+    }
+
+    static func revealScrollValue(current: Double, minimum: Double, maximum: Double,
+                                  row: CGRect, viewport: CGRect, content: CGRect) throws -> Double {
+        guard [current, minimum, maximum, Double(row.minY), Double(row.maxY), Double(viewport.minY), Double(viewport.maxY), Double(content.height)].allSatisfy(\.isFinite),
+              maximum > minimum, current >= minimum, current <= maximum,
+              viewport.height > row.height, row.height > 0, content.height > viewport.height else {
+            throw Failure(code: "BOOKMARK_TARGET_OBSCURED", message: "The native bookmark viewport cannot reveal the exact requested row.")
+        }
+        let shift = Double(row.midY - viewport.midY) / Double(content.height - viewport.height) * (maximum - minimum)
+        return max(minimum, min(maximum, current + shift))
+    }
+
+    static func acceptsAddBookmarkSheet(phaseAllowed: Bool, role: String?, identifier: String?,
+                                       attachedCount: Int, exactFocusedAttachment: Bool) -> Bool {
+        phaseAllowed && role == kAXSheetRole && identifier == "AddBookmarkSheet"
+            && attachedCount == 1 && exactFocusedAttachment
     }
 
     /// Classify each observed AXRows collection once per expansion depth,
@@ -276,15 +373,21 @@ final class SafariBookmarks {
     func perform(method: String, args: [Any], window: AXUIElement, profileIdentity: String,
                  utilityURL: String? = nil, withUtilityPage: ((() throws -> Void) throws -> Void)? = nil,
                  assertCurrentWithPostedButton: ((CGMouseButton) -> Bool)? = nil,
+                 currentEditorSurface: @escaping (CGMouseButton?) -> [AXUIElement]?,
+                 stageCreation: Bool = false, creationMarker: String? = nil, pendingCreation: PendingCreation? = nil,
                  assertCurrent: @escaping () -> Bool) throws -> Any {
         guard lock.try() else { throw Failure(code: "BOOKMARKS_BUSY", message: "Another native bookmarks operation is running.") }
         defer { lock.unlock() }
-        var driver = try Editor(window: window, authorized: assertCurrent, buttonAuthorized: assertCurrentWithPostedButton)
+        var driver = try Editor(window: window, authorized: assertCurrent, buttonAuthorized: assertCurrentWithPostedButton, currentSurface: currentEditorSurface)
         var restorationNeeded = true
+        var restorationLost = false
         lastRestorationConfirmed = false
-        defer { lastRestorationConfirmed = !restorationNeeded || driver.restore() }
+        defer { lastRestorationConfirmed = !restorationLost && (!restorationNeeded || driver.restore()) }
+        let initialStarted = Date()
         try driver.expand()
+        let initialExpanded = Date()
         var rows = try driver.records()
+        let initialRead = Date()
         let root = roots[profileIdentity] ?? "safari-bookmarks-" + UUID().uuidString
         roots[profileIdentity] = root
         func id(_ identity: Identity) -> String {
@@ -332,6 +435,21 @@ final class SafariBookmarks {
             return value.identity
         }
         switch method {
+        case "__finalizeCreate":
+            guard let pending = pendingCreation, pending.profileIdentity == profileIdentity, CFEqual(pending.window, window),
+                  Self.matches(rows, pending.expectedStaged) else {
+                throw Failure(code: "BOOKMARK_CREATE_UNCONFIRMED", message: "The staged native bookmark or unrelated hierarchy changed before finalization. Inspect the existing pending entry; do not repeat Add.", mutationApplied: true)
+            }
+            // Restore the view observed before Add, including folders that
+            // Safari itself collapsed while leaving/reentering the editor.
+            try driver.rebindExpansions(rows.filter { $0.identity.url == nil && !pending.originallyExpanded.contains($0.identity) }.map(\.identity), in: rows)
+            try driver.update(position: Self.resolve(pending.staged, in: rows), title: pending.final.title, url: pending.final.url)
+            rows = try driver.records()
+            guard Self.matches(rows, pending.expectedFinal) else {
+                throw Failure(code: "BOOKMARK_CREATE_UNCONFIRMED", message: "Safari did not confirm the staged bookmark's exact final URL, title, parent and preservation of unrelated bookmarks. Do not repeat Add.", mutationApplied: true)
+            }
+            identifyRows()
+            return node(try Self.resolve(pending.final, in: rows))
         case "getTree": return [["id": root, "title": "Safari Bookmarks", "children": tree()]]
         case "search":
             guard args.count == 1 else { throw Failure(code: "INVALID_ARGUMENTS", message: "Bookmark search requires one query.") }
@@ -386,6 +504,13 @@ final class SafariBookmarks {
             }
             return node(try Self.resolve(plan.replacements[previous]!, in: rows))
         case "create":
+            var timings: [TimingStage: Int] = [.initialExpansionMS: Int(initialExpanded.timeIntervalSince(initialStarted) * 1000),
+                .initialInventoryMS: Int(initialRead.timeIntervalSince(initialExpanded) * 1000)]
+            func timed<T>(_ stage: TimingStage, _ body: () throws -> T) rethrows -> T {
+                let started = Date()
+                defer { timings[stage] = max(0, min(1_000_000_000, Int(Date().timeIntervalSince(started) * 1000))) }
+                return try body()
+            }
             guard args.count == 1, let properties = args[0] as? [String: Any],
                   Set(properties.keys).isSubset(of: ["title", "url", "parentId"]), let rawURL = properties["url"] else {
                 throw Failure(code: "INVALID_ARGUMENTS", message: "Create URL bookmark requires an HTTP(S) URL and an optional title and parent handle. Explicit insertion indices require a separate confirmed native move.")
@@ -414,38 +539,61 @@ final class SafariBookmarks {
             let parents = parent.map { $0.parents + [$0.title] } ?? []
             let final = Identity(parents: parents, title: properties["title"] as? String ?? "", url: rawURL as? String)
             _ = try Self.inserting(final, in: rows)
-            let marker = "ChatGPT Safari Pending " + UUID().uuidString
+            let marker = creationMarker ?? "ChatGPT Safari Pending " + UUID().uuidString
             let staged = Identity(parents: parents, title: marker, url: utilityURL)
             let expectedStaged = try Self.inserting(staged, in: rows)
             let expectedFinal = try Self.inserting(final, in: rows)
-            guard driver.restore() else { throw Failure(code: "BOOKMARK_RESTORATION_UNCONFIRMED", message: "The bookmark tree could not be restored before Add Bookmark.") }
+            let pendingExpansions = driver.expansionIdentities(in: rows)
+            let openedDuringPreflight = Set(pendingExpansions)
+            let originallyExpanded = Set(rows.filter { $0.identity.url == nil && !openedDuringPreflight.contains($0.identity) }.map(\.identity))
+            // Preserve the operation's temporary expansion across the one
+            // utility-page/Add Bookmark transaction. Rebind exact observed
+            // identities on reentry, then restore once at operation end.
+            // Collapsing and fully re-expanding the same tree here consumed
+            // the original bounded transaction before final URL/title editing.
             restorationNeeded = false
+            restorationLost = true
+            func bindReopenedEditor() throws {
+                driver = try Editor(window: window, authorized: assertCurrent, buttonAuthorized: assertCurrentWithPostedButton, currentSurface: currentEditorSurface)
+                restorationNeeded = true
+                try timed(.reentryExpansionMS) { try driver.expand() }
+                rows = try timed(.reentryInventoryMS) { try driver.records() }
+                let newlyExpanded = driver.expansionIdentities(in: rows)
+                let restoreIdentities = Set(pendingExpansions + newlyExpanded)
+                try driver.rebindExpansions(rows.map(\.identity).filter { restoreIdentities.contains($0) }, in: rows)
+                restorationLost = false
+            }
             var added = false
             do {
-                try withUtilityPage {
-                    try AddSheet.create(window: window, title: marker, destination: destination,
-                                        authorized: assertCurrent, mutationDelivered: { added = true })
+                try timed(.utilityMS) {
+                    try withUtilityPage {
+                        try AddSheet.create(window: window, title: marker, destination: destination,
+                                            authorized: assertCurrent, mutationDelivered: { added = true })
+                    }
                 }
-                driver = try Editor(window: window, authorized: assertCurrent, buttonAuthorized: assertCurrentWithPostedButton)
-                restorationNeeded = true
-                try driver.expand()
-                rows = try driver.records()
+                if stageCreation {
+                    return PendingCreation(window: window, profileIdentity: profileIdentity, marker: marker, staged: staged, final: final,
+                        expectedStaged: expectedStaged, expectedFinal: expectedFinal, originallyExpanded: originallyExpanded)
+                }
+                try bindReopenedEditor()
                 guard Self.matches(rows, expectedStaged) else {
                     throw Failure(code: "BOOKMARK_CREATE_UNCONFIRMED", message: "Safari did not confirm the new bookmark in exactly the requested folder while preserving unrelated bookmarks.", mutationApplied: true)
                 }
-                try driver.update(position: try Self.resolve(staged, in: rows), title: final.title, url: final.url)
-                rows = try driver.records()
+                try timed(.updateMS) { try driver.update(position: try Self.resolve(staged, in: rows), title: final.title, url: final.url) }
+                rows = try timed(.finalInventoryMS) { try driver.records() }
                 guard Self.matches(rows, expectedFinal) else {
                     throw Failure(code: "BOOKMARK_CREATE_UNCONFIRMED", message: "Safari did not confirm the new bookmark's final URL, title, parent, and unchanged unrelated bookmarks.", mutationApplied: true)
                 }
                 identifyRows()
                 return node(try Self.resolve(final, in: rows))
             } catch let failure as Failure {
+                if restorationLost && assertCurrent() { try? bindReopenedEditor() }
                 if added {
-                    throw Failure(code: failure.code, message: failure.message + " The Add Bookmark command was delivered once. Inspect the temporary entry named " + marker + "; do not repeat creation.", mutationApplied: true)
+                    throw Failure(code: failure.code, message: failure.message + " The Add Bookmark command was delivered once. Inspect the temporary entry named " + marker + "; do not repeat creation.", mutationApplied: true, diagnostics: failure.diagnostics, timings: timings)
                 }
-                throw failure
+                var observed = failure; observed.timings = timings; throw observed
             } catch {
+                if restorationLost && assertCurrent() { try? bindReopenedEditor() }
                 if added {
                     throw Failure(code: "BOOKMARK_CREATE_UNCONFIRMED", message: "Safari's Add Bookmark command was delivered, but the final editor transaction did not complete. Inspect the temporary entry named " + marker + "; do not repeat creation.", mutationApplied: true)
                 }
@@ -530,7 +678,7 @@ final class SafariBookmarks {
                 throw Failure(code: "BOOKMARK_CREATE_UNCONFIRMED", message: "Safari's official Add Bookmark sheet did not reach the verified state.")
             }
             try check()
-            guard !Editor.nodes(window).contains(where: { Editor.string($0, kAXRoleAttribute) == kAXSheetRole }),
+            guard let initialSurface = Editor.surface(window), !initialSurface.contains(where: { Editor.string($0, kAXRoleAttribute) == kAXSheetRole }),
                   let bar = Editor.attribute(app, kAXMenuBarAttribute), CFGetTypeID(bar) == AXUIElementGetTypeID() else {
                 throw Failure(code: "BOOKMARK_CREATE_UNAVAILABLE", message: "The temporary Safari window is not ready for Add Bookmark.")
             }
@@ -547,7 +695,7 @@ final class SafariBookmarks {
             }
             var sheet: AXUIElement?
             try wait {
-                let matches = Editor.nodes(window).filter { Editor.string($0, kAXIdentifierAttribute) == "AddBookmarkSheet" }
+                let matches = (Editor.surface(window) ?? []).filter { Editor.string($0, kAXIdentifierAttribute) == "AddBookmarkSheet" }
                 if matches.count == 1 { sheet = matches[0]; return true }
                 return false
             }
@@ -563,7 +711,7 @@ final class SafariBookmarks {
             }
             var delivered = false
             defer {
-                if !delivered, authorized(), Editor.nodes(window).contains(where: { CFEqual($0, panel) }) {
+                if !delivered, authorized(), Editor.surface(window)?.contains(where: { CFEqual($0, panel) }) == true {
                     _ = AXUIElementPerformAction(cancel, kAXPressAction as CFString)
                 }
             }
@@ -577,7 +725,9 @@ final class SafariBookmarks {
                 guard AXUIElementPerformAction(popup, kAXPressAction as CFString) == .success else { throw Failure(code: "BOOKMARK_PARENT_UNAVAILABLE", message: "Safari's Add Bookmark destination menu could not be opened.") }
                 var locationMenu: AXUIElement?
                 try wait {
-                    let matches = Editor.nodes(app).filter { Editor.string($0, kAXIdentifierAttribute) == "LocationMenu" }
+                    // Native popup discovery must not traverse unrelated web
+                    // documents (including the hosting Work conversation).
+                    let matches = (Editor.surface(app) ?? []).filter { Editor.string($0, kAXIdentifierAttribute) == "LocationMenu" }
                     if matches.count == 1 { locationMenu = matches[0]; return true }
                     return false
                 }
@@ -587,7 +737,7 @@ final class SafariBookmarks {
                 }
                 try check()
                 guard AXUIElementPerformAction(matches[0], kAXPressAction as CFString) == .success else { throw Failure(code: "BOOKMARK_PARENT_UNAVAILABLE", message: "Safari rejected the requested Add Bookmark destination.") }
-                try wait { label() == destination && !Editor.nodes(app).contains(where: { CFEqual($0, locationMenu!) }) }
+                try wait { label() == destination && Editor.surface(app)?.contains(where: { CFEqual($0, locationMenu!) }) == false }
             }
             try check()
             var settable = DarwinBoolean(false)
@@ -601,7 +751,7 @@ final class SafariBookmarks {
             delivered = true
             mutationDelivered()
             guard AXUIElementPerformAction(add, kAXPressAction as CFString) == .success else { throw Failure(code: "BOOKMARK_CREATE_UNCONFIRMED", message: "Safari's Add Bookmark command was delivered without a confirmed result.", mutationApplied: true) }
-            try wait { !Editor.nodes(window).contains(where: { CFEqual($0, panel) }) }
+            try wait { Editor.surface(window)?.contains(where: { CFEqual($0, panel) }) == false }
         }
     }
 
@@ -610,6 +760,7 @@ final class SafariBookmarks {
         let window: AXUIElement
         let authorized: () -> Bool
         let buttonAuthorized: ((CGMouseButton) -> Bool)?
+        let currentSurface: (CGMouseButton?) -> [AXUIElement]?
         let outline: AXUIElement
         var currentRows: [AXUIElement] = []
         var expanded: [AXUIElement] = []
@@ -629,10 +780,12 @@ final class SafariBookmarks {
             return max(0, min(1_000_000_000, Int(value * 1000)))
         }
 
-        init(window: AXUIElement, authorized: @escaping () -> Bool, buttonAuthorized: ((CGMouseButton) -> Bool)? = nil) throws {
+        init(window: AXUIElement, authorized: @escaping () -> Bool, buttonAuthorized: ((CGMouseButton) -> Bool)? = nil,
+             currentSurface: @escaping (CGMouseButton?) -> [AXUIElement]?) throws {
             self.window = window; self.authorized = authorized
             self.buttonAuthorized = buttonAuthorized
-            guard authorized(), let surface = Self.surface(window) else {
+            self.currentSurface = currentSurface
+            guard let surface = currentSurface(nil) else {
                 throw Failure(code: "BOOKMARK_EDITOR_UNAVAILABLE", message: "The guarded native Safari bookmarks editor is unavailable.")
             }
             let outlines = surface.filter { Self.string($0, kAXIdentifierAttribute) == "Bookmarks" && Self.string($0, kAXRoleAttribute) == kAXOutlineRole }
@@ -643,9 +796,12 @@ final class SafariBookmarks {
                 throw Failure(code: "BOOKMARK_SEARCH_ACTIVE", message: "Safari's native bookmark editor has an active or unverifiable search filter. Clear that editor's search before using complete bookmark operations.")
             }
         }
-        func check() throws {
-            let ownerCurrent = authorized()
-            let surface = Self.surface(window)
+        func check(postedButton: CGMouseButton? = nil) throws {
+            // This fresh, synchronous proof already includes the caller's
+            // owner, exact window, foreground, input and editor identity. Use
+            // its observed surface instead of immediately traversing it again.
+            let surface = currentSurface(postedButton)
+            let ownerCurrent = surface != nil
             let outlineCurrent = surface?.contains(where: {
                 CFEqual($0, outline) && Self.string($0, kAXRoleAttribute) == kAXOutlineRole && Self.string($0, kAXIdentifierAttribute) == "Bookmarks"
             }) == true
@@ -668,14 +824,14 @@ final class SafariBookmarks {
             try SafariBookmarks.expandInRounds(rows: rows, collapsedTriangle: { row -> (AXUIElement, String)? in
                 classified += 1
                 if classified % 32 == 1 { try check() }
-                let descendants = Self.nodes(row)
-                guard let triangle = descendants.first(where: { Self.string($0, kAXIdentifierAttribute) == "SectionDisclosureTriangle"
-                    && (Self.attribute($0, kAXValueAttribute) as? NSNumber)?.boolValue == false }), let title = Self.folderTitle(row) else { return nil }
-                return (triangle, title)
+                let descendants = try Self.rowNodes(row)
+                guard let triangle = descendants.first(where: { $0.identifier == "SectionDisclosureTriangle"
+                    && ($0.value as? NSNumber)?.boolValue == false }), let title = Self.folderTitle(row, observed: descendants) else { return nil }
+                return (triangle.element, title)
             }, expand: { row, candidate in
                 let (triangle, title) = candidate
                 guard try rows().contains(where: { CFEqual($0, row) }), Self.descendant(triangle, of: row),
-                      Self.folderTitle(row) == title,
+                      Self.folderTitle(row, observed: try Self.rowNodes(row)) == title,
                       Self.string(triangle, kAXIdentifierAttribute) == "SectionDisclosureTriangle",
                       (Self.attribute(triangle, kAXValueAttribute) as? NSNumber)?.boolValue == false else {
                     throw Failure(code: "STALE_BOOKMARK", message: "A native bookmark folder changed before its one-shot expansion. No press was replayed.", mutationApplied: mutated)
@@ -708,13 +864,13 @@ final class SafariBookmarks {
                     throw Failure(code: "BOOKMARK_HIERARCHY_UNAVAILABLE", message: "Safari's native bookmark hierarchy could not be verified.", mutationApplied: mutated)
                 }
                 parents = Array(parents.prefix(depth))
-                let nodes = Self.nodes(row)
-                let titleField = nodes.first(where: { ["BookmarkTitle", "BookmarkFolderTitle"].contains(Self.string($0, kAXIdentifierAttribute) ?? "") })
-                guard let title = titleField.flatMap({ Self.string($0, kAXValueAttribute) }) ?? Self.folderTitle(row) else {
+                let nodes = try Self.rowNodes(row)
+                let titleField = nodes.first(where: { ["BookmarkTitle", "BookmarkFolderTitle"].contains($0.identifier ?? "") })
+                guard let title = titleField?.value as? String ?? Self.folderTitle(row, observed: nodes) else {
                     throw Failure(code: "BOOKMARK_ROW_UNAVAILABLE", message: "A native bookmark row could not be read.", mutationApplied: mutated)
                 }
-                let urlField = nodes.first(where: { Self.string($0, kAXIdentifierAttribute) == "BookmarkURL" })
-                let url = urlField.flatMap { Self.string($0, kAXValueAttribute) }
+                let urlField = nodes.first(where: { $0.identifier == "BookmarkURL" })
+                let url = urlField?.value as? String
                 let index = indices[parents, default: 0]; indices[parents] = index + 1
                 result.append(Record(identity: Identity(parents: parents, title: title, url: url), depth: depth, index: index, editable: titleField != nil))
                 if url == nil { parents.append(title) }
@@ -794,7 +950,7 @@ final class SafariBookmarks {
                     throw Failure(code: "BOOKMARK_PARENT_UNAVAILABLE", message: "Safari could not select the bookmark root.")
                 }
             }
-            guard let button = Self.nodes(window).first(where: { Self.string($0, kAXIdentifierAttribute) == "NewFolder" }) else { throw Failure(code: "BOOKMARK_CREATE_UNAVAILABLE", message: "Safari's New Folder control is unavailable.") }
+            guard let button = Self.surface(window)?.first(where: { Self.string($0, kAXIdentifierAttribute) == "NewFolder" }) else { throw Failure(code: "BOOKMARK_CREATE_UNAVAILABLE", message: "Safari's New Folder control is unavailable.") }
             try check()
             guard AXUIElementPerformAction(button, kAXPressAction as CFString) == .success else { throw Failure(code: "BOOKMARK_CREATE_REJECTED", message: "Safari rejected creating a bookmark folder.") }
             mutated = true
@@ -888,11 +1044,11 @@ final class SafariBookmarks {
                   let selected = Self.attribute(outline, kAXSelectedRowsAttribute) as? [AXUIElement], selected.count == 1, CFEqual(selected[0], row) else {
                 throw Failure(code: "BOOKMARK_SELECTION_UNCONFIRMED", message: "Safari did not select exactly the requested bookmark for native movement.")
             }
-            let start = try nativePoint(row: row), finish = try nativePoint(row: target)
-            guard hypot(start.x - finish.x, start.y - finish.y) >= 4,
-                  let source = CGEventSource(stateID: .combinedSessionState),
+            try reveal(row: row, stage: .sourceReveal)
+            let start = try nativePoint(row: row)
+            guard let source = CGEventSource(stateID: .combinedSessionState),
                   let down = CGEvent(mouseEventSource: source, mouseType: .leftMouseDown, mouseCursorPosition: start, mouseButton: .left) else {
-                throw Failure(code: "BOOKMARK_MOVE_UNAVAILABLE", message: "Safari did not expose distinct visible source and destination rows for the native drag.")
+                throw Failure(code: "BOOKMARK_MOVE_UNAVAILABLE", message: "Safari did not expose the visible source row for the native drag.")
             }
             try check()
             down.flags = []; down.setIntegerValueField(.mouseEventClickState, value: 1)
@@ -904,12 +1060,28 @@ final class SafariBookmarks {
                     up.flags = []; up.post(tap: .cghidEventTap)
                 }
             }
+            // Begin the one native drag in the proven visible source row.
+            // Revealing a distant destination changes only this temporary
+            // editor's viewport, while the same owned mouse-down stays live.
+            let lift = CGPoint(x: start.x + 8, y: start.y)
+            var liftHit: AXUIElement?
+            guard buttonAuthorized?(.left) == true,
+                  AXUIElementCopyElementAtPosition(AXUIElementCreateSystemWide(), Float(lift.x), Float(lift.y), &liftHit) == .success,
+                  let liftHit, Self.descendant(liftHit, of: row),
+                  let liftEvent = CGEvent(mouseEventSource: source, mouseType: .leftMouseDragged, mouseCursorPosition: lift, mouseButton: .left) else {
+                throw Failure(code: "BOOKMARK_MOVE_UNCONFIRMED", message: "The native bookmark drag could not start inside its exact visible source row. Inspect current bookmarks; do not repeat it.", mutationApplied: true)
+            }
+            liftEvent.flags = []; liftEvent.post(tap: .cghidEventTap); last = lift
+            try reveal(row: target, stage: .destinationReveal, postedButton: .left)
+            let finish = try nativePoint(row: target, postedButton: .left)
             for step in 1...12 {
-                guard buttonAuthorized?(.left) == true, Self.nodes(window).contains(where: { CFEqual($0, outline) }) else {
+                // Re-prove native editor chrome, not the entire expanded
+                // bookmark inventory, during every delivered drag step.
+                guard buttonAuthorized?(.left) == true, Self.surface(window)?.contains(where: { CFEqual($0, outline) }) == true else {
                     throw Failure(code: "FOCUS_CHANGED", message: "Safari changed during the delivered bookmark drag. Inspect the current hierarchy; do not repeat it.", mutationApplied: true)
                 }
                 let fraction = CGFloat(step) / 12
-                let point = CGPoint(x: start.x + (finish.x - start.x) * fraction, y: start.y + (finish.y - start.y) * fraction)
+                let point = CGPoint(x: lift.x + (finish.x - lift.x) * fraction, y: lift.y + (finish.y - lift.y) * fraction)
                 var hit: AXUIElement?
                 guard AXUIElementCopyElementAtPosition(AXUIElementCreateSystemWide(), Float(point.x), Float(point.y), &hit) == .success,
                       let hit, Self.descendant(hit, of: step == 12 ? target : outline),
@@ -939,8 +1111,58 @@ final class SafariBookmarks {
         func acceptRemovedExpansions(_ removed: [AXUIElement]) {
             expanded.removeAll { node in removed.contains(where: { CFEqual($0, node) }) }
         }
-        func nativePoint(row: AXUIElement) throws -> CGPoint {
-            try check()
+        func reveal(row: AXUIElement, stage: NativeStage, postedButton: CGMouseButton? = nil) throws {
+            try check(postedButton: postedButton)
+            guard try rowsForReveal(postedButton: postedButton).contains(where: { CFEqual($0, row) }) else {
+                throw Failure(code: "STALE_BOOKMARK", message: "The exact native bookmark row changed before revealing it.", mutationApplied: mutated)
+            }
+            var ancestor: AXUIElement? = outline, scrollArea: AXUIElement?
+            for _ in 0..<12 {
+                guard let current = ancestor else { break }
+                if Self.string(current, kAXRoleAttribute) == kAXScrollAreaRole { scrollArea = current; break }
+                guard let parent = Self.attribute(current, kAXParentAttribute), CFGetTypeID(parent) == AXUIElementGetTypeID() else { break }
+                ancestor = unsafeBitCast(parent, to: AXUIElement.self)
+            }
+            guard let scrollArea, Self.descendant(scrollArea, of: window),
+                  let area = Self.frame(scrollArea), let bounds = Self.frame(window), let rowBounds = Self.frame(row) else {
+                throw Failure(code: "BOOKMARK_TARGET_OBSCURED", message: "The requested bookmark has no verified native editor viewport.", mutationApplied: mutated)
+            }
+            let viewport = area.intersection(bounds).insetBy(dx: 0, dy: 3)
+            func visible() -> Bool {
+                guard let observed = Self.frame(row) else { return false }
+                return observed.minY >= viewport.minY && observed.maxY <= viewport.maxY
+            }
+            if visible() { return }
+            guard let rawBar = Self.attribute(scrollArea, kAXVerticalScrollBarAttribute), CFGetTypeID(rawBar) == AXUIElementGetTypeID(),
+                  let first = currentRows.first.flatMap(Self.frame), let last = currentRows.last.flatMap(Self.frame) else {
+                throw Failure(code: "BOOKMARK_TARGET_OBSCURED", message: "The native bookmark editor has no bound vertical scroll control.", mutationApplied: mutated)
+            }
+            let bar = unsafeBitCast(rawBar, to: AXUIElement.self)
+            // AXScrollBar exposes a normalized 0...1 AXValue, not the
+            // AXMinValue/AXMaxValue attributes used by range controls.
+            guard Self.descendant(bar, of: scrollArea), Self.string(bar, kAXRoleAttribute) == kAXScrollBarRole,
+                  Self.string(bar, kAXOrientationAttribute) == kAXVerticalOrientationValue,
+                  let current = Self.attribute(bar, kAXValueAttribute) as? NSNumber,
+                  current.doubleValue.isFinite, (0...1).contains(current.doubleValue) else {
+                throw Failure(code: "BOOKMARK_TARGET_OBSCURED", message: "The native bookmark scrollbar has no verified normalized vertical position.", mutationApplied: mutated)
+            }
+            let value = try SafariBookmarks.revealScrollValue(current: current.doubleValue, minimum: 0, maximum: 1,
+                row: rowBounds, viewport: viewport, content: first.union(last))
+            try check(postedButton: postedButton)
+            guard AXUIElementSetAttributeValue(bar, kAXValueAttribute as CFString, NSNumber(value: value)) == .success else {
+                throw Failure(code: "BOOKMARK_TARGET_OBSCURED", message: "Safari rejected revealing the exact native bookmark row.", mutationApplied: mutated)
+            }
+            try wait(stage: stage, postedButton: postedButton, visible)
+        }
+        private func rowsForReveal(postedButton: CGMouseButton?) throws -> [AXUIElement] {
+            try check(postedButton: postedButton)
+            guard let value = Self.attribute(outline, kAXRowsAttribute) as? [AXUIElement] else {
+                throw Failure(code: "BOOKMARK_ROWS_UNAVAILABLE", message: "Safari did not expose the exact bookmark rows while revealing a target.", mutationApplied: mutated)
+            }
+            return value
+        }
+        func nativePoint(row: AXUIElement, postedButton: CGMouseButton? = nil) throws -> CGPoint {
+            try check(postedButton: postedButton)
             guard let bounds = Self.frame(row), let windowFrame = Self.frame(window),
                   bounds.width > 0, bounds.height > 0 else {
                 throw Failure(code: "BOOKMARK_TARGET_UNAVAILABLE", message: "Safari did not expose the requested bookmark's native bounds.")
@@ -958,12 +1180,12 @@ final class SafariBookmarks {
             }
             return point
         }
-        func wait(stage: NativeStage, observation: (() -> WaitObservation)? = nil, _ ready: () -> Bool) throws {
+        func wait(stage: NativeStage, observation: (() -> WaitObservation)? = nil, postedButton: CGMouseButton? = nil, _ ready: () -> Bool) throws {
             let started = Date(), deadline = Date().addingTimeInterval(2)
             let snapshot = { [self] in Diagnostics(stage: stage, waitMS: Int(Date().timeIntervalSince(started) * 1000),
                 expansionMS: milliseconds(.expansion), inventoryMS: milliseconds(.inventory), observation: observation?() ?? WaitObservation()) }
             do {
-                repeat { try check(); if ready() { return }; Thread.sleep(forTimeInterval: 0.025) } while Date() < deadline
+                repeat { try check(postedButton: postedButton); if ready() { return }; Thread.sleep(forTimeInterval: 0.025) } while Date() < deadline
             } catch var failure as Failure {
                 if failure.diagnostics == nil { failure.diagnostics = snapshot() }
                 throw failure
@@ -993,12 +1215,33 @@ final class SafariBookmarks {
                   [point.x, point.y, dimensions.width, dimensions.height].allSatisfy(\.isFinite) else { return nil }
             return CGRect(origin: point, size: dimensions)
         }
-        static func folderTitle(_ row: AXUIElement) -> String? {
-            let descendants = nodes(row)
-            if let field = descendants.first(where: { string($0, kAXIdentifierAttribute) == "BookmarkFolderTitle" }) { return string(field, kAXValueAttribute) }
-            guard !descendants.contains(where: { string($0, kAXIdentifierAttribute) == "BookmarkTitle" || string($0, kAXIdentifierAttribute) == "BookmarkURL" }) else { return nil }
+        private struct RowNode {
+            let element: AXUIElement
+            let identifier: String?
+            let value: Any
+        }
+        /// Batch each node's native attributes in one IPC. The snapshot is
+        /// local to this single row read and is never reused across actions.
+        private static func rowNodes(_ root: AXUIElement) throws -> [RowNode] {
+            var result: [RowNode] = [], pending = [root]
+            let names = [kAXChildrenAttribute, kAXIdentifierAttribute, kAXValueAttribute] as CFArray
+            while let node = pending.popLast(), result.count < 10000 {
+                var raw: CFArray?
+                guard AXUIElementCopyMultipleAttributeValues(node, names, [], &raw) == .success,
+                      let values = raw as? [Any], values.count == 3 else {
+                    throw Failure(code: "BOOKMARK_ROW_UNAVAILABLE", message: "Safari's native bookmark row attributes could not be read together.")
+                }
+                result.append(RowNode(element: node, identifier: values[1] as? String, value: values[2]))
+                if let children = values[0] as? [AXUIElement] { pending.append(contentsOf: children.reversed()) }
+            }
+            guard pending.isEmpty else { throw Failure(code: "BOOKMARK_TREE_TOO_LARGE", message: "The native bookmark row exceeds its bounded traversal limit.") }
+            return result
+        }
+        private static func folderTitle(_ row: AXUIElement, observed descendants: [RowNode]) -> String? {
+            if let field = descendants.first(where: { $0.identifier == "BookmarkFolderTitle" }) { return field.value as? String }
+            guard !descendants.contains(where: { $0.identifier == "BookmarkTitle" || $0.identifier == "BookmarkURL" }) else { return nil }
             return SafariBookmarks.categoryTitle(description: string(row, kAXDescriptionAttribute), value: string(row, kAXValueAttribute),
-                                                  hasDisclosureTriangle: descendants.contains(where: { string($0, kAXIdentifierAttribute) == "SectionDisclosureTriangle" }))
+                                                  hasDisclosureTriangle: descendants.contains(where: { $0.identifier == "SectionDisclosureTriangle" }))
         }
         static func nodes(_ root: AXUIElement) -> [AXUIElement] {
             var result: [AXUIElement] = [], pending = [root]

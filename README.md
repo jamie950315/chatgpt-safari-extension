@@ -104,8 +104,11 @@ automatically or replaces an existing draft. Open tab mentions refresh when
 their real tabs change. Expired sessions have an explicit sign-in/Continue path
 using only this app's existing official WebKit profile.
 
-Current installed acceptance is still open for bookmark CRUD and the updated
-website prompt prefill lifecycle. Native dialogs, two-file upload, and clean
+Installed original Work bookmark read/search, updates, folder and URL creation,
+and native movement passed with exact readback and sidebar restoration. Native
+deletion retains source/guard coverage; destructive GUI acceptance was not run.
+The updated website prompt prefill lifecycle still needs installed acceptance.
+Native dialogs, two-file upload, and clean
 provider-document reload have passed installed checks. Completed checks are listed
 under [Installed acceptance](#installed-acceptance).
 
@@ -222,8 +225,14 @@ browser session, scoped to the current ChatGPT account and Safari profile
 
 History search reads a profile-bound Safari database read-only, using bounded
 parameterized queries. Native profile metadata must match; an unknown profile
-never falls back to another profile's history. macOS may require Safari-data
-access for this containing app. Permission failures remain explicit.
+never falls back to another profile's history. This Mac currently denies the
+containing app access to Safari history and download metadata. Continuing that
+integration requires the user to enable **System Settings → Privacy & Security →
+Full Disk Access** for this checkout's `dist/ChatGPT for Safari.app`. That grant
+is broader than the two metadata sources; Downloads-folder and Accessibility
+permissions do not replace it. The app does not bypass a denial. History and
+native completed-download provenance remain unverified until that grant and
+subsequent validation.
 
 Bookmark tree/search/read, title/URL updates, and folder creation use Safari's
 own editor in a temporary ordinary-profile window, then restore the sidebar
@@ -234,6 +243,22 @@ in Safari's editor. It never visits the bookmarked website. The destination
 folder must have a unique native name; root placement requires Safari's actual
 root label to match its menu and selected destination. Missing official button
 identities or an unconfirmed destination stop the operation before Add.
+One original SDK `create` awaits two internal native stages: the one-shot Add
+transaction and exact editor finalization. Each stage is bounded to 20 seconds
+and uses a separate 25-second native HTTP request; the original operation has a
+45-second overall bound and a five-second continuation handoff. Its memory-only,
+one-use receipt binds the original owner/account/profile/session/turn, operation,
+utility window and native editor. Finalization never selects or refocuses a
+window. Safari can temporarily unload this disposable utility's API tab while
+its native editor is visible. The same native lease restores the exact
+capability page; the extension verifies its sole fresh real tab before returning
+to the original sidebar. This never aliases a user tab or transfers its claims.
+New siblings, foreign navigation and user focus changes abort the lease.
+Cancellation, a changed owner/focus/document, expiry, or an app/background
+restart stops continuation without replaying Add or deleting data. A partial
+creation remains identifiable as `ChatGPT Safari Pending <operation UUID>`;
+inspect that existing entry before explicitly finishing it or creating anything
+else. Receipts and native hierarchy snapshots are not persisted.
 Deletion uses the selected native row's real context menu. Built-in collections
 are protected; deleting a nonempty folder requires `removeTree`. All mutations
 verify the resulting hierarchy and preservation of unrelated bookmarks. An
@@ -241,8 +266,11 @@ active native editor search must be cleared before complete-tree operations.
 Bookmark movement uses a trusted native drag into an explicit visible folder,
 then verifies its actual parent, appended index, entire subtree, and unchanged
 unrelated hierarchy. A delivered but unconfirmed drag is never replayed.
-Explicit insertion indices, root drops, and obscured/offscreen drag targets are
-unsupported.
+Offscreen rows are first revealed through their actual normalized native
+scrollbar. The same owned drag can reveal its destination without replaying
+mouse-down; every event still uses visible, native-hit-tested row/outline
+coordinates. Explicit insertion indices, root drops, and targets that cannot be
+safely revealed remain unsupported.
 
 System notifications use `UNUserNotificationCenter`. Open **connection
 diagnostics → App notifications → Enable notifications** to request the Mac's
@@ -413,8 +441,7 @@ Completed installed checks:
 
 - The original **Work** management capability moved one explicitly claimed,
   unpinned scratch tab into a new normal window with a single `windows.create`
-  call. It read back the same native tab ID and URL in the new window. This is
-  separate from the pending new-blank-tab lifecycle check.
+  call. It read back the same native tab ID and URL in the new window.
 
 - The original **Work** agent completed text entry, an Apply button click, and
   a Next page link click in an ordinary Safari tab, read back the applied value

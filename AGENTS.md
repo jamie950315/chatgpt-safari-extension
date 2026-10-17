@@ -110,6 +110,10 @@ This is a development-signed conversion of Chrome extension 1.26.1005.11759.
   its explicit `live_status.viewport` outcome rather than silently losing it.
 - History uses trusted SFExtensionProfileKey observations and exact read-only
   metadata/store binding. Unknown mappings never select a default store.
+  This Mac denied the containing app access to Safari history/download metadata.
+  Full Disk Access for the canonical dist app requires the user's own system
+  grant and subsequent validation. Do not bypass TCC through another process or
+  path, or infer native download provenance from files appearing in Downloads.
   Bookmarks use a capability-addressed inert temporary page and native editor;
   preserve the owning sidebar and never write Safari's live plist. Row handles
   bind native identity, profile, and account epoch. Await the sole temporary
@@ -121,7 +125,26 @@ This is a development-signed conversion of Chrome extension 1.26.1005.11759.
   are protected; nonempty folder deletion requires `removeTree`. Movement uses
   trusted native drag into an explicit visible folder, appends only, and verifies
   the entire subtree and unrelated hierarchy. No root drops, explicit insertion
-  indices, offscreen targets, or replay of an uncertain mutation.
+  indices, unrevealable/obscured targets, or replay of an uncertain mutation.
+  Reveal offscreen rows through the actual normalized native scrollbar, then
+  re-prove visible hit-tested coordinates. A single owned drag may reveal its
+  destination; always release its owned mouse-down on success or safe abort.
+  URL `create` remains one original SDK call, internally split into one-shot
+  Add and exact editor-finalize stages. Keep 20 seconds per native stage,
+  25 seconds per native HTTP call, 45 seconds overall and a five-second handoff.
+  The one-use receipt and expected hierarchy stay memory-only, bound to the
+  same original operation/owner/account/profile/session/turn, utility capability
+  and exact native window. Continue the original foreground/selection lease;
+  never refocus to conceal a manual interruption. Only this disposable utility
+  may temporarily unload its API tab while the exact native editor is active.
+  Before restoring the sidebar, return natively to that same capability page and
+  verify the sole fresh real API tab in the original window. Never retain an
+  alias or transfer claimed-tab authority. New siblings, foreign navigation and
+  actual user focus changes cancel the lease. Cancellation, expiry or
+  app/background restart invalidates continuation without retrying Add or
+  deleting the existing `ChatGPT Safari Pending <operation UUID>` record.
+  Completed receipts and private native snapshots are cleared; operation-ID
+  tombstones prevent Add replay for the containing app's lifetime.
 - `SafariFileChooser` accepts only a native-opened panel and its exact observed
   DOM input/profile/document/owner/session/turn lease. Keep original upload
   approval, native file/path readback, and no-replay outcomes. Never substitute
@@ -282,8 +305,14 @@ Build artifacts, private configuration backups, and probe reports stay ignored.
 Use only owned synthetic bookmarks for acceptance; do not send private bookmark
 inventories to the cloud agent.
 
-Current installed acceptance remains open for bookmark CRUD and updated
-website prompt prefill. Native prompt response and two-file upload passed
+Installed original Work bookmark tree/search/read, title/URL update, folder
+creation, URL creation, and native movement passed with exact synthetic-record
+readback. URL creation returned normally from one SDK call, restored its native
+view and the same inline conversation, and cleared all continuation receipts.
+Previously partial test creations were explicitly recovered without Add replay.
+Native deletion has source/guard coverage but no destructive GUI acceptance.
+Updated website prompt prefill remains an installed acceptance dependency.
+Native prompt response and two-file upload passed
 through the original Work agent with exact page readback and no replay.
 Keep source/protocol checks separate from
 original Work completion and retain still-valid accepted results below.

@@ -150,6 +150,52 @@ test("viewport rollback page commit follows only a completed genuine owner resto
   assert.equal(commits.length, 1, "A failed operation cannot authorize a new native return page");
 });
 
+test("only the native bookmark utility lease tolerates virtual editor tab unloading and binds the real returned page", async () => {
+  const f = fixture({ companion: { embedded: true, onClosed: event(), async open() {}, async close() {} } });
+  const url = "http://chatgpt-utility-11111111-1111-4111-8111-111111111111.localhost:1234/bookmarks/22222222-2222-4222-8222-222222222222";
+  const utility = { id: 21, windowId: 20, active: true, url, status: "complete" };
+  f.tabs.set(21, utility);
+  await f.adapter.sidePanel.open({ tabId: 11 });
+  const owner = f.messages[0].message;
+  const result = await f.adapter.withAgentSelection(owner.instanceId, utility, async selection => {
+    await selection.select(utility);
+    for (const [oldId, newId] of [[21, 22], [22, 23]]) {
+      f.api.tabs.onCreated.emit({ id: newId, windowId: -1 });
+      f.api.tabs.onRemoved.emit(oldId, { windowId: 20 }); f.tabs.delete(oldId);
+      selection.assertCurrent();
+      const fresh = { ...utility, id: newId }; f.tabs.set(newId, fresh);
+      f.api.tabs.onActivated.emit({ tabId: newId, windowId: 20 });
+      selection.assertCurrent();
+    }
+    selection.confirmBookmarkUtility(await f.api.tabs.get(23));
+    return { id: "real-final-record" };
+  }, { nativeBookmarkCreate: url });
+  assert.equal(result.id, "real-final-record");
+  assert.deepEqual(f.selections, []);
+  assert.equal((await f.api.windows.get(3)).focused, true);
+  assert.equal(f.storage.chatgptSafariSidebarStateV1.openPanels[0].instanceId, owner.instanceId);
+  assert.equal(f.adapter.selectionDiagnostics().phase, "verified");
+});
+
+test("the native bookmark utility lease still cancels user focus, navigation, siblings and actual tab removal", async () => {
+  for (const changed of ["focus", "navigation", "sibling", "remove"]) {
+    const f = fixture({ companion: { embedded: true, onClosed: event(), async open() {}, async close() {} } });
+    const url = "http://chatgpt-utility-11111111-1111-4111-8111-111111111111.localhost:1234/bookmarks/22222222-2222-4222-8222-222222222222";
+    const utility = { id: 21, windowId: 20, active: true, url, status: "complete" }; f.tabs.set(21, utility);
+    await f.adapter.sidePanel.open({ tabId: 11 }); const owner = f.messages[0].message;
+    await f.adapter.withAgentSelection(owner.instanceId, utility, async selection => {
+      await selection.select(utility);
+      if (changed === "focus") f.api.windows.onFocusChanged.emit(-1);
+      if (changed === "navigation") f.api.tabs.onUpdated.emit(21, { url: "https://example.test/user" });
+      if (changed === "sibling") f.api.tabs.onCreated.emit({ ...utility, id: 22 });
+      if (changed === "remove") { f.api.tabs.onRemoved.emit(21, { windowId: 20 }); f.api.windows.onRemoved.emit(20); }
+      assert.throws(() => selection.assertCurrent(), { code: "FOCUS_CHANGED" });
+    }, { nativeBookmarkCreate: url });
+    assert.deepEqual(f.selections, []);
+    assert.equal(f.adapter.selectionDiagnostics().phase, "rejected");
+  }
+});
+
 test("a native JavaScript dialog retains only its exact owner and target until a confirmed response", async () => {
   const f = fixture({ companion: { embedded: true, onClosed: event(), async open() {}, async close() {} } });
   await f.adapter.sidePanel.open({ tabId: 11 });

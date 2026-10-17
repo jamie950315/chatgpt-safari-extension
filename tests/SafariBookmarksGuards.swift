@@ -17,6 +17,40 @@ import Foundation
         precondition(deadline.authorization(ownerCurrent: true, now: issued.addingTimeInterval(20)) == .deadline)
         precondition(deadline.authorization(ownerCurrent: false, now: issued.addingTimeInterval(20)) == .ownerAndDeadline,
                      "The native deadline must not masquerade as an owner/account authorization change")
+        let scopeCommand: [String: Any] = ["operationId": UUID().uuidString, "_bookmarkOwnerToken": "original-owner", "sessionId": "session", "turnId": "turn", "issuedAtMs": 1_000_000]
+        let scope = try SafariBookmarks.ContinuationScope(scopeCommand, profileIdentity: "profile:account-epoch")
+        let gate = SafariBookmarks.ContinuationGate(scope: scope, now: issued)
+        let receipt = try gate.issueReceipt(now: issued.addingTimeInterval(19))
+        precondition(gate.phase == .awaitingFinalize && gate.authorized(now: issued.addingTimeInterval(23.9)))
+        for key in ["operationId", "_bookmarkOwnerToken", "sessionId", "turnId", "profile"] {
+            var otherCommand = scopeCommand; otherCommand[key] = key == "operationId" ? UUID().uuidString : "different"
+            let other = try SafariBookmarks.ContinuationScope(otherCommand, profileIdentity: key == "profile" ? "other-profile" : scope.profileIdentity)
+            do { _ = try gate.beginFinalize(receipt: receipt, scope: other, now: issued.addingTimeInterval(20)); preconditionFailure("A foreign continuation scope was accepted") }
+            catch let failure as SafariBookmarks.Failure { precondition(failure.code == "BOOKMARK_CONTINUATION_EXPIRED") }
+        }
+        let finalDeadline = try gate.beginFinalize(receipt: receipt, scope: scope, now: issued.addingTimeInterval(23))
+        precondition(finalDeadline.expiresAt == issued.addingTimeInterval(43) && gate.overallExpiry == issued.addingTimeInterval(45))
+        do { _ = try gate.beginFinalize(receipt: receipt, scope: scope, now: issued.addingTimeInterval(23.1)); preconditionFailure("A consumed receipt was replayed") }
+        catch let failure as SafariBookmarks.Failure { precondition(failure.mutationApplied) }
+        gate.complete(); precondition(!gate.authorized(now: issued.addingTimeInterval(24)))
+        let expiredGate = SafariBookmarks.ContinuationGate(scope: scope, now: issued)
+        let expiredReceipt = try expiredGate.issueReceipt(now: issued.addingTimeInterval(5))
+        do { _ = try expiredGate.beginFinalize(receipt: expiredReceipt, scope: scope, now: issued.addingTimeInterval(10)); preconditionFailure("An expired handoff was accepted") }
+        catch let failure as SafariBookmarks.Failure { precondition(failure.code == "BOOKMARK_CONTINUATION_EXPIRED") }
+        let cancelled = SafariBookmarks.ContinuationGate(scope: scope, now: issued)
+        let cancelledReceipt = try cancelled.issueReceipt(now: issued.addingTimeInterval(1))
+        precondition(cancelled.cancel(scope: scope) && !cancelled.authorized(now: issued.addingTimeInterval(2)))
+        do { _ = try cancelled.beginFinalize(receipt: cancelledReceipt, scope: scope, now: issued.addingTimeInterval(2)); preconditionFailure("A cancelled operation continued") }
+        catch let failure as SafariBookmarks.Failure { precondition(failure.mutationApplied) }
+        let restarted = SafariBookmarks.ContinuationGate(scope: scope, now: issued)
+        do { _ = try restarted.beginFinalize(receipt: receipt, scope: scope, now: issued.addingTimeInterval(2)); preconditionFailure("A receipt survived a native runtime restart") }
+        catch let failure as SafariBookmarks.Failure { precondition(failure.code == "BOOKMARK_CONTINUATION_EXPIRED") }
+        precondition(SafariBookmarks.acceptsAddBookmarkSheet(phaseAllowed: true, role: "AXSheet", identifier: "AddBookmarkSheet", attachedCount: 1, exactFocusedAttachment: true))
+        for mismatch in 0..<5 {
+            precondition(!SafariBookmarks.acceptsAddBookmarkSheet(phaseAllowed: mismatch != 0, role: mismatch == 1 ? "AXWindow" : "AXSheet",
+                identifier: mismatch == 2 ? "OtherSheet" : "AddBookmarkSheet", attachedCount: mismatch == 3 ? 2 : 1, exactFocusedAttachment: mismatch != 4),
+                "A focused sheet is authorized only in the bounded Add Bookmark phase and as the one exact attachment to the existing utility window")
+        }
         let diagnostic = SafariBookmarks.Diagnostics(stage: .urlFocus, waitMS: 2048, expansionMS: -1,
             inventoryMS: 1_000_000_001, observation: .init(focusedElementMatches: false, fieldFocused: true, valueMatches: false)).data
         precondition(diagnostic["stage"] as? String == "url_focus" && diagnostic["waitMS"] as? Int == 2048)
@@ -25,6 +59,19 @@ import Foundation
             && diagnostic["valueMatches"] as? Bool == false)
         precondition(Set(diagnostic.keys) == ["stage", "waitMS", "expansionMS", "inventoryMS", "focusedElementMatches", "fieldFocused", "valueMatches"],
                      "Native bookmark diagnostics must remain fixed timings and booleans, without private identities or values")
+        let viewport = CGRect(x: 0, y: 100, width: 800, height: 400)
+        let content = CGRect(x: 0, y: 100, width: 800, height: 2000)
+        let reveal = try SafariBookmarks.revealScrollValue(current: 0, minimum: 0, maximum: 1,
+            row: CGRect(x: 0, y: 1480, width: 800, height: 40), viewport: viewport, content: content)
+        precondition(abs(reveal - 0.75) < 0.001, "Reveal uses the exact observed row and native scroll range, not a guessed screen coordinate")
+        let top = try SafariBookmarks.revealScrollValue(current: 0.75, minimum: 0, maximum: 1,
+            row: CGRect(x: 0, y: -1100, width: 800, height: 40), viewport: viewport, content: content)
+        precondition(top == 0)
+        do {
+            _ = try SafariBookmarks.revealScrollValue(current: 0, minimum: 0, maximum: 1,
+                row: CGRect(x: 0, y: 500, width: 800, height: 400), viewport: viewport, content: content)
+            preconditionFailure("A bookmark larger than the verified viewport was accepted")
+        } catch let failure as SafariBookmarks.Failure { precondition(failure.code == "BOOKMARK_TARGET_OBSCURED") }
         var opened = Set<Int>(), rowScans = 0, classified = 0
         try SafariBookmarks.expandInRounds(rows: {
             rowScans += 1

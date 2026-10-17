@@ -97,13 +97,20 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 if request["action"] as? String == "utilityEntry" {
                     do { reply(["ok": true, "result": ["url": try self.companionServer.utilityEntry()]]) }
                     catch { reply(["ok": false, "error": ["code": "UTILITY_UNAVAILABLE", "message": "The temporary Safari bookmark page is unavailable."]]) }
-                } else if request["action"] as? String == "bookmarks" {
+                } else if ["bookmarks", "bookmarksContinue", "bookmarksCancel"].contains(request["action"] as? String ?? "") {
                     guard let expected = try? self.companionServer.utilityEntry(), request["expectedUrl"] as? String == expected else {
                         reply(["ok": false, "error": ["code": "INVALID_UTILITY_PAGE", "message": "Bookmarks must use the app's temporary operation page."]]); return
                     }
-                    let deadline = SafariBookmarks.OperationDeadline()
-                    self.liveInput.manageBookmarks(request, profileIdentity: profile + ":" + epoch.uuidString, deadline: deadline,
-                        isAuthorized: authorized) { result in DispatchQueue.main.async { reply(result) } }
+                    var signedRequest = request
+                    signedRequest["_bookmarkOwnerToken"] = owner
+                    if request["action"] as? String == "bookmarks" {
+                        let deadline = SafariBookmarks.OperationDeadline()
+                        self.liveInput.manageBookmarks(signedRequest, profileIdentity: profile + ":" + epoch.uuidString, deadline: deadline,
+                            isAuthorized: authorized) { result in DispatchQueue.main.async { reply(result) } }
+                    } else {
+                        self.liveInput.continueBookmarks(signedRequest, profileIdentity: profile + ":" + epoch.uuidString,
+                            isAuthorized: authorized) { result in DispatchQueue.main.async { reply(result) } }
+                    }
                 } else if request["action"] as? String == "notification" {
                     self.notifications.handle(request, isAuthorized: authorized) { result in DispatchQueue.main.async { reply(result) } }
                 } else {
