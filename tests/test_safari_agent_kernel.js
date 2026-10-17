@@ -8,6 +8,7 @@ test("Safari high-level commands retain the original RPC session transport rathe
   assert.equal(await dispatch(context, command, () => assert.fail("Must not enter the CDP handler")), "real result");
   assert.deepEqual(calls, [{ type: "browser_safari_command", command }]);
   assert.equal(await dispatch(context, { type: "browser_user_claim_tab", tab_id: "12" }, async () => "original lease"), "original lease");
+  assert.deepEqual(calls.at(-1), { type: "browser_safari_context" });
   await assert.rejects(dispatch(context, { type: "playwright_evaluate" }, async () => "bad"), /does not support/);
   await assert.rejects(dispatch(context, { ...command, tab_id: "12-other" }, async () => "bad"), /claimed tab IDs/);
 });

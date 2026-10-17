@@ -39,7 +39,9 @@ test("unclaimed tabs, ended turns, old owners and released snapshots cannot post
   await assert.rejects(f.execute("dom_cua_click", { node_id: "d1_n1" }), /Read the current visible DOM/);
   await f.execute("dom_cua_get_visible_dom");
   f.setOwner({ instanceId: "sidebar-b", profileId: "55555555-5555-4555-8555-555555555555" });
-  await assert.rejects(f.execute("dom_cua_click", { node_id: "d2_n1" }), /Read the current visible DOM/);
+  await assert.rejects(f.execute("dom_cua_click", { node_id: "d2_n1" }), /sidebar owner changed/);
+  await assert.rejects(f.execute("dom_cua_get_visible_dom"), /sidebar owner changed/);
+  await assert.rejects(f.agent.authorize(f.session, f.metadata), /sidebar owner changed/);
   f.session.currentTurnId = "turn-ended";
   await assert.rejects(f.execute("dom_cua_get_visible_dom"), /no longer active/);
   assert.equal(f.calls.length, 2);

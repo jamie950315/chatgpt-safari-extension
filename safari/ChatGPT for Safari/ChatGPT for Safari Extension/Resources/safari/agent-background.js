@@ -6,8 +6,10 @@
     "navigate_tab_url", "navigate_tab_back", "navigate_tab_forward", "navigate_tab_reload", "close_tab"]);
   function createAgent(api, companion) {
     const snapshots = new Map();
+    const turnOwners = new Map();
     let generation = 0;
     const scopeKey = (metadata, tabId) => JSON.stringify([metadata.session_id, metadata.turn_id, tabId]);
+    const turnKey = metadata => JSON.stringify([metadata.session_id, metadata.turn_id]);
     const virtual = (snapshot, node) => `d${snapshot.generation}_${node}`;
     function retain(key, page, owner, expose = false) {
       if (!page?.documentId || !page?.snapshotId) { snapshots.delete(key); return; }
@@ -26,14 +28,21 @@
       if (normalized.length === 1 && names[normalized[0]]) return names[normalized[0]];
       throw new Error("Safari supports page editing/navigation keys here, not application shortcuts");
     }
-    async function execute(command, session, metadata) {
-      if (!command || !supported.has(command.type)) throw new Error("This agent command is not implemented by the Safari native backend");
+    async function authorize(session, metadata) {
       if (typeof metadata?.session_id !== "string" || typeof metadata.turn_id !== "string"
         || session.currentTurnId !== metadata.turn_id) throw new Error("The Safari agent turn is no longer active");
+      const owner = await companion.agentOwner();
+      const key = turnKey(metadata), previous = turnOwners.get(key);
+      if (previous && previous !== owner.instanceId) throw new Error("The Safari sidebar owner changed during this agent turn. Start a new turn before using another sidebar owner");
+      turnOwners.set(key, owner.instanceId);
+      return owner;
+    }
+    async function execute(command, session, metadata) {
+      if (!command || !supported.has(command.type)) throw new Error("This agent command is not implemented by the Safari native backend");
+      const owner = await authorize(session, metadata);
       const tabId = Number(command.tab_id);
       if (!Number.isSafeInteger(tabId) || tabId <= 0 || String(tabId) !== command.tab_id) throw new Error("A real Safari tab ID is required");
       await session.requireOwnedTab(tabId);
-      const owner = await companion.agentOwner();
       const handle = `live:${owner.profileId}:${tabId}`;
       const key = scopeKey(metadata, tabId);
       const run = async (action, args) => {
@@ -89,8 +98,12 @@
         const [session, turn] = JSON.parse(key);
         if (session === sessionId && (turnId == null || turn === turnId)) snapshots.delete(key);
       }
+      for (const key of turnOwners.keys()) {
+        const [session, turn] = JSON.parse(key);
+        if (session === sessionId && (turnId == null || turn === turnId)) turnOwners.delete(key);
+      }
     }
-    return { execute, release, supported };
+    return { execute, authorize, release, supported };
   }
   if (typeof module === "object" && module.exports) module.exports = { createAgent, supported };
   const api = root.browser || root.chrome;

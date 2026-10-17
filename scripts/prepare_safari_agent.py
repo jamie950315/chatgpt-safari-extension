@@ -86,7 +86,7 @@ def prepare_background(source: str) -> str:
     source = replace_once(source, 'a=chrome.runtime.sendMessage(d).catch(()=>{})',
                           'a=globalThis.ChatGPTSafariAgentKernel.sendRequest(d).catch(()=>{})')
     source = replace_once(source, 'async executeUnhandledCommand(e){const t=',
-                          'async executeUnhandledCommand(e){if(e.type==="browser_safari_command"){const t=await this.activateSession(e);return globalThis.ChatGPTSafariAgent.execute(e.command,t,e)}const t=')
+                          'async executeUnhandledCommand(e){if(e.type==="browser_safari_context"){const t=await this.activateSession(e);await globalThis.ChatGPTSafariAgent.authorize(t,e);return{}}if(e.type==="browser_safari_command"){const t=await this.activateSession(e);return globalThis.ChatGPTSafariAgent.execute(e.command,t,e)}const t=')
     source = replace_once(source, 'apiSupportOverrides:{"BrowserUser.getTabContext":!0}',
                           'apiSupportOverrides:' + json.dumps(API_SUPPORT_OVERRIDES, separators=(",", ":")))
     source = replace_once(source, ',await n.endTurn(r)}async getInfo(e)',

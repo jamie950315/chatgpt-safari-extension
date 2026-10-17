@@ -16,7 +16,12 @@
   async function dispatch(context, command, original) {
     if (context.clientInfo.family !== "safari") return original();
     if (!record(command) || typeof command.type !== "string") throw new Error("A Safari agent command is required.");
-    if (originalCommands.has(command.type)) return original();
+    if (originalCommands.has(command.type)) {
+      // Original inventory/claim handlers do not call the live executor. Bind
+      // these reads and leases to the same real sidebar owner as native input.
+      await context.api.executeUnhandledCommand({ type: "browser_safari_context" });
+      return original();
+    }
     if (!nativeCommands.has(command.type)) throw new Error(`Safari does not support agent command "${command.type}".`);
     if (typeof command.browser_id !== "string" || !/^[1-9]\d*$/u.test(command.tab_id || "")
       || !Number.isSafeInteger(Number(command.tab_id))) throw new Error("A Safari agent command requires its browser and claimed tab IDs.");
