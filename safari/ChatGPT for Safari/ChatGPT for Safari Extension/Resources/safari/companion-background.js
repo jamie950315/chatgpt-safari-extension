@@ -15,6 +15,7 @@
       if (result?.ok !== true) {
         const error = new Error(typeof result?.error === "string" ? result.error : result?.error?.message || "The Safari companion did not respond");
         error.code = result?.error?.code;
+        error.data = result?.error?.data;
         throw error;
       }
       return result;
@@ -46,6 +47,11 @@
         ...(includeSelection ? { selectedText, selectionId } : {}) };
     }
     const capabilities = { "browserSideChat.openInBrowser": true, "browserSideChat.tabContext.read": true, "browserTabMentions.search": true };
+    const sessionChanged = () => {
+      if (typeof environment.ChatGPTSafariBrowserSessionChanged === "function") {
+        Promise.resolve(environment.ChatGPTSafariBrowserSessionChanged()).catch(() => {});
+      }
+    };
     async function handleRequest(state, request) {
       if (request.ownerToken !== state.instanceId) throw new Error("The native sidebar request belongs to an earlier owner");
       const params = request.params || {};
@@ -81,7 +87,8 @@
       polling = true;
       const state = owner;
       try {
-        const response = await send({ action: "poll", ownerToken: state.instanceId });
+        const cloudTunnel = embedded ? environment.ChatGPTSafariGetCloudTunnelState?.() : undefined;
+        const response = await send({ action: "poll", ownerToken: state.instanceId, ...(cloudTunnel ? { cloudTunnel } : {}) });
         if (response.closed === true) { didClose(state); return; }
         for (const request of response.requests || []) {
           if (owner?.instanceId !== state.instanceId) return;
@@ -102,6 +109,7 @@
     function didClose(state) {
       if (owner?.instanceId !== state.instanceId) return;
       owner = undefined;
+      sessionChanged();
       clearInterval(timer);
       timer = undefined;
       for (const listener of closeListeners) listener(state);
@@ -109,13 +117,50 @@
     async function update(state, action) {
       const value = await context(state);
       const window = await api.windows.get(state.windowId);
+      const profile = embedded ? (await api.storage.local.get("safariLiveProfileId")).safariLiveProfileId : undefined;
       await send({ action: embedded && action === "open" ? "embeddedOpen" : action,
         ...(embedded ? { parentExtensionOrigin: (() => { const u = new URL(api.runtime.getURL("/")); return u.protocol + "//" + u.host.toLowerCase(); })() } : {}),
+        ...(profile ? { liveProfileId: profile } : {}),
         ownerToken: state.instanceId, context: value, capabilities,
         bounds: { left: window.left, top: window.top, width: window.width, height: window.height } });
     }
     const binding = {
       embedded,
+      // These methods belong only to the privileged background's original
+      // account tunnel/kernel. They are not exposed by frameRequest.
+      async readBrowserSession() {
+        if (!embedded || !owner) return null;
+        const state = owner;
+        await ownedTab(state);
+        const response = await send({ action: "embeddedBrowserSession", ownerToken: state.instanceId });
+        await ownedTab(state);
+        return response.session;
+      },
+      async agentOwner() {
+        if (!embedded || !owner) throw new Error("Open the ChatGPT sidebar before controlling Safari");
+        const state = owner;
+        await ownedTab(state);
+        const profileId = (await api.storage.local.get("safariLiveProfileId")).safariLiveProfileId;
+        if (typeof profileId !== "string" || !/^[0-9a-f-]{36}$/i.test(profileId)) throw new Error("The Safari browser profile is not ready");
+        return { instanceId: state.instanceId, profileId };
+      },
+      async agentKernelURL() {
+        if (!embedded || !owner) throw new Error("Open the ChatGPT sidebar before starting its agent kernel");
+        const state = owner;
+        await ownedTab(state);
+        const response = await send({ action: "embeddedKernel", ownerToken: state.instanceId });
+        await ownedTab(state);
+        return response.url;
+      },
+      async runAgentCommand(command, expectedOwner) {
+        const state = owner;
+        if (!state || state.instanceId !== expectedOwner.instanceId) throw new Error("The Safari side-chat owner changed; the command was not executed");
+        await ownedTab(state);
+        const response = await send({ action: "embeddedLive", ownerToken: state.instanceId,
+          profileId: expectedOwner.profileId, command });
+        if (owner?.instanceId !== state.instanceId) throw new Error("The Safari side-chat owner changed during execution; read the page before continuing. Do not repeat the input");
+        return response.result;
+      },
       async frameRequest(state, payload) {
         if (!embedded) throw new Error("The embedded side chat is not enabled");
         await ownedTab(state);
@@ -136,6 +181,7 @@
         } else if (payload.method === "authStateChanged") {
           if (!["expired", "logout_requested", "signed_in", "signed_out"].includes(params.state)) throw new Error("Invalid ChatGPT authentication state");
           await send({ action: "embeddedAuth", ownerToken: state.instanceId, state: params.state });
+          sessionChanged();
         }
         return result;
       },
@@ -152,6 +198,7 @@
         owner = state;
         if (!timer) timer = setInterval(poll, 500);
         await poll();
+        sessionChanged();
         return owner;
       },
       async open(state) {
@@ -159,6 +206,7 @@
         owner = state;
         try { await update(state, "open"); }
         catch (error) { owner = previous; throw error; }
+        sessionChanged();
         if (!timer) timer = setInterval(poll, 500);
         await poll();
       },
@@ -166,6 +214,7 @@
         if (owner?.instanceId !== state.instanceId) return;
         await send({ action: embedded ? "embeddedClose" : "close", ownerToken: state.instanceId });
         owner = undefined;
+        sessionChanged();
         clearInterval(timer);
         timer = undefined;
         await api.scripting.executeScript({ target: { tabId: state.tabId }, func: environment.ChatGPTSafariSidebarFunctions.removeSelection, args: [state.instanceId] }).catch(() => {});

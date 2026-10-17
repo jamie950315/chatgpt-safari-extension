@@ -301,6 +301,16 @@ globalThis.__CHATGPT_SAFARI_ADAPTER_READY__ = (async () => {
         ? (relayMode ? relay.parentExtensionOrigin : actualOrigin) : upstream.a(candidate);
       require.d(exports, { a: () => origin });
     });
+    install("ipG", original => (module, exports, require) => {
+      const upstream = {};
+      original(module, upstream, require);
+      // The official SSR response cannot identify a locally hosted provider
+      // iframe. Classify this validated host surface before RQN initializes
+      // the original connection; account, consent and submit checks stay intact.
+      const presentation = () => relayMode && !window.closed && documentAvailable()
+        && window !== window.top ? true : upstream.a();
+      require.d(exports, { a: () => presentation });
+    });
     install("Kxt", () => (module, exports, require) => {
       require.d(exports, { BrowserSideChatConnection: () => NativeBrowserSideChatConnection });
     });

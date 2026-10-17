@@ -107,6 +107,26 @@ final class ChatGPTProviderRelay {
         }
     }
 
+    /// Returns the minimum original-background session shape through native code only.
+    /// Callers must enforce the active signed-extension owner; never forward this to provider UI or logs.
+    func readBrowserSession(completion: @escaping (Result<[String: Any], Error>) -> Void) {
+        providerRelayQueue.async {
+            guard let engine = self.server, !engine.stopped, engine.enabled, engine.phase == "signedIn" else {
+                self.deliver(completion, .failure(ProviderRelayError.sessionUnconfirmed)); return
+            }
+            let operation = self.sessionOperation, epoch = engine.accountScope
+            engine.readBrowserSession { result in
+                DispatchQueue.main.async {
+                    let current = providerRelayQueue.sync {
+                        self.server === engine && self.sessionOperation == operation && engine.accountScope == epoch
+                            && !engine.stopped && engine.enabled && engine.phase == "signedIn"
+                    }
+                    completion(current ? result : .failure(ProviderRelayError.sessionChanged))
+                }
+            }
+        }
+    }
+
     /// Revoke only this relay's memory session and capabilities. The original WK profile is untouched.
     func clearOwnSession() {
         providerRelayQueue.async {

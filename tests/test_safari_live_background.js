@@ -110,3 +110,15 @@ test("native errors are resolved once with no synthetic input or mutation replay
   assert.equal(f.calls.at(-1).response.error.data.details.stage, "input");
   assert.equal(f.scripts.every(x => typeof x.func === "function" && x.target.frameIds[0] === 0), true);
 });
+
+test("original agent typing requires existing focus and never posts an implicit click", async () => {
+  const f = fixture();
+  const request = f.request("interact", { handle: `live:${f.profileId}:12`, documentId: "doc", snapshotId: "snap",
+    interactions: [{ type: "type", node: "n1", value: "agent text", requireFocused: true }] });
+  f.setPage({ ok: true, result: { expectedUrl: f.tab.url, point: { x: 50, y: 50 }, viewport: { width: 1000, height: 700 } } });
+  f.setNative(command => command.action === "livePoll" ? { ok: true, requests: [request] } : { ok: true, result: { eventsPosted: 2 } });
+  await f.binding.start();
+  assert.deepEqual(f.calls.filter(x => x.action === "liveInput").map(x => x.input.action), ["focus", "type"]);
+  assert.ok(f.scripts.some(x => x.args[0] === "focused"));
+  assert.equal(f.calls.at(-1).response.ok, true);
+});

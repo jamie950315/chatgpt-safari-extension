@@ -199,11 +199,11 @@ struct ProviderRelayTaskKey: Hashable {
 
 final class ProviderRelaySessionProbe {
     let url: URL
-    let completion: (Bool) -> Void
+    let completion: (Result<[String: Any], Error>) -> Void
     var body = Data()
     var status = 0
     var accepted = false
-    init(url: URL, completion: @escaping (Bool) -> Void) { self.url = url; self.completion = completion }
+    init(url: URL, completion: @escaping (Result<[String: Any], Error>) -> Void) { self.url = url; self.completion = completion }
 }
 
 final class ProviderRelayServer: NSObject, URLSessionDataDelegate, URLSessionTaskDelegate {
@@ -387,7 +387,7 @@ final class ProviderRelayServer: NSObject, URLSessionDataDelegate, URLSessionTas
         requestRoutes = ["browserScript": 0, "hostModule": 0, "runtimeModule": 0, "rejections": 0]
         settingsRequests.removeAll()
         enabled = accessible
-        for probe in abandoned { probe.completion(false) }
+        for probe in abandoned { probe.completion(.failure(ProviderRelayError.sessionChanged)) }
     }
 
     func verifyOwnSession(_ cookies: [HTTPCookie], completion: @escaping (Bool) -> Void) {
@@ -397,14 +397,40 @@ final class ProviderRelayServer: NSObject, URLSessionDataDelegate, URLSessionTas
             phase = "checking"
             guard let storage = session.configuration.httpCookieStorage else { completion(false); return }
             for cookie in accepted { storage.setCookie(cookie) }
-            let url = policy.mainOrigin.appendingPathComponent("api/auth/session")
-            var request = URLRequest(url: url)
-            request.timeoutInterval = 15
-            request.setValue("application/json", forHTTPHeaderField: "Accept")
-            let task = session.dataTask(with: request)
-            probes[ProviderRelayTaskKey(session, task)] = ProviderRelaySessionProbe(url: url, completion: completion)
-            task.resume()
+            requestOwnSession { result in
+                if case .success = result { completion(true) } else { completion(false) }
+            }
         } catch { completion(false) }
+    }
+
+    /// Native-only credential read for the signed extension background, never the provider page.
+    func readBrowserSession(completion: @escaping (Result<[String: Any], Error>) -> Void) {
+        guard !stopped, enabled, phase == "signedIn" else { completion(.failure(ProviderRelayError.sessionUnconfirmed)); return }
+        let epoch = accountScope, currentSession = session
+        requestOwnSession { result in
+            guard !self.stopped, self.enabled, self.phase == "signedIn", self.accountScope == epoch,
+                  self.session === currentSession else { completion(.failure(ProviderRelayError.sessionChanged)); return }
+            switch result {
+            case .success(let payload):
+                guard let minimal = ProviderRelaySessionCookies.browserSession(from: payload) else {
+                    completion(.failure(ProviderRelayError.invalidBrowserSession)); return
+                }
+                completion(.success(minimal))
+            case .failure(let error): completion(.failure(error))
+            }
+        }
+    }
+
+    private func requestOwnSession(completion: @escaping (Result<[String: Any], Error>) -> Void) {
+        guard !stopped else { completion(.failure(ProviderRelayError.notRunning)); return }
+        let url = policy.mainOrigin.appendingPathComponent("api/auth/session")
+        var request = URLRequest(url: url)
+        request.httpMethod = "GET"
+        request.timeoutInterval = 15
+        request.setValue("application/json", forHTTPHeaderField: "Accept")
+        let task = session.dataTask(with: request)
+        probes[ProviderRelayTaskKey(session, task)] = ProviderRelaySessionProbe(url: url, completion: completion)
+        task.resume()
     }
 
     func registerInlineModule(_ source: String, documentURL: URL) throws -> String {
@@ -441,7 +467,7 @@ final class ProviderRelayServer: NSObject, URLSessionDataDelegate, URLSessionTas
         inlineModules.removeAll(); inlineModuleOrder.removeAll(); inlineModuleBytes = 0
         session.invalidateAndCancel()
         startup?(ProviderRelayError.notRunning)
-        for probe in abandoned { probe.completion(false) }
+        for probe in abandoned { probe.completion(.failure(ProviderRelayError.sessionChanged)) }
     }
 
     func urlSession(_ session: URLSession, task: URLSessionTask, willPerformHTTPRedirection response: HTTPURLResponse, newRequest request: URLRequest, completionHandler: @escaping (URLRequest?) -> Void) {
@@ -525,7 +551,12 @@ final class ProviderRelayServer: NSObject, URLSessionDataDelegate, URLSessionTas
             guard let self else { return }
             let key = ProviderRelayTaskKey(session, task)
             if let probe = self.probes.removeValue(forKey: key) {
-                probe.completion(self.session === session && error == nil && probe.accepted && ProviderRelaySessionCookies.validSessionResponse(status: probe.status, data: probe.body))
+                guard self.session === session, !self.stopped else { probe.completion(.failure(ProviderRelayError.sessionChanged)); return }
+                guard error == nil, probe.accepted,
+                      let payload = ProviderRelaySessionCookies.sessionPayload(status: probe.status, data: probe.body) else {
+                    probe.completion(.failure(ProviderRelayError.sessionUnconfirmed)); return
+                }
+                probe.completion(.success(payload))
                 return
             }
             guard self.session === session, let transfer = self.transfers.removeValue(forKey: key), !transfer.client.completed else { return }

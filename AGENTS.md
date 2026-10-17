@@ -20,7 +20,7 @@ This is a development-signed conversion of Chrome extension 1.26.1005.11759.
   minimal secure HTTP-only ChatGPT session after an official session probe.
   Never read Safari/Margina cookies, persist credentials, or delete the original
   app-owned WebKit profile. The old native view remains for its sign-in profile.
-- `companion/SideChatBridge.js` adapts the original host boundary (`aH` and `Kxt`).
+- `companion/SideChatBridge.js` adapts the original host boundary (`aH`, `ipG`, and `Kxt`).
   Resolve the runtime from fresh HTML, install before original entry execution,
   and preserve canonical public module URLs (including known async chunks).
   Forward the actual browser User-Agent. Keep exact real frame/parent identity,
@@ -44,6 +44,23 @@ This is a development-signed conversion of Chrome extension 1.26.1005.11759.
   uses a separate profile/session-bound extension poll channel, independent of
   side-chat ownership. Handles bind profile and tab; snapshots bind document,
   URL, and node identity. Never replay a delivered command after a disconnect.
+- The original side-chat Work agent uses its account-bound upstream cloud
+  tunnel and JavaScript kernel, not a separate MCP or replacement model loop.
+  Its native-only session read is owner-bound and returns only the minimum
+  original tunnel fields. Never expose it through the provider host vocabulary.
+- `Resources/safari/agent-kernel-bridge.js` dispatches supported high-level DOM
+  and navigation commands inside the original security gate. Preserve original
+  consent, claimed-tab leases, session/turn scope, and owner cancellation. The
+  executor calls the same ordinary-profile live backend internally; it does not
+  start safaridriver or fake CDP responses. Unsupported APIs stay disabled.
+- Safari does not implement manifest `sandbox.pages`. The original packaged
+  worker runs at a separate capability-bound `chatgpt-kernel-*.localhost` origin
+  served by `CompanionControlServer`, without extension APIs, credentials, or
+  network access. Keep its exact Host/parent/capability, CSP, body, and resource
+  checks. Never add eval permission to privileged extension pages or run agent
+  scripts in the provider relay. Background/offscreen traffic uses a real
+  parent-validated MessageChannel because runtime messages do not deliver to
+  Safari's replacement offscreen iframe in the same background document.
 - `native/SafariLiveInput.swift` uses public AX + CGEvent for trusted input.
   Preserve real Accessibility checks, Safari foreground/window/page identity,
   viewport mapping, native hit testing, and editable keyboard focus. Never use
@@ -101,3 +118,7 @@ Preserve original downloads, browser profiles, login state, drafts, and user
 tabs. Test only owned pages, do not restart Safari, and stop owned probes.
 Do not alter the installed OpenAI app/plugin or Chrome host registration.
 Build artifacts, private configuration backups, and probe reports stay ignored.
+
+The direct Work-agent integration is a development candidate until the original
+sidebar completes real existing-tab actions. Tunnel registration and isolated
+worker tests are narrower evidence, not installed end-to-end acceptance.

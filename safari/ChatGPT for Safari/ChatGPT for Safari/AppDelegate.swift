@@ -24,6 +24,15 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func startCompanionServer() {
+        EmbeddedSideChatController.shared.kernelEntry = { [weak self] origin in
+            guard let self else { throw SideChatError("The Safari companion was closed") }
+            return try self.companionServer.kernelEntry(parentOrigin: origin)
+        }
+        EmbeddedSideChatController.shared.cancelAgentCommands = { [weak self] owner in self?.live.cancelAgent(owner: owner) }
+        EmbeddedSideChatController.shared.liveCommand = { [weak self] command, reply in
+            guard let self else { reply(["ok": false, "error": "The Safari companion was closed"]); return }
+            self.live.handle(command, reply: reply)
+        }
         companionServer.commandHandler = { [weak self] command, reply in
             if command["action"] as? String == "automation" {
                 guard let action = command["command"] as? [String: Any], let self else {

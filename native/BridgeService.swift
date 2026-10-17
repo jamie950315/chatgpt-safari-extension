@@ -200,7 +200,7 @@ final class BridgeService: NSObject, SafariNativeBridge {
                           let action = command["action"] as? String,
                           ["open", "update", "close", "status", "poll", "resolve", "automation", "livePoll", "liveResolve", "liveInput",
                            "embeddedOpen", "embeddedUpdate", "embeddedClose", "embeddedStatus", "embeddedPoll",
-                           "embeddedEntry", "embeddedLocation", "embeddedAuth"].contains(action) else {
+                           "embeddedEntry", "embeddedLocation", "embeddedAuth", "embeddedBrowserSession", "embeddedKernel", "embeddedLive"].contains(action) else {
                         reply(encode(failure("INVALID_COMPANION_COMMAND", "Unknown Safari companion operation.")))
                         return
                     }

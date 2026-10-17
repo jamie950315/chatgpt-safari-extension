@@ -156,10 +156,16 @@
         const created = await api.tabs.create({ url: url(args.url), active: true, ...(args.windowId === undefined ? {} : { windowId: args.windowId }) });
         return describe(await ready(created.id));
       }
-      const tab = await target(args.handle, ["navigate", "select_tab", "close_tab"].includes(action) ? args.expectedUrl : undefined);
+      const tab = await target(args.handle, ["navigate", "history", "select_tab", "close_tab"].includes(action) ? args.expectedUrl : undefined);
       if (action === "read_page") return read(tab, args.maxLength);
-      if (["navigate", "select_tab", "close_tab"].includes(action) && typeof args.expectedUrl !== "string") throw fail("INVALID_ARGUMENT", "expectedUrl is required for this action.");
+      if (["navigate", "history", "select_tab", "close_tab"].includes(action) && typeof args.expectedUrl !== "string") throw fail("INVALID_ARGUMENT", "expectedUrl is required for this action.");
       if (action === "navigate") { await api.tabs.update(tab.id, { url: url(args.url) }); return describe(await ready(tab.id)); }
+      if (action === "history") {
+        const method = { back: "goBack", forward: "goForward", reload: "reload" }[args.direction];
+        if (!method || typeof api.tabs[method] !== "function") throw fail("UNSUPPORTED_NAVIGATION", "This native Safari navigation method is unavailable.");
+        await api.tabs[method](tab.id);
+        return describe(await ready(tab.id));
+      }
       if (action === "select_tab") { await focus(tab); return describe(await target(args.handle, tab.url)); }
       if (action === "close_tab") { await api.tabs.remove(tab.id); return { closed: true, handle: args.handle }; }
       if (action !== "interact") throw fail("UNKNOWN_ACTION", "Unknown live Safari action.");
@@ -196,12 +202,12 @@
             nativeSteps.push({ action: kind, node: interaction.node, ...result });
             return result;
           };
-          if (interaction.type === "type") {
+          if (interaction.type === "type" && interaction.requireFocused !== true) {
             await native("click");
             await page(tab, "focused", { ...args, node: interaction.node });
           }
           // A key must not implicitly click/activate a button or move a caret.
-          if (interaction.type === "key") await page(tab, "focused", { ...args, node: interaction.node });
+          if (interaction.type === "key" || (interaction.type === "type" && interaction.requireFocused === true)) await page(tab, "focused", { ...args, node: interaction.node });
           const result = await native(interaction.type, { text: interaction.value, replaceAll: interaction.replaceAll === true,
             key: interaction.key, deltaX: interaction.deltaX, deltaY: interaction.deltaY });
           completed.push({ type: interaction.type, node: interaction.node, result });

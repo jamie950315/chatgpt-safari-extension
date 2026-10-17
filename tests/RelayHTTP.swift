@@ -33,6 +33,13 @@ import Foundation
                             engine.enabled = verified; engine.phase = verified ? "signedIn" : "blocked"
                             emit(["verified": verified])
                         }
+                    case "browser-session":
+                        engine.readBrowserSession { result in
+                            switch result {
+                            case .success(let value): emit(["browserSessionAvailable": true, "browserSession": value])
+                            case .failure: emit(["browserSessionAvailable": false])
+                            }
+                        }
                     case "stop": engine.stop(); exit(0)
                     default: fatalError("Unknown fixture command")
                     }

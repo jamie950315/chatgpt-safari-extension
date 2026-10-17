@@ -452,6 +452,20 @@
         if (getOptionsUnlocked(tabId).enabled) await openUnlocked({ tabId, windowId });
       }).catch(reportError);
     });
+    api.tabs.onUpdated?.addListener((tabId, change) => {
+      if (!embedded || change.status !== "complete") return;
+      serialize(async () => {
+        const state = Array.from(openByWindow.values()).find(item => item.tabId === tabId);
+        if (!state) return;
+        const tab = await api.tabs.get(tabId);
+        if (!/^https?:\/\//i.test(tab.url || "") || tab.incognito || tab.windowId !== state.windowId) {
+          await closeState(state, "navigation", true); return;
+        }
+        // A document navigation destroys the old inline frame. Retain the
+        // conversation and account owner; do not reopen or restart the agent.
+        await mountContent(state);
+      }).catch(reportError);
+    });
     action.onClicked.addListener((tab) => {
       serialize(async () => {
         if (!panelBehavior.openPanelOnActionClick) return;

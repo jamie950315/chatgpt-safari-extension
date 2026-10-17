@@ -88,7 +88,7 @@ final class CompanionClient {
             request.setValue("Bearer \(connection.1)", forHTTPHeaderField: "Authorization")
             request.setValue("application/json", forHTTPHeaderField: "Content-Type")
             request.httpBody = try JSONSerialization.data(withJSONObject: command)
-            request.timeoutInterval = ["automation", "live"].contains(command["action"] as? String ?? "") ? 130 : 25
+            request.timeoutInterval = ["automation", "live", "embeddedLive"].contains(command["action"] as? String ?? "") ? 130 : 25
             let config = URLSessionConfiguration.ephemeral
             config.connectionProxyDictionary = [:]
             let session = URLSession(configuration: config)

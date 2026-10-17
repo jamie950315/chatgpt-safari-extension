@@ -11,6 +11,7 @@ function fixture(options = {}) {
     runtime: { getURL: path => "safari-web-extension://actual-owner" + path, async sendNativeMessage(_, value) { calls.push(value.command); return typeof response === "function" ? response(value.command) : response; } },
     tabs: { async get() { return { ...tab }; }, onUpdated: { addListener() {} } },
     windows: { async get() { return { left: 100, top: 100, width: 1000, height: 800 }; } },
+    storage: { local: { async get() { return { safariLiveProfileId: "55555555-5555-4555-8555-555555555555" }; } } },
     scripting: { async executeScript(value) { scripts.push(value); afterCapture?.(); return [{ documentId: "doc", result: { selectedText: "selected test text", revision: 2 } }]; } },
   };
   const environment = {
@@ -20,6 +21,32 @@ function fixture(options = {}) {
   return { api, tab, calls, scripts, binding: createCompanion(api, environment, options), setAfterCapture(value) { afterCapture = value; }, setResponse(value) { response = value; } };
 }
 const owner = { tabId: 11, windowId: 3, instanceId: "owner-token" };
+
+test("agent credentials and native commands stay owner-bound and outside the provider host vocabulary", async () => {
+  const f = fixture({ embedded: true });
+  assert.equal(await f.binding.readBrowserSession(), null);
+  await assert.rejects(f.binding.agentKernelURL(), /Open the ChatGPT sidebar/);
+  assert.equal(f.calls.length, 0);
+  f.setResponse(command => ({ ok: true, requests: [], ...(command.action === "embeddedBrowserSession"
+    ? { session: { accessToken: "synthetic-only", account: { id: "synthetic-account" }, user: { id: "synthetic-user" } } }
+    : command.action === "embeddedKernel" ? { url: "http://chatgpt-kernel-fixture.localhost:1234/sandbox?cap=" + "a".repeat(64) }
+    : { result: { text: "Real page result" } }) }));
+  await f.binding.open(owner);
+  try {
+    const session = await f.binding.readBrowserSession();
+    assert.equal(session.accessToken, "synthetic-only");
+    assert.match(await f.binding.agentKernelURL(), /^http:\/\/chatgpt-kernel-fixture\.localhost:/);
+    const current = await f.binding.agentOwner();
+    assert.equal(current.instanceId, owner.instanceId);
+    assert.equal(f.calls[0].liveProfileId, current.profileId);
+    assert.equal((await f.binding.runAgentCommand({ action: "read_page", arguments: {} }, current)).text, "Real page result");
+    await assert.rejects(f.binding.runAgentCommand({}, { ...current, instanceId: "old-owner" }), /owner changed/);
+    for (const method of ["readBrowserSession", "runAgentCommand", "agentKernelURL"]) {
+      await assert.rejects(f.binding.frameRequest(owner, { operation: "host", method, params: {} }), /Unknown native/);
+    }
+  } finally { await f.binding.close(owner); }
+  assert.equal(await f.binding.readBrowserSession(), null);
+});
 
 test("native open and close retain the exact Safari owner and live browser identity", async () => {
   const f = fixture();

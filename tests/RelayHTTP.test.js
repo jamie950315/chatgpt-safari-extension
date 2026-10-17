@@ -23,7 +23,9 @@ test("provider relay uses real bounded HTTP, isolated capabilities, module gates
     received.push({ url: req.url, method: req.method, headers: req.headers, body: Buffer.concat(chunks) });
     if (req.url === "/api/auth/session") {
       res.writeHead(200, { "Content-Type": "application/json" });
-      res.end(JSON.stringify(sessionValid ? { user: { id: "synthetic-user" }, accessToken: "synthetic-only", expires: new Date(Date.now() + 3600_000).toISOString() } : {}));
+      res.end(JSON.stringify(sessionValid ? { user: { id: "synthetic-user", email: "not-forwarded@example.invalid" },
+        account: { id: "synthetic-account", structure: "personal", privateField: "not-forwarded" },
+        accessToken: "synthetic-only", expires: new Date(Date.now() + 3600_000).toISOString() } : {}));
     } else if (req.url.startsWith("/backend-api/settings/user")) {
       res.writeHead(200, { "Content-Type": "application/json" }); res.end("{\"fixture\":true}");
     } else if (req.url.startsWith("/__codex-api/settings/user")) {
@@ -183,8 +185,14 @@ test("provider relay uses real bounded HTTP, isolated capabilities, module gates
   assert.ok(!JSON.stringify(settingsStatus.settingsRequests).includes("fixture-only"));
   assert.ok(!JSON.stringify(settingsStatus.settingsRequests).includes("synthetic-account-scope"));
   const old = entry;
+  child.stdin.write("browser-session\n"); const guestSession = await next();
+  assert.equal(guestSession.browserSessionAvailable, false);
   child.stdin.write("verify\n"); entry = await next();
   assert.equal(entry.verified, true); assert.notEqual(entry.key, old.key); assert.notEqual(entry.accountScope, old.accountScope);
+  child.stdin.write("browser-session\n"); const browserSession = await next();
+  assert.deepEqual(browserSession.browserSession, { accessToken: "synthetic-only", account: { id: "synthetic-account", structure: "personal" }, user: { id: "synthetic-user" } });
+  child.stdin.write("status\n"); const safeStatus = await next();
+  assert.ok(!JSON.stringify(safeStatus).includes("synthetic-only"));
   assert.equal((await call("/", { headers: { "X-ChatGPT-Relay": old.key } })).status, 401);
   sessionValid = false;
   child.stdin.write("verify\n"); entry = await next();

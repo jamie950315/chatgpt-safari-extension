@@ -7,7 +7,8 @@ let providerRelayInlineParameter = "__chatgpt_inline"
 
 enum ProviderRelayError: Error, LocalizedError {
     case invalidParent, invalidConversation, notRunning, invalidResource, missingSession,
-         invalidSession, ambiguousSession, sessionUnconfirmed, moduleLimit, unsupportedRuntime
+         invalidSession, ambiguousSession, sessionUnconfirmed, moduleLimit, unsupportedRuntime,
+         invalidBrowserSession, sessionChanged
     var errorDescription: String? {
         switch self {
         case .invalidParent: return "The sidebar parent must be this Safari extension's exact origin"
@@ -20,6 +21,8 @@ enum ProviderRelayError: Error, LocalizedError {
         case .sessionUnconfirmed: return "The official ChatGPT session check did not confirm this login"
         case .moduleLimit: return "The provider page exceeds the inline-module memory limit"
         case .unsupportedRuntime: return "The ChatGPT page does not identify one supported module runtime"
+        case .invalidBrowserSession: return "The ChatGPT session does not contain a supported browser account scope"
+        case .sessionChanged: return "The ChatGPT session changed while the browser connection was being prepared"
         }
     }
 }
@@ -383,16 +386,39 @@ enum ProviderRelaySessionCookies {
         return ordered.map { $0.2 }
     }
 
-    static func validSessionResponse(status: Int, data: Data, now: Date = Date()) -> Bool {
+    static func sessionPayload(status: Int, data: Data, now: Date = Date()) -> [String: Any]? {
         guard status == 200, data.count <= sessionResponseLimit,
               let value = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
               let user = value["user"] as? [String: Any], let id = user["id"] as? String,
-              !id.isEmpty, id.utf8.count <= 256, let access = value["accessToken"] as? String,
-              !access.isEmpty, access.utf8.count <= 128 * 1024, let expires = value["expires"] as? String else { return false }
+              validSessionString(id, maximumBytes: 256), let access = value["accessToken"] as? String,
+              validSessionString(access, maximumBytes: 128 * 1024), let expires = value["expires"] as? String,
+              expires.utf8.count <= 128 else { return nil }
+        if let error = value["error"], !(error is NSNull) { return nil }
         let formatter = ISO8601DateFormatter(); formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
         var expiry = formatter.date(from: expires)
         if expiry == nil { formatter.formatOptions = [.withInternetDateTime]; expiry = formatter.date(from: expires) }
-        return expiry.map { $0 > now } ?? false
+        guard expiry.map({ $0 > now }) == true else { return nil }
+        return value
+    }
+
+    static func validSessionResponse(status: Int, data: Data, now: Date = Date()) -> Bool {
+        sessionPayload(status: status, data: data, now: now) != nil
+    }
+
+    // Original background ps(account, user.id) consumes only these account fields.
+    // This result is native-only and must never enter provider HTTP/config/diagnostics.
+    static func browserSession(from value: [String: Any]) -> [String: Any]? {
+        guard let token = value["accessToken"] as? String, validSessionString(token, maximumBytes: 128 * 1024),
+              let user = value["user"] as? [String: Any], let userID = user["id"] as? String,
+              validSessionString(userID, maximumBytes: 256), let account = value["account"] as? [String: Any],
+              let accountID = account["id"] as? String, validSessionString(accountID, maximumBytes: 256),
+              let structure = account["structure"] as? String, ["personal", "workspace"].contains(structure) else { return nil }
+        return ["accessToken": token, "account": ["id": accountID, "structure": structure], "user": ["id": userID]]
+    }
+
+    private static func validSessionString(_ value: String, maximumBytes: Int) -> Bool {
+        !value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && value.utf8.count <= maximumBytes
+            && value.rangeOfCharacter(from: .controlCharacters) == nil
     }
 }
 

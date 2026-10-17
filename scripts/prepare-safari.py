@@ -4,12 +4,70 @@
 from pathlib import Path
 import copy
 import json
+import sys
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import prepare_safari_agent
 
 ROOT = Path(__file__).resolve().parent.parent
 SOURCE = ROOT / "vendor/background.chrome.js"
 TARGET = ROOT / "safari/ChatGPT for Safari/ChatGPT for Safari Extension/Resources/background.js"
 
+BROWSER_SESSION_SOURCE = r'''async function Ar(e){
+jn++;
+const timeout=AbortSignal.timeout(us),signal=e==null?timeout:AbortSignal.any([e,timeout]);
+signal.throwIfAborted();
+const companion=globalThis.ChatGPTSafariSidebarOptions?.companion;
+if(typeof companion?.readBrowserSession!=="function")throw new Error("The app-owned ChatGPT session provider is unavailable");
+let cancel;
+try{
+const value=await Promise.race([companion.readBrowserSession(),new Promise((resolve,reject)=>{
+cancel=()=>reject(signal.reason);signal.addEventListener("abort",cancel,{once:!0});if(signal.aborted)cancel();
+})]);
+signal.throwIfAborted();
+if(value===null)return{status:200,session:null};
+try{
+if(typeof value?.accessToken!=="string"||!value.accessToken.trim()||value.accessToken.length>131072)return{status:200,error:"decode"};
+return{status:200,session:{accessToken:value.accessToken,account:ps(value.account,value.user.id)}};
+}catch{return{status:200,error:"decode"}}
+}finally{if(cancel)signal.removeEventListener("abort",cancel)}
+}'''
+
+# This state never contains the upstream setup object, registration IDs, account
+# identifiers, native capabilities, or credentials. The original tunnel owns retries.
+CLOUD_TUNNEL_DIAGNOSTICS = r'''
+var safariTunnelState={kernelGate:null,running:!1,registered:!1,setup:null,polling:null};
+function safariTunnelHttpStatus(value){return Number.isInteger(value)&&value>=100&&value<=599?value:null}
+function safariObserveTunnelSetup(value,outcome){
+const triggers=["startup","navigation","retry","unauthorized","invalid_tunnel","app_session"],
+stages=["session","session_decode","read_configuration","create_tunnel","save_registration","configure_polling","start_polling"],
+outcomes=["created","refreshed","unchanged","invalid_session","failed"];
+safariTunnelState.setup={trigger:triggers.includes(value.trigger)?value.trigger:"unknown",stage:stages.includes(value.stage)?value.stage:"unknown",outcome:outcomes.includes(outcome)?outcome:"unknown",httpStatus:safariTunnelHttpStatus(value.http_status)};
+safariTunnelState.registered=["created","refreshed","unchanged"].includes(outcome);
+if(!safariTunnelState.registered)safariTunnelState.polling={state:"stopped",reason:null,httpStatus:null};
+}
+function safariObserveTunnelPolling(state,reason,httpStatus){
+safariTunnelState.polling={state:["connected","failed","offline","stopped","recovered"].includes(state)?state:"unknown",reason:["http","network","invalid_response","unknown"].includes(reason)?reason:null,httpStatus:safariTunnelHttpStatus(httpStatus)};
+}
+globalThis.ChatGPTSafariGetCloudTunnelState=()=>JSON.parse(JSON.stringify(safariTunnelState));
+'''
+
 REPLACEMENTS = {
+    'async function Ar(e){jn++;const t=AbortSignal.timeout(us),r=await fetch(`${qn}/api/auth/session`,{cache:"no-store",credentials:"include",redirect:"error",signal:e==null?t:AbortSignal.any([e,t])}),{status:n}=r;if(!r.ok)return{status:n,error:"http",retryAfterMs:ms(r)};let i;try{i=await r.json()}catch{return{status:n,error:"decode"}}if(typeof i=="object"&&i!=null&&!Array.isArray(i)&&Object.keys(i).length===0)return{status:n,session:null};try{const a=i;return a.error!=null||!a.accessToken.trim()?{status:n,error:"decode"}:{status:n,session:{accessToken:a.accessToken,account:ps(a.account,a.user.id),...typeof a.user.email=="string"?{email:a.user.email}:{}}}}catch{return{status:n,error:"decode"}}}':
+        (BROWSER_SESSION_SOURCE, 1),
+    'var Vs=3e4': (CLOUD_TUNNEL_DIAGNOSTICS + 'var Vs=3e4', 1),
+    'function Qd(){let e;return(t,r)=>{const n={...t,outcome:r},i=JSON.stringify(n);i!==e&&(e=i,ai("setup",n))}}':
+        ('function Qd(){let e;return(t,r)=>{safariObserveTunnelSetup(t,r);const n={...t,outcome:r},i=JSON.stringify(n);i!==e&&(e=i,ai("setup",n))}}', 1),
+    'function zd(e){let t;return(r,n,i)=>{const a=`${r}:${n??""}:${i??""}`;if(a===t)return;const s=r==="connected"&&t!==void 0;t=a,ai("polling",{state:s?"recovered":r,tunnel_id:e,reason:n,http_status:i})}}':
+        ('function zd(e){let t;return(r,n,i)=>{safariObserveTunnelPolling(r,n,i);const a=`${r}:${n??""}:${i??""}`;if(a===t)return;const s=r==="connected"&&t!==void 0;t=a,ai("polling",{state:s?"recovered":r,tunnel_id:e,reason:n,http_status:i})}}', 1),
+    'chrome.webNavigation.onCompleted.addListener(h,{url:[{hostEquals:new URL(qn).hostname}]});const d=f=>':
+        ('safariTunnelState.running=!0;const safariSessionChanged=()=>l("app_session");globalThis.ChatGPTSafariBrowserSessionChanged=safariSessionChanged;chrome.webNavigation.onCompleted.addListener(h,{url:[{hostEquals:new URL(qn).hostname}]});const d=f=>', 1),
+    'm.stop()}}async function rh':
+        ('m.stop();safariTunnelState.running=!1;safariTunnelState.registered=!1;safariTunnelState.polling={state:"stopped",reason:null,httpStatus:null};if(globalThis.ChatGPTSafariBrowserSessionChanged===safariSessionChanged)delete globalThis.ChatGPTSafariBrowserSessionChanged}}async function rh', 1),
+    'Rr(Iw,v=>{v&&d()},m.signal)':
+        ('Rr(Iw,v=>{safariTunnelState.kernelGate=v===!0;v&&d()},m.signal)', 1),
+    'JSON.stringify({device_name:"Chrome",instance_id:l})':
+        ('JSON.stringify({device_name:"Safari",instance_id:l})', 1),
     'async function xv({reason:e}){e!=="install"||Mn(globalThis.navigator)==="opera"||await wt(Dv).catch(()=>!1)&&await chrome.tabs.create({active:!0,url:`${Ir}/work/extension/installed`})}':
         ('async function xv(){}', 1),  # Setup belongs to the native Safari companion, not Chrome's installation page.
     'async function El(e,t){await oa(e,':
@@ -97,9 +155,10 @@ if __name__ == "__main__":
     resources = TARGET.parent
     manifest = prepare_manifest(json.loads((ROOT / "vendor/manifest.safari-input.json").read_text()))
     (resources / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
-    adapters = ["native-transport.js", "diagnostics-background.js", "sidechat-preload-background.js", "companion-background.js", "live-background.js", "sidebar-adapter.js", "session-windows.js"]
+    adapters = ["native-transport.js", "diagnostics-background.js", "sidechat-preload-background.js", "companion-background.js", "live-background.js", "agent-background.js", "sidebar-adapter.js", "session-windows.js"]
     TARGET.write_text(sidebar_functions() + "\n".join((resources / "safari" / name).read_text() for name in adapters)
-                      + "\n" + prepare(SOURCE.read_text()))
+                      + "\n" + prepare_safari_agent.prepare_background(prepare(SOURCE.read_text())))
+    prepare_safari_agent.prepare_resources(resources)
     origin = '(()=>{const u=new URL(chrome.runtime.getURL("/"));return u.protocol+"//"+u.host})()'
     adaptations = {
         "codex-work-sidepanel.html": (

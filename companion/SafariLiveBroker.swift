@@ -13,6 +13,7 @@ final class SafariLiveBroker {
         let profile: String
         let session: String
         let command: [String: Any]
+        let agentOwner: String?
         let reply: Reply
         var delivered = false
     }
@@ -21,6 +22,8 @@ final class SafariLiveBroker {
     private var operation: Operation?
     private var busy = false
     private var closed = false
+    private var activeAgentOwner: String?
+    private var agentGeneration = 0
 
     init(input: @escaping ([String: Any], @escaping Reply) -> Void) { self.input = input }
 
@@ -59,8 +62,10 @@ final class SafariLiveBroker {
                     reply(Self.failure("LIVE_BUSY", "Another live Safari command is running. This command was not queued or executed.")); return
                 }
                 busy = true
-                execute(action, args: args) { result in
+                activeAgentOwner = command["agentOwner"] as? String
+                execute(action, args: args, agentOwner: activeAgentOwner, generation: agentGeneration) { result in
                     self.busy = false
+                    self.activeAgentOwner = nil
                     reply(result)
                 }
             }
@@ -107,13 +112,13 @@ final class SafariLiveBroker {
         current.reply(result)
     }
 
-    private func send(_ action: String, args: [String: Any], profile: String, reply: @escaping Reply) {
+    private func send(_ action: String, args: [String: Any], profile: String, agentOwner: String? = nil, reply: @escaping Reply) {
         guard let connection = profiles[profile], availableProfiles().contains(profile) else {
             reply(Self.failure("PROFILE_DISCONNECTED", "This Safari profile is disconnected. List tabs again.")); return
         }
         let id = UUID().uuidString
         operation = Operation(id: id, profile: profile, session: connection.session,
-                              command: ["action": action, "arguments": args], reply: reply)
+                              command: ["action": action, "arguments": args], agentOwner: agentOwner, reply: reply)
         DispatchQueue.main.asyncAfter(deadline: .now() + 40) { [weak self] in
             guard let self, let pending = self.operation, pending.id == id else { return }
             self.operation = nil
@@ -127,11 +132,14 @@ final class SafariLiveBroker {
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) { self.discover(deadline: deadline, completion: completion) }
     }
 
-    private func execute(_ action: String, args: [String: Any], reply: @escaping Reply) {
-        guard ["list_tabs", "read_page", "interact", "navigate", "select_tab", "create_tab", "close_tab"].contains(action) else {
+    private func execute(_ action: String, args: [String: Any], agentOwner: String?, generation: Int, reply: @escaping Reply) {
+        guard ["list_tabs", "read_page", "interact", "navigate", "history", "select_tab", "create_tab", "close_tab"].contains(action) else {
             reply(Self.failure("UNKNOWN_ACTION", "Unknown live Safari tool.")); return
         }
         discover(deadline: Date().addingTimeInterval(5)) { ids in
+            if let agentOwner, self.activeAgentOwner != agentOwner || self.agentGeneration != generation {
+                reply(Self.failure("AGENT_OWNER_CHANGED", "The sidebar closed before command delivery. No input was executed.")); return
+            }
             guard !ids.isEmpty else {
                 reply(Self.failure("EXTENSION_DISCONNECTED", "Enable ChatGPT in Safari Extensions and allow access to the target website.")); return
             }
@@ -144,7 +152,7 @@ final class SafariLiveBroker {
                 guard let profile, ids.contains(profile) else {
                     reply(Self.failure("INVALID_HANDLE", "Use a handle or profileId returned by live_list_tabs.")); return
                 }
-                self.send(action, args: args, profile: profile, reply: reply)
+                self.send(action, args: args, profile: profile, agentOwner: agentOwner, reply: reply)
             }
         }
     }
@@ -166,6 +174,18 @@ final class SafariLiveBroker {
         guard parts.count == 3, parts[0] == "live", UUID(uuidString: String(parts[1])) != nil,
               let id = Int(parts[2]), id >= 0 else { return nil }
         return String(parts[1])
+    }
+
+    func cancelAgent(owner: String) {
+        precondition(Thread.isMainThread)
+        guard activeAgentOwner == owner else { return }
+        activeAgentOwner = nil
+        agentGeneration += 1
+        guard let pending = operation, pending.agentOwner == owner else { return }
+        operation = nil
+        pending.reply(Self.failure("AGENT_OWNER_CHANGED", pending.delivered
+            ? "The sidebar closed or changed during a delivered command. Its outcome may be partial; read the page before continuing and do not repeat input."
+            : "The sidebar closed or changed before command delivery. No input was executed."))
     }
 
     func close() {

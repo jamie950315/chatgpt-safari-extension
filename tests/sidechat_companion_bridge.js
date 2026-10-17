@@ -100,7 +100,15 @@ test("isolated provider uses its real parent/origin and a capability-bound chann
   assert.equal(f.messages.length, 0);
   runtime.m.aH = (module, exports, require) => require.d(exports, { a: () => () => undefined });
   runtime.m.Kxt = () => {};
+  runtime.m.ipG = (module, exports, require) => require.d(exports, { a: () => () => false });
   const originExports = {}, connectionExports = {};
+  const presentationExports = {};
+  runtime.m.ipG({}, presentationExports, runtime);
+  assert.equal(presentationExports.a(), true, "The actual provider iframe initializes the original side-chat connection");
+  const top = f.window.top;
+  f.window.top = f.window;
+  assert.equal(presentationExports.a(), false, "A top-level provider document keeps the official classification");
+  f.window.top = top;
   runtime.m.aH({}, originExports, runtime);
   assert.equal(originExports.a(f.window), relay.parentExtensionOrigin);
   assert.equal(originExports.a(f.window.parent), undefined);
@@ -172,6 +180,10 @@ test("the version-bound native host boundary drives the original context and sub
   assert.equal(f.window.__CHATGPT_SAFARI_SIDECAR__.diagnostics().siteAdapter.state, "installed");
   runtime.m.aH = (module, exports, require) => require.d(exports, { a: () => () => undefined });
   runtime.m.Kxt = () => { throw new Error("The Chrome-only connection was not replaced"); };
+  runtime.m.ipG = (module, exports, require) => require.d(exports, { a: () => () => false });
+  const presentationExports = {};
+  runtime.m.ipG({}, presentationExports, runtime);
+  assert.equal(presentationExports.a(), false, "Native-profile presentation still uses the official bootstrap");
   const originExports = {};
   runtime.m.aH({}, originExports, runtime);
   assert.equal(originExports.a(f.window), "https://chatgpt.com");

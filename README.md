@@ -27,7 +27,7 @@ context. The original website still renders the conversation, composer, and
 constructs its own conversation requests.
 
 Each fresh HTML response identifies its actual module runtime. The host adapter
-hooks the inspected `aH` and `Kxt` factories before original entry modules run;
+hooks the inspected `aH`, `ipG`, and `Kxt` factories before original entry modules run;
 public module URLs must remain canonical so both use the same module instance.
 The relay forwards the actual browser User-Agent, retains script CSP protection,
 and narrowly adapts local framing/reporting directives. Never fake a Chrome
@@ -42,7 +42,37 @@ cold-start side-chat requests. Preparation retains the sandbox and original
 host permissions, adding only the embedded wrapper resource and scoped local
 provider frame policy.
 
-## Control existing Safari tabs and logins
+## Direct side-chat agent control (development candidate)
+
+In the original inline sidebar, select **Work** and describe an action on an
+existing Safari tab, for example: "In this page, enter the project note and click
+Apply." Approve the original Browser confirmation when prompted. Its upstream
+confirmation can still say "Chrome"; supported actions are dispatched to the
+real Safari backend, not Chrome or an isolated browser profile.
+
+The original agent keeps its cloud tunnel, account scope, conversation UI,
+browser-control consent, and tab leases. Supported high-level commands use
+Safari's real tabs/scripting APIs and trusted native mouse/keyboard input.
+The app's own ChatGPT session authenticates only the agent tunnel; page logins
+remain in ordinary Safari and are never copied out. No separate MCP client or
+API key is needed for this path.
+
+The current executor supports top-level visible DOM, click, focused typing,
+page keys, scrolling, existing-tab navigation/history/reload, and tab closing.
+Unimplemented screenshot, Playwright, clipboard, and browser-management APIs are
+disabled rather than simulated. Stale targets and uncertain input outcomes
+require a fresh page read; delivered input is never automatically replayed.
+
+Safari lacks Chrome's manifest sandbox pages. The packaged original JavaScript
+worker therefore runs at a dedicated local origin with no extension APIs,
+credentials, or network access. Exact-parent ports connect it to the original
+security-gated host. This computation sandbox does not create website tabs or
+another login session.
+
+**Installed end-to-end verification of this new sidebar path is still required.**
+The independent desktop control results below do not establish that acceptance.
+
+## Optional desktop control of existing tabs
 
 Use **`safari_live`** for the tabs already open in ordinary Safari. It lists the
 real tabs in each connected profile and reads their current pages without
@@ -90,8 +120,8 @@ describes client configuration and connection reloads.
 The original OpenAI native-host connection remains available: the desktop runtime
 discovers the extension as Safari, lists real tabs, and creates agent tabs using
 native Safari windows. Its legacy raw-CDP navigation path is not the control
-backend; Safari does not expose `chrome.debugger`. Use `safari_live` for existing
-tabs, or `safari_native` for isolated tests.
+backend; Safari does not expose `chrome.debugger`. The sidebar's high-level
+adapter and `safari_live` target existing tabs; `safari_native` is for isolated tests.
 
 ## Installed acceptance
 

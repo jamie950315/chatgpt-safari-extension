@@ -47,6 +47,7 @@ function fixture(options = {}) {
       async sendMessage() { assert.fail("Sidebar control must not use Safari tabs.sendMessage"); },
       onRemoved: event(),
       onActivated: event(),
+      onUpdated: event(),
     },
     scripting: { async executeScript(args) {
       scripts.push(args);
@@ -130,6 +131,20 @@ test("the embedded companion opens before mounting and only its owning wrapper c
   assert.equal(calls.filter(([kind]) => kind === "request").length, 1);
   await f.adapter.sidePanel.close({ tabId: 11 });
   assert.deepEqual(calls.map(([kind]) => kind), ["open", "request", "close"]);
+});
+
+test("document navigation remounts the inline conversation without reopening its account or agent", async () => {
+  let opens = 0;
+  const f = fixture({ companion: { embedded: true, onClosed: event(), async open() { opens++; }, async close() {} } });
+  await f.adapter.sidePanel.open({ tabId: 11 });
+  const instance = f.messages[0].message.instanceId;
+  f.tabs.get(11).url = "https://example.com/next";
+  f.api.tabs.onUpdated.emit(11, { status: "complete" }, f.tabs.get(11));
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(opens, 1);
+  assert.equal(f.messages.at(-1).message.type, MESSAGE.mount);
+  assert.equal(f.messages.at(-1).message.instanceId, instance);
+  assert.equal(f.messages.filter(x => x.message.type === MESSAGE.mount).length, 2);
 });
 
 test("embedded restoration remounts an authenticated owner without reopening the native UI", async () => {

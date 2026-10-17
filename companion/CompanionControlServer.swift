@@ -18,10 +18,21 @@ final class CompanionControlServer {
     private let maxBodyBytes = 1024 * 1024
     private let maxResponseBytes = 16 * 1024 * 1024
     private let maxHeaderBytes = 16 * 1024
+    private struct KernelResource {
+        let parent: String
+        let host: String
+        let target: String
+        let url: String
+        let policy: String
+        let document: Data
+    }
+    private var kernelResource: KernelResource?
+    private let kernelSource: Data?
     var commandHandler: CommandHandler?
 
-    init(descriptorDirectory: URL? = nil) {
+    init(descriptorDirectory: URL? = nil, kernelSource: Data? = nil) {
         self.descriptorDirectory = descriptorDirectory
+        self.kernelSource = kernelSource
         queue.setSpecific(key: queueKey, value: true)
     }
 
@@ -62,6 +73,7 @@ final class CompanionControlServer {
             deadlines.removeAll()
             for connection in connections.values { connection.cancel() }
             connections.removeAll()
+            kernelResource = nil
             removeDescriptor()
         }
         if DispatchQueue.getSpecific(key: queueKey) == true { finish() }
@@ -101,13 +113,15 @@ final class CompanionControlServer {
             case .reject(let status, let message):
                 self.respond(connection, status: status, object: ["ok": false, "error": message])
             case .command(let command):
-                self.setDeadline(connection, seconds: ["automation", "live"].contains(command["action"] as? String ?? "") ? 130 : 25)
+                self.setDeadline(connection, seconds: ["automation", "live", "embeddedLive"].contains(command["action"] as? String ?? "") ? 130 : 25)
                 DispatchQueue.main.async {
                     guard let handler = self.commandHandler else {
                         self.respond(connection, status: 503, object: ["ok": false, "error": "The companion is not ready"]); return
                     }
                     handler(command) { result in self.respond(connection, status: 200, object: result) }
                 }
+            case .kernel(let document, let policy):
+                self.respondKernel(connection, document: document, policy: policy)
             }
         }
     }
@@ -124,6 +138,7 @@ final class CompanionControlServer {
         case incomplete
         case reject(Int, String)
         case command([String: Any])
+        case kernel(Data, String)
     }
 
     /// Kept deterministic so request framing and authentication can be checked without opening a port.
@@ -137,7 +152,6 @@ final class CompanionControlServer {
             return .reject(400, "Invalid HTTP headers")
         }
         let lines = headers.components(separatedBy: "\r\n")
-        guard lines.first == "POST /command HTTP/1.1" else { return .reject(404, "Unknown companion endpoint") }
         var fields: [String: String] = [:]
         for line in lines.dropFirst() {
             guard !line.hasPrefix(" "), !line.hasPrefix("\t"),
@@ -151,6 +165,15 @@ final class CompanionControlServer {
             }
             fields[name] = value
         }
+        if let kernel = kernelResource, fields["host"] == kernel.host {
+            guard lines.first == "GET \(kernel.target) HTTP/1.1" else { return .reject(404, "Unknown kernel resource") }
+            guard fields["origin"] == nil || fields["origin"]?.lowercased() == kernel.parent,
+                  fields["transfer-encoding"] == nil,
+                  fields["content-length"] == nil || fields["content-length"] == "0",
+                  data.count == range.upperBound else { return .reject(403, "Invalid kernel document request") }
+            return .kernel(kernel.document, kernel.policy)
+        }
+        guard lines.first == "POST /command HTTP/1.1" else { return .reject(404, "Unknown companion endpoint") }
         guard let host = fields["host"], host.hasPrefix("127.0.0.1:"),
               let port = UInt16(host.dropFirst("127.0.0.1:".count)), port > 0 else {
             return .reject(403, "Only the local companion host is allowed")
@@ -184,6 +207,50 @@ final class CompanionControlServer {
             let text = "HTTP/1.1 \(status) \(status == 200 ? "OK" : "Error")\r\nContent-Type: application/json\r\nContent-Length: \(payload.count)\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n"
             var response = Data(text.utf8)
             response.append(payload)
+            connection.send(content: response, contentContext: .finalMessage, isComplete: true,
+                            completion: .contentProcessed { _ in connection.cancel() })
+        }
+    }
+
+    /// The original worker runs at a dedicated unprivileged origin, not in the
+    /// provider relay or an extension page. Safari ignores manifest sandbox.pages.
+    func kernelEntry(parentOrigin: String) throws -> String {
+        try queue.sync {
+            let parent = parentOrigin.lowercased()
+            guard parent.range(of: #"^safari-web-extension://[a-z0-9-]{1,128}$"#, options: .regularExpression) != nil,
+                  let port = listener?.port, started else { throw SideChatError("The Safari kernel host is not ready") }
+            if let current = kernelResource, current.parent == parent { return current.url }
+            let resource = Bundle.main.builtInPlugInsURL?
+                .appendingPathComponent("ChatGPT for Safari Extension.appex/Contents/Resources/chunks/js-kernel-Ja-7IJxY.js")
+            let bytes: Data
+            if let kernelSource { bytes = kernelSource }
+            else if let resource { bytes = try Data(contentsOf: resource) }
+            else { throw SideChatError("The original JavaScript kernel resource is unavailable") }
+            guard bytes.count <= 2 * 1024 * 1024, let source = String(data: bytes, encoding: .utf8),
+                  source.contains("js-kernel:agent-port") else { throw SideChatError("Invalid original JavaScript kernel resource") }
+            var random = [UInt8](repeating: 0, count: 32)
+            guard SecRandomCopyBytes(kSecRandomDefault, random.count, &random) == errSecSuccess else {
+                throw SideChatError("Could not create the kernel document capability")
+            }
+            let key = random.map { String(format: "%02x", $0) }.joined()
+            let host = "chatgpt-kernel-\(UUID().uuidString.lowercased()).localhost:\(port.rawValue)"
+            let target = "/sandbox?cap=\(key)"
+            // allow-same-origin refers only to this dedicated kernel origin. It
+            // does not grant the extension's origin, APIs, session, or network.
+            let policy = "sandbox allow-scripts allow-same-origin; default-src 'none'; script-src 'nonce-\(key)' 'unsafe-eval'; worker-src blob:; connect-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors \(parent)"
+            let escaped = source.replacingOccurrences(of: "</script", with: "<\\/script", options: .caseInsensitive)
+            let html = "<!doctype html><html lang=en><meta charset=utf-8><title>Safari agent kernel</title><script nonce=\"\(key)\">\(escaped)</script></html>"
+            let value = KernelResource(parent: parent, host: host, target: target, url: "http://\(host)\(target)",
+                                       policy: policy, document: Data(html.utf8))
+            kernelResource = value
+            return value.url
+        }
+    }
+
+    private func respondKernel(_ connection: NWConnection, document: Data, policy: String) {
+        queue.async {
+            let head = "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: \(document.count)\r\nContent-Security-Policy: \(policy)\r\nReferrer-Policy: no-referrer\r\nX-Content-Type-Options: nosniff\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n"
+            var response = Data(head.utf8); response.append(document)
             connection.send(content: response, contentContext: .finalMessage, isComplete: true,
                             completion: .contentProcessed { _ in connection.cancel() })
         }
