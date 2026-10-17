@@ -147,7 +147,7 @@ final class ProviderRelayClient {
         providerRelayQueue.asyncAfter(deadline: .now() + providerRelayWriteTimeout, execute: work)
     }
 
-    func error(_ status: Int, _ message: String, documentRecoveryParent: String? = nil) {
+    func error(_ status: Int, _ message: String) {
         if responded { finish(); return }
         server?.incrementRoute("rejections")
         server?.incrementRoute("rejection_http_\(status)")
@@ -161,18 +161,8 @@ final class ProviderRelayClient {
             "The provider session is unavailable": "session",
         ]
         if let reason = reasons[message] { server?.incrementRoute("rejection_" + reason) }
-        var script = "", csp = "default-src 'none'; base-uri 'none'; form-action 'none'"
-        if status == 401, message == "The provider capability is invalid", let parent = documentRecoveryParent,
-           ProviderRelayPolicy.validParent(parent), let nonce = try? providerRelayRandomKey(),
-           let encoded = try? JSONSerialization.data(withJSONObject: parent, options: [.fragmentsAllowed]),
-           let target = String(data: encoded, encoding: .utf8) {
-            // This signal contains no relay key, bridge token, account data, or
-            // host-channel readiness. It can only remount its containing view.
-            script = "<script nonce=\"\(nonce)\">parent.postMessage({type:'chatgpt-safari-provider:document-capability-missing'},\(target));</script>"
-            csp += "; script-src 'nonce-\(nonce)'; frame-ancestors http: https: \(parent)"
-        }
-        let body = "<!doctype html><html lang=\"en\"><meta charset=\"utf-8\"><title>\(providerRelayEscapeHTML(ProviderRelayMessages.text("relayStatusTitle")))</title><h1>\(providerRelayEscapeHTML(ProviderRelayMessages.text("chatUnavailable")))</h1><p>\(providerRelayEscapeHTML(message))</p><p>\(providerRelayEscapeHTML(ProviderRelayMessages.text("noAutomaticAction")))</p>\(script)</html>"
-        send(status, data: Data(body.utf8), headers: ["Content-Type": "text/html; charset=utf-8", "Content-Security-Policy": csp])
+        let body = "<!doctype html><html lang=\"en\"><meta charset=\"utf-8\"><title>\(providerRelayEscapeHTML(ProviderRelayMessages.text("relayStatusTitle")))</title><h1>\(providerRelayEscapeHTML(ProviderRelayMessages.text("chatUnavailable")))</h1><p>\(providerRelayEscapeHTML(message))</p><p>\(providerRelayEscapeHTML(ProviderRelayMessages.text("noAutomaticAction")))</p></html>"
+        send(status, data: Data(body.utf8), headers: ["Content-Type": "text/html; charset=utf-8", "Content-Security-Policy": "default-src 'none'; base-uri 'none'; form-action 'none'"])
     }
 
     func finish() {
@@ -307,6 +297,7 @@ final class ProviderRelayServer: NSObject, URLSessionDataDelegate, URLSessionTas
     var inlineModuleOrder: [String] = []
     var runtimeInspection: [String: Any] = ["state": "uninspected"]
     var providerReport: [String: Any]?
+    var documentRecoverySequence = 0
     var requestRoutes = ["browserScript": 0, "hostModule": 0, "runtimeModule": 0, "rejections": 0]
     var settingsRequests: [ProviderRelaySettingsObservation] = []
 
@@ -437,7 +428,11 @@ final class ProviderRelayServer: NSObject, URLSessionDataDelegate, URLSessionTas
 
     func preflight(_ request: ProviderRelayRequest, client: ProviderRelayClient) -> Bool {
         if let rejection = policy.rejection(for: request, enabled: enabled && !stopped) {
-            client.error(rejection.0, rejection.1, documentRecoveryParent: policy.documentRecoveryParent(for: request, enabled: enabled && !stopped)); return false
+            if policy.documentRecoveryParent(for: request, enabled: enabled && !stopped) != nil {
+                documentRecoverySequence = min(1_000_000_000, documentRecoverySequence + 1)
+                incrementRoute("document_capability_missing")
+            }
+            client.error(rejection.0, rejection.1); return false
         }
         return true
     }
@@ -479,6 +474,7 @@ final class ProviderRelayServer: NSObject, URLSessionDataDelegate, URLSessionTas
         inlineModules.removeAll(); inlineModuleOrder.removeAll(); inlineModuleBytes = 0
         runtimeInspection = ["state": "uninspected"]
         providerReport = nil
+        documentRecoverySequence = 0
         requestRoutes = ["browserScript": 0, "hostModule": 0, "runtimeModule": 0, "rejections": 0]
         settingsRequests.removeAll()
         enabled = accessible

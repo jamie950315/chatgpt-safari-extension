@@ -385,8 +385,12 @@
           if (target.id === owner.tabId) throw new Error("Keep the active sidebar tab outside this window creation. Move only another explicitly claimed tab");
           if (target.pinned) throw new Error("windows.create cannot move a pinned tab without changing its pinning");
           await window(target.windowId);
-          const observed = await organize(target, "inspect");
-          if (observed.currentGroupTitle !== null && observed.currentGroupSharingState !== "unshared") {
+          const observed = await organize(target, "inspectWindowSource");
+          const source = observed.sourceCollection;
+          if (observed.currentGroupTitle !== null || observed.currentGroupSharingState !== "unshared"
+            || source?.kind !== "ungrouped" || source.sharingState !== "unshared"
+            || typeof observed.windowIdentifier !== "string" || !observed.windowIdentifier
+            || source.nativeWindowIdentifier !== observed.windowIdentifier) {
             throw new Error("Safari did not verify that the source tab collection is unshared. No window was created and no tab was moved");
           }
           sourceTabs = await api.tabs.query({ windowId: target.windowId });

@@ -216,7 +216,15 @@ final class EmbeddedSideChatController {
                 if ownerToken == nil { reply(["ok": true, "closed": true, "requests": [], "state": state()]); return }
                 try requireOwner(command)
                 if let status = command["cloudTunnel"] as? [String: Any] { cloudTunnel = Self.safeTunnelStatus(status) }
-                reply(["ok": true, "requests": [], "state": state()])
+                let current = state(), token = ownerToken, epoch = authorizationEpoch
+                if let relay, initialized, authenticationState == nil {
+                    relay.readDocumentRecoverySequence { sequence in
+                        guard self.ownerToken == token, self.authorizationEpoch == epoch else {
+                            reply(["ok": false, "error": "The embedded side chat owner changed"]); return
+                        }
+                        reply(["ok": true, "requests": [], "state": current, "documentRecoverySequence": sequence])
+                    }
+                } else { reply(["ok": true, "requests": [], "state": current]) }
             case "embeddedClose":
                 if ownerToken != nil { try requireOwner(command) }
                 if let ownerToken { cancelAgentCommands?(ownerToken) }

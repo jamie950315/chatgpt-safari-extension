@@ -16,7 +16,7 @@
     "playwright_locator_press_sequentially", "playwright_locator_set_checked", "playwright_locator_text_content",
     "playwright_locator_read_all", "playwright_locator_wait_for", "playwright_locator_select_option", "playwright_wait_for_load_state",
     "playwright_wait_for_timeout", "playwright_wait_for_url", "playwright_locator_download_media",
-    "playwright_wait_for_file_chooser", "playwright_file_chooser_set_files", "safari_file_chooser_inspect",
+    "playwright_wait_for_file_chooser", "playwright_file_chooser_set_files", "safari_file_chooser_inspect", "safari_native_upload_inspect",
     "tab_content_export_gsuite", "tab_content_export_youtube_transcript", "safari_content_export_inspect"]);
   function createAgent(api, companion) {
     const snapshots = new Map();
@@ -90,8 +90,9 @@
         catch (error) {
           snapshots.delete(key);
           const completed = error.data?.completed?.length || 0;
+          const modalOutcome = args.nativeModal ? ` Native modal events posted: ${Number.isSafeInteger(error.data?.eventsPosted) ? error.data.eventsPosted : "unknown"}; mutation or response may be partial.` : "";
           // Original RPC serializes message only. Preserve uncertainty there.
-          throw new Error(`${error.message}. Completed steps: ${completed}. Input was not retried. Read the current visible DOM before deciding the next action; do not repeat a possibly delivered input.`);
+          throw new Error(`${error.message}.${modalOutcome} Completed steps: ${completed}. Input was not retried. Read the current visible DOM before deciding the next action; do not repeat a possibly delivered input.`);
         }
       };
       const query = type => run("dom_query", { command: { ...command, ...(type ? { type } : {}) } });
@@ -105,11 +106,15 @@
         return run("content_export", { ...args, exportId: command.exportId });
       }
       const agentScope = { ownerId: owner.instanceId, sessionId: metadata.session_id, turnId: metadata.turn_id };
-      const interact = async (target, interactions) => {
+      const interact = async (target, interactions, nativeModal) => {
         try {
           const result = await run("interact", { documentId: target.documentId, snapshotId: target.snapshotId, interactions, agentScope,
             fileChooserScope: { profileId: owner.profileId, tabId: String(tabId), documentId: target.documentId, ...agentScope },
-            ...(target.frameId ? { frameId: target.frameId, framePath: target.framePath } : {}) });
+            ...(target.frameId ? { frameId: target.frameId, framePath: target.framePath } : {}),
+            ...(interactions.some(item => item.type === "clipboard") ? { expectedUrl: target.url,
+              agentScope: { ...agentScope, accountScope: owner.accountScope } } : {}),
+            ...(nativeModal ? { nativeModal, expectedUrl: target.url, agentScope: { ...agentScope, accountScope: owner.accountScope },
+              ...(nativeModal.kind === "upload" ? { uploadSource: { node: target.node, isMultiple: target.isMultiple } } : {}) } : {}) });
           if (result.fileChooserOpen) {
             const waiter = fileChooserWaiters.get(key);
             if (result.fileChooser?.id && typeof result.fileChooser.isMultiple === "boolean") {
@@ -117,9 +122,24 @@
               waiter?.resolve({ file_chooser_id: result.fileChooser.id, is_multiple: result.fileChooser.isMultiple });
             } else waiter?.reject(new Error(result.fileChooserError || "Safari opened a file chooser without a verified source file input. Cancel that chooser; the click was not repeated"));
           }
+          for (const step of result.completed || []) if (step.type === "clipboard") {
+            const observed = step.result?.nativeClipboard;
+            if (!observed?.nativeKeyDelivered || observed.trustedPageReceipt !== true || !["restored", "unchanged", "newer-change-preserved"].includes(observed.clipboardRestoration)) {
+              throw new Error("The native clipboard shortcut or user clipboard restoration is unconfirmed. Do not replay the delivered shortcut");
+            }
+            if (["copy", "cut"].includes(observed.operation)) {
+              await authorize(session, metadata);
+              if (!Array.isArray(observed.items)) throw new Error("Safari returned no verified native clipboard items after the delivered shortcut");
+              clipboards.set(clipboardKey, structuredClone(observed.items));
+            }
+          }
           return result;
         } catch (error) { fileChooserWaiters.get(key)?.reject(error); throw error; }
       };
+      if (command.type === "safari_native_upload_inspect") {
+        if (typeof command.selector !== "string" || !command.selector) throw new Error("An exact native upload source selector is required");
+        return query("safari_native_upload_inspect");
+      }
       if (command.type === "playwright_wait_for_file_chooser") {
         if (fileChooserWaiters.has(key)) throw new Error("A file chooser waiter is already registered for this claimed tab and turn");
         const timeout = command.timeout_ms ?? 30000;
@@ -166,14 +186,12 @@
           let items = clipboards.get(clipboardKey) || [];
           if (action === "paste-plain-text") items = items.map(item => ({ ...item, entries: item.entries.filter(entry => entry.mime_type === "text/plain") })).filter(item => item.entries.length);
           if (!items.length) return null;
-          if (items.some(item => item.entries.some(entry => entry.mime_type !== "text/plain"))) throw new Error("Trusted session paste supports plain text; rich-text or binary clipboard items cannot be pasted through native text input");
+          if (items.some(item => item.entries.some(entry => entry.mime_type !== "text/plain"))) return { type: "clipboard", node, operation: "paste", items: structuredClone(items) };
           const text = items.flatMap(item => item.entries).find(entry => entry.mime_type === "text/plain")?.text;
           if (typeof text !== "string") throw new Error("The session clipboard contains no plain-text payload to paste through native input");
           return { type: "type", node, value: text, requireFocused: true };
         }
-        const selection = await query("safari_selection_read");
-        clipboards.set(clipboardKey, [{ entries: [{ mime_type: "text/plain", text: selection.text }], presentation_style: "unspecified" }]);
-        return action === "copy" || !selection.text ? null : { type: "key", node, key: "Backspace" };
+        return { type: "clipboard", node, operation: action };
       };
       const logScope = JSON.stringify([metadata.session_id, owner.instanceId, metadata.turn_id]);
       const startLogs = async () => {
@@ -266,7 +284,31 @@
           });
           selectedOptions = { options, multiple: observed.multiple };
         }
-        let target = await query(["playwright_locator_press", "playwright_locator_press_sequentially"].includes(command.type) ? "safari_locator_focus" : "safari_locator_prepare");
+        let nativeModal;
+        if (command.safari_native_modal !== undefined) {
+          const value = command.safari_native_modal;
+          if (command.type !== "playwright_locator_click" || !value || typeof value !== "object" || Array.isArray(value)
+            || command.force === true || command.button && command.button !== "left" || command.modifiers?.length
+            || !["dialog", "upload"].includes(value.kind) || !Number.isInteger(value.timeout_ms) || value.timeout_ms < 1 || value.timeout_ms > 10000) {
+            throw new Error("A preregistered native modal requires one plain locator click with a 1–10000ms response deadline");
+          }
+          if (value.kind === "dialog") {
+            if (Object.keys(value).some(key => !["kind", "timeout_ms", "type", "message", "accept", "promptText"].includes(key))
+              || !["alert", "confirm", "prompt"].includes(value.type) || typeof value.message !== "string" || value.message.length > 8000
+              || typeof value.accept !== "boolean" || value.type === "alert" && !value.accept
+              || value.promptText !== undefined && (value.type !== "prompt" || !value.accept || typeof value.promptText !== "string" || value.promptText.length > 20000)) {
+              throw new Error("Specify the exact expected dialog type/message and explicit response; promptText only applies to an accepted prompt");
+            }
+          } else if (Object.keys(value).some(key => !["kind", "timeout_ms", "files"].includes(key))
+            || !Array.isArray(value.files) || !value.files.length || value.files.length > 128
+            || value.files.some(path => typeof path !== "string" || !path.startsWith("/") || path.includes("\0")) || !command.safari_upload_source) {
+            throw new Error("Native upload needs explicit absolute files and its original consent-bound source input preflight");
+          }
+          nativeModal = { ...value };
+        }
+        let target = await query(nativeModal?.kind === "upload" ? "safari_native_upload_inspect"
+          : ["playwright_locator_press", "playwright_locator_press_sequentially"].includes(command.type) ? "safari_locator_focus" : "safari_locator_prepare");
+        if (nativeModal && target.frameId) throw new Error("Preregistered native modals currently require a top-level or same-origin source, not a cross-origin frame");
         if (command.type === "playwright_locator_press_sequentially") {
           if (typeof command.value !== "string") throw new Error("A string input value is required");
           const characters = Array.from(command.value), deadline = Date.now() + Math.min(command.timeout_ms ?? 5000, 5000);
@@ -305,7 +347,14 @@
           if (!interaction) return {};
           interactions = [interaction];
         } else throw new Error(`Safari does not implement ${command.type}`);
-        const outcome = await interact(target, interactions); snapshots.delete(key);
+        const outcome = await interact(target, interactions, nativeModal); snapshots.delete(key);
+        if (nativeModal) {
+          const response = outcome.completed?.[0]?.result?.nativeModal;
+          if (outcome.completed?.length !== 1 || !response?.done || response.responseVerified !== true || response.kind !== nativeModal.kind) {
+            throw new Error("The native modal response is unconfirmed after a delivered click. Do not replay the input or assume a dialog response/upload succeeded");
+          }
+          return response;
+        }
         if (outcome.dialogOpen || outcome.fileChooserOpen) return {};
         if (command.type === "playwright_locator_set_checked" && (await query("safari_checked_read")).checked !== command.checked) {
           throw new Error(`Native click did not change checked state to ${command.checked}; it was not repeated`);
@@ -327,7 +376,12 @@
       if (command.type.startsWith("navigate_tab_") || command.type === "close_tab") {
         const tab = await api.tabs.get(tabId);
         snapshots.delete(key);
-        const args = { expectedUrl: tab.url };
+        let expectedUrl = tab.url;
+        if (expectedUrl == null || expectedUrl === "") {
+          if (typeof root.ChatGPTSafariLive?.navigationSourceUrl !== "function") throw new Error("Safari did not expose this tab's committed URL or native navigation-source verifier. Its source was not assumed to be blank");
+          expectedUrl = await root.ChatGPTSafariLive.navigationSourceUrl(tabId);
+        }
+        const args = { expectedUrl };
         const result = command.type === "navigate_tab_url" ? await run("navigate", { ...args, url: command.url })
           : command.type === "close_tab" ? await run("close_tab", args)
           : await run("history", { ...args, direction: command.type.slice("navigate_tab_".length) });

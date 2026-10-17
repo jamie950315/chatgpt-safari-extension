@@ -226,12 +226,14 @@
         const oldest = live.contentExports.values().next().value; oldest.controller?.abort(); clearTimeout(oldest.timer); live.contentExports.delete(oldest.id);
       }
       live.contentExports.set(id, item);
-      item.timer = setTimeout(() => { item.controller?.abort(); item.bytes = null; live.contentExports.delete(id); }, 30000);
-      item.timer?.unref?.();
+      // Original download approval can take longer than the byte-transfer limit.
+      // Keep at most four small, exact-document inspections until approval;
+      // pagehide, scope changes and eviction still invalidate their authority.
       return { ok: true, result: { exportId: id, documentId: item.documentId, pageUrl: item.pageUrl, href, kind: item.kind, format, videoId, filename: item.filename } };
     }
     const item = live.contentExports.get(args.exportId);
-    const current = () => item && item.scope === args.scope && item.documentId === live.documentId && item.pageUrl === location.href && Date.now() - item.createdAt <= 30000;
+    const current = () => item && item.scope === args.scope && item.documentId === live.documentId && item.pageUrl === location.href
+      && (item.startedAt === undefined || Date.now() - item.startedAt <= 30000);
     if (operation === "cancel") {
       if (item?.scope === args.scope) { item.controller?.abort(); clearTimeout(item.timer); live.contentExports.delete(item.id); }
       return { ok: true, result: { cancelled: true } };
@@ -239,7 +241,10 @@
     if (!current()) return fail("The content export no longer belongs to this exact document and sidebar scope.");
     if (operation === "check") return { ok: true, result: { current: true, pageUrl: item.pageUrl, documentId: item.documentId, kind: item.kind, format: item.format, videoId: item.videoId } };
     if (operation === "start") {
-      if (item.bytes || item.controller) return fail("This export transfer already started; it was not repeated.");
+      if (item.startedAt !== undefined) return fail("This export transfer already started; it was not repeated.");
+      item.startedAt = Date.now();
+      item.timer = setTimeout(() => { item.controller?.abort(); item.bytes = null; live.contentExports.delete(item.id); }, 30000);
+      item.timer?.unref?.();
       if (item.kind === "youtube") {
         if (typeof args.text !== "string" || !args.text.startsWith("YouTube transcript\nVideo ID: " + item.videoId + "\n") || new TextEncoder().encode(args.text).length > 501000) return fail("The fixed YouTube helper returned an invalid or oversized transcript.");
         item.bytes = new TextEncoder().encode(args.text);

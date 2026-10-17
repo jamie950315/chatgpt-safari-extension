@@ -7,10 +7,11 @@ struct ChatGPTProviderRelayEntry {
     let bridgeToken: String
     let accountScope: String
     let phase: String
+    let documentRecoverySequence: Int
     var dictionary: [String: Any] {
         ["providerURL": providerURL, "providerOrigin": providerOrigin,
          "parentExtensionOrigin": parentExtensionOrigin, "bridgeToken": bridgeToken,
-         "accountScope": accountScope, "phase": phase]
+         "accountScope": accountScope, "phase": phase, "documentRecoverySequence": documentRecoverySequence]
     }
 }
 
@@ -146,9 +147,17 @@ final class ChatGPTProviderRelay {
                 "challenges": engine?.challengeCount ?? 0, "activeRequests": engine?.transfers.count ?? 0,
                 "runtimeInspection": engine?.runtimeInspection ?? ["state": "uninspected"],
                 "providerReport": engine?.providerReport ?? NSNull(),
+                "documentRecoverySequence": engine?.documentRecoverySequence ?? 0,
                 "requestRoutes": engine?.requestRoutes ?? ["browserScript": 0, "hostModule": 0, "runtimeModule": 0, "rejections": 0],
                 "settingsRequests": engine?.settingsRequests.map(\.dictionary) ?? []]
             DispatchQueue.main.async { completion(value) }
+        }
+    }
+
+    func readDocumentRecoverySequence(completion: @escaping (Int) -> Void) {
+        providerRelayQueue.async {
+            let sequence = self.server.map { $0.enabled && !$0.stopped ? $0.documentRecoverySequence : 0 } ?? 0
+            DispatchQueue.main.async { completion(sequence) }
         }
     }
 
@@ -169,7 +178,7 @@ final class ChatGPTProviderRelay {
         guard let url = parts.url, let mapped = engine.policy.localURL(url.absoluteString, relativeTo: url) else { throw ProviderRelayError.invalidConversation }
         return ChatGPTProviderRelayEntry(providerURL: mapped, providerOrigin: engine.policy.localOrigin,
             parentExtensionOrigin: engine.policy.parentExtensionOrigin, bridgeToken: engine.policy.bridgeToken,
-            accountScope: engine.accountScope, phase: engine.phase)
+            accountScope: engine.accountScope, phase: engine.phase, documentRecoverySequence: engine.documentRecoverySequence)
     }
 
     private func deliver<T>(_ completion: @escaping (Result<T, Error>) -> Void, _ value: Result<T, Error>) {

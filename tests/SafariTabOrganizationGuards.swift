@@ -16,6 +16,7 @@ struct SafariTabOrganizationGuards {
             catch { preconditionFailure("Unexpected error: \(error)") }
         }
         _ = try request()
+        _ = try request(["action": "inspectWindowSource"])
         rejects("INVALID_ARGUMENTS") { _ = try request(["action": "deleteGroup"]) }
         rejects("INVALID_ARGUMENTS") { _ = try request(["expectedUrl": "file:///private/data"]) }
         rejects("UNSUPPORTED_GROUP_PROPERTY") { _ = try request(["color": "blue"]) }
@@ -37,6 +38,16 @@ struct SafariTabOrganizationGuards {
         precondition(SafariTabOrganization.groupTitle("TabGroupPickerButton?TabGroup=Research%20%2F%20Tabs") == "Research / Tabs")
         precondition(SafariTabOrganization.groupTitle("TabGroupPickerButton?TabGroup=") == "")
         precondition(SafariTabOrganization.groupTitle("PageSupplied?TabGroup=Research") == nil)
+        let ungroupedSource = try SafariTabOrganization.windowSource(["TabGroupPickerButton?TabGroup="])
+        precondition(ungroupedSource.groupTitle == nil && ungroupedSource.kind == "ungrouped" && ungroupedSource.sharingState == "unshared")
+        let duplicateSource = try SafariTabOrganization.windowSource(["TabGroupPickerButton?TabGroup=", "TabGroupPickerButton?TabGroup="])
+        precondition(duplicateSource == ungroupedSource)
+        let groupedSource = try SafariTabOrganization.windowSource(["TabGroupPickerButton?TabGroup=Research%20Tabs"])
+        precondition(groupedSource.groupTitle == "Research Tabs" && groupedSource.kind == "named-tab-group" && groupedSource.sharingState == "unknown")
+        for identifiers in [[], ["PageSupplied?TabGroup="], ["TabGroupPickerButton?TabGroup=%GG"],
+                            ["TabGroupPickerButton?TabGroup=", "TabGroupPickerButton?TabGroup=Research"]] {
+            rejects("WINDOW_SOURCE_UNVERIFIED") { _ = try SafariTabOrganization.windowSource(identifiers) }
+        }
         let uuid = "C1216CBB-8F0C-42A2-8C18-84643E328436"
         precondition(SafariTabOrganization.windowIdentifier("SafariWindow?IsSecure=true&UUID=" + uuid) == uuid)
         precondition(SafariTabOrganization.windowIdentifier("SafariWindow?IsSecure=false&UUID=" + uuid) == uuid)
@@ -115,6 +126,6 @@ struct SafariTabOrganizationGuards {
         precondition(SafariTabOrganization.sidebarLayoutConfirmed(requestedVisible: true, sidebarHit: true, pickerHit: false))
         precondition(SafariTabOrganization.sidebarLayoutConfirmed(requestedVisible: false, sidebarHit: false, pickerHit: true))
         precondition(!SafariTabOrganization.sidebarLayoutConfirmed(requestedVisible: false, sidebarHit: false, pickerHit: false))
-        print("Safari native Tab Group argument guards, title/window identities, and observed selected-tab identities passed. No Safari activation or input was performed.")
+        print("Safari native Tab Group argument guards, read-only window-source proofs, title/window identities, and observed selected-tab identities passed. No Safari activation or input was performed.")
     }
 }

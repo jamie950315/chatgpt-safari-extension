@@ -41,13 +41,17 @@ import Foundation
             headers: ["host": "chatgpt-provider-fixture.localhost:34567", "accept": "text/html,application/xhtml+xml", "sec-fetch-dest": "iframe"], body: Data())
         precondition(policy.rejection(for: reload, enabled: true)?.0 == 401, "Reload stays unauthorized until the wrapper obtains a fresh entry")
         precondition(policy.documentRecoveryParent(for: reload, enabled: true) == parent)
+        let documentReload = ProviderRelayRequest(method: "GET", target: reload.target,
+            headers: reload.headers.merging(["sec-fetch-dest": "document"]) { _, new in new }, body: Data())
+        precondition(policy.documentRecoveryParent(for: documentReload, enabled: true) == parent,
+                     "WebKit document reload metadata must not prevent native receipt classification")
         precondition(policy.documentRecoveryParent(for: reload, enabled: false) == nil)
         for invalid in [ProviderRelayRequest(method: "POST", target: reload.target, headers: reload.headers, body: Data()),
                         ProviderRelayRequest(method: "GET", target: "/backend-api/me", headers: reload.headers, body: Data()),
                         ProviderRelayRequest(method: "GET", target: "/api/auth/session", headers: reload.headers, body: Data()),
                         ProviderRelayRequest(method: "GET", target: "/?__chatgpt_key=wrong", headers: reload.headers, body: Data()),
                         ProviderRelayRequest(method: "GET", target: reload.target, headers: reload.headers.merging(["origin": "https://attacker.invalid"]) { _, new in new }, body: Data()),
-                        ProviderRelayRequest(method: "GET", target: reload.target, headers: reload.headers.merging(["sec-fetch-dest": "script"]) { _, new in new }, body: Data()),
+                        ProviderRelayRequest(method: "GET", target: reload.target, headers: reload.headers.merging(["x-chatgpt-relay": "wrong"]) { _, new in new }, body: Data()),
                         ProviderRelayRequest(method: "GET", target: reload.target, headers: reload.headers.merging(["accept": "application/json"]) { _, new in new }, body: Data())] {
             precondition(policy.documentRecoveryParent(for: invalid, enabled: true) == nil)
         }
@@ -105,7 +109,8 @@ import Foundation
         precondition(!ProviderRelaySessionCookies.validSessionResponse(status: 200, data: Data("{}".utf8)))
         let diagnostic: [String: Any] = ["state": "installed", "usedOrigin": 1, "usedConnection": 2,
             "channelConnected": true, "readyPosted": true, "connectMessages": 1, "parentSourceMatched": true,
-            "parentTokenMatched": true, "parentOriginKind": "expected",
+            "parentTokenMatched": true, "parentOriginKind": "expected", "trustedInputCounter": 2,
+            "composerHasText": true, "composerFocused": true, "composerEditable": true, "sendDisabled": false,
             "errors": [["kind": "TypeError", "frames": ["/cdn/assets/async/637745.14f70978dc.js:12:34"]]]]
         precondition(ProviderRelayDiagnostics.validate(diagnostic) != nil)
         var unsafe = diagnostic; unsafe["message"] = "private raw error"; precondition(ProviderRelayDiagnostics.validate(unsafe) == nil)
@@ -114,6 +119,12 @@ import Foundation
         unsafe = diagnostic; unsafe["channelConnected"] = 1; precondition(ProviderRelayDiagnostics.validate(unsafe) == nil)
         unsafe = diagnostic; unsafe["readyPosted"] = "true"; precondition(ProviderRelayDiagnostics.validate(unsafe) == nil)
         unsafe = diagnostic; unsafe["connectMessages"] = -1; precondition(ProviderRelayDiagnostics.validate(unsafe) == nil)
+        unsafe = diagnostic; unsafe["trustedInputCounter"] = true; precondition(ProviderRelayDiagnostics.validate(unsafe) == nil)
+        unsafe = diagnostic; unsafe["trustedInputCounter"] = -1; precondition(ProviderRelayDiagnostics.validate(unsafe) == nil)
+        unsafe = diagnostic; unsafe["composerHasText"] = "private draft text"; precondition(ProviderRelayDiagnostics.validate(unsafe) == nil)
+        unsafe = diagnostic; unsafe["composerFocused"] = 1; precondition(ProviderRelayDiagnostics.validate(unsafe) == nil)
+        unsafe = diagnostic; unsafe["composerEditable"] = "true"; precondition(ProviderRelayDiagnostics.validate(unsafe) == nil)
+        unsafe = diagnostic; unsafe["sendDisabled"] = "false"; precondition(ProviderRelayDiagnostics.validate(unsafe) == nil)
         unsafe = diagnostic; unsafe["parentOriginKind"] = "https://private.invalid/"; precondition(ProviderRelayDiagnostics.validate(unsafe) == nil)
         unsafe = diagnostic; unsafe["errors"] = [["kind": "Error", "frames": ["https://chatgpt.com/c/private-conversation"]]]; precondition(ProviderRelayDiagnostics.validate(unsafe) == nil)
         unsafe = diagnostic; unsafe["errors"] = [["kind": "Error", "frames": ["/cdn/assets/fixture-123.js?secret=private"]]]; precondition(ProviderRelayDiagnostics.validate(unsafe) == nil)

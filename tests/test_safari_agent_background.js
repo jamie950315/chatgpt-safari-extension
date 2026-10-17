@@ -17,7 +17,8 @@ function fixture() {
     if (command.action === "download_link_inspect") return { href: page.nodes[2].href, url: page.url };
     if (command.action === "download_link") return { state: "complete", path: "/Downloads/report.txt", bytesWritten: 42 };
     if (command.action === "interact") { page.snapshotId += "-next"; page.focusedNode = "n1"; return interactionResult
-      ?? { page: { ...page }, completed: command.arguments.interactions.map(item => ({ type: item.type })) }; }
+      ?? { page: { ...page }, completed: command.arguments.interactions.map(item => ({ type: item.type,
+        ...(item.type === "clipboard" ? { result: { nativeClipboard: { operation: item.operation, nativeKeyDelivered: true, trustedPageReceipt: true, clipboardRestoration: "restored" } } } : {}) })) }; }
     return { status: "complete" };
   } };
   const agent = createAgent({ tabs: { async get() { return { url: page.url }; } } }, companion);
@@ -109,6 +110,24 @@ test("double-click and modified page keys retain the original claimed native bou
   assert.equal(f.calls.at(-1).command.arguments.interactions[0].key, "Meta+a");
   await assert.rejects(f.execute("dom_cua_keypress", { keys: ["META", "a", "b"] }), /one page key/);
 });
+test("native dialog responses share one exact claimed click scope and return actual native outcome", async () => {
+  const f = fixture(), policy = { kind: "dialog", type: "prompt", message: "Exact prompt?", accept: true, promptText: "Native answer", timeout_ms: 10000 };
+  const actual = { kind: "dialog", type: "prompt", message: "Exact prompt?", accepted: true, responseVerified: true, done: true };
+  f.setInteractionResult({ completed: [{ type: "click", result: { nativeModal: actual } }] });
+  assert.equal(await f.execute("playwright_locator_click", { selector: "button", safari_native_modal: policy }), actual);
+  const delivered = f.calls.at(-1).command;
+  assert.equal(delivered.action, "interact"); assert.deepEqual(delivered.arguments.nativeModal, policy);
+  assert.equal(delivered.arguments.expectedUrl, "https://example.com/");
+  assert.deepEqual(delivered.arguments.agentScope, { ownerId: "sidebar-a", accountScope: "account-a", sessionId: "thread-a", turnId: "turn-a" });
+  assert.equal(delivered.arguments.interactions.length, 1);
+  f.setInteractionResult({ completed: [{ type: "click" }] });
+  await assert.rejects(f.execute("playwright_locator_click", { selector: "button", safari_native_modal: policy }), /response is unconfirmed.*Do not replay/);
+  const before = f.calls.length;
+  for (const changed of [{ accept: 1 }, { message: "x".repeat(8001) }, { timeout_ms: 10001 }, { type: "alert", accept: false }, { unknown: true }]) {
+    await assert.rejects(f.execute("playwright_locator_click", { selector: "button", safari_native_modal: { ...policy, ...changed } }), /preregistered native modal|exact expected dialog/);
+  }
+  assert.equal(f.calls.length, before, "invalid responses never post the opening click");
+});
 test("the original browser clipboard is a real session and owner scoped virtual clipboard", async () => {
   const f = fixture();
   await f.execute("tab_clipboard_write_text", { text: "session-only clipboard" });
@@ -136,7 +155,7 @@ test("original Playwright locators resolve a native target rather than dispatchi
   assert.deepEqual(requests[1].arguments.interactions, [{ type: "type", node: "real-query-node", value: "Native replacement", replaceAll: true }]);
   assert.equal(original.supported.has("playwright_locator_fill"), true);
 });
-test("all original keyboard routes use the virtual clipboard and never send OS paste shortcuts", async () => {
+test("all original keyboard routes retain session storage, plaintext typing, and explicit scoped rich native paste", async () => {
   for (const route of ["dom_cua_keypress", "cua_keypress", "playwright_locator_press"]) {
     const f = fixture(); await f.execute("dom_cua_get_visible_dom"); await f.execute("dom_cua_click", { node_id: "d1_n1" });
     await f.execute("tab_clipboard_write_text", { text: "Virtual session payload" });
@@ -152,10 +171,33 @@ test("all original keyboard routes use the virtual clipboard and never send OS p
     await invoke(["Shift", "Insert"]);
     await assert.rejects(invoke(["Meta", "Alt", "v"]), /Native clipboard shortcuts are disabled/);
     await f.execute("tab_clipboard_write", { items: [{ entries: [{ mime_type: "text/plain", text: "Plain" }, { mime_type: "text/html", text: "<b>Rich</b>" }] }] });
-    await assert.rejects(invoke(["Meta", "v"]), /rich-text or binary/);
+    await invoke(["Meta", "v"]);
+    assert.equal(f.calls.at(-1).command.arguments.interactions[0].type, "clipboard");
+    assert.equal(f.calls.at(-1).command.arguments.interactions[0].operation, "paste");
+    assert.equal(f.calls.at(-1).command.arguments.agentScope.accountScope, "account-a");
+    assert.equal(f.calls.at(-1).command.arguments.interactions[0].items[0].entries[1].mime_type, "text/html");
     await invoke(["Meta", "Shift", "v"]);
     assert.equal(f.calls.at(-1).command.arguments.interactions[0].value, "Plain");
   }
+});
+test("native copy and cut retain all returned supported MIME entries in the original session only", async () => {
+  for (const key of ["c", "x"]) {
+    const f = fixture(), items = [{ entries: [{ mime_type: "text/plain", text: "Native copied text" }, { mime_type: "text/html", text: "<b>Native</b>" }] }];
+    f.setInteractionResult({ completed: [{ type: "clipboard", result: { nativeClipboard: { operation: key === "c" ? "copy" : "cut", items,
+      nativeKeyDelivered: true, trustedPageReceipt: true, clipboardRestoration: "restored" } } }] });
+    await f.execute("playwright_locator_press", { selector: "textarea", value: "Meta+" + key });
+    const actual = f.calls.at(-1).command.arguments.interactions[0];
+    assert.equal(actual.type, "clipboard"); assert.equal(actual.operation, key === "c" ? "copy" : "cut"); assert.equal(actual.items, undefined);
+    assert.deepEqual(await f.execute("tab_clipboard_read"), { items });
+    f.agent.release(f.metadata.session_id); assert.deepEqual(await f.execute("tab_clipboard_read"), { items: [] });
+  }
+});
+test("an unobserved native clipboard shortcut cannot publish data into the original session", async () => {
+  const f = fixture();
+  f.setInteractionResult({ completed: [{ type: "clipboard", result: { nativeClipboard: { operation: "copy", nativeKeyDelivered: true,
+    clipboardRestoration: "restored", items: [{ entries: [{ mime_type: "text/plain", text: "Unverified" }] }] } } }] });
+  await assert.rejects(f.execute("playwright_locator_press", { selector: "textarea", value: "Meta+c" }), /unconfirmed.*Do not replay/);
+  assert.deepEqual(await f.execute("tab_clipboard_read"), { items: [] });
 });
 test("sequential typing sends Unicode characters once in bounded fresh native batches", async () => {
   const f = fixture(), value = "1234567890123456789😀ab";

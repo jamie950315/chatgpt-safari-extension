@@ -9,6 +9,7 @@ ROOT = Path(__file__).resolve().parent.parent
 RESOURCES = ROOT / "safari/ChatGPT for Safari/ChatGPT for Safari Extension/Resources"
 KERNEL_HOST = "chunks/js-kernel-host-Biytnb6r.js"
 KERNEL_OFFSCREEN = "chunks/js-kernel-offscreen-DIYPN8p_.js"
+KERNEL_WORKER = "chunks/js-kernel-Ja-7IJxY.js"
 BRIDGE_BEGIN = "/* BEGIN GENERATED SAFARI AGENT BRIDGE */\n"
 BRIDGE_END = "/* END GENERATED SAFARI AGENT BRIDGE */\n"
 
@@ -138,8 +139,9 @@ uncertain result must never be replayed automatically.
 viewport. Reset before finishing. Turn, sidebar owner and account teardown also
 request restoration. Restoration never steals focus, changes another native
 window, or overwrites a user's subsequent move/resize. An unconfirmed restoration
-is an explicit error, not a successful reset. Keep the exact tab/document selected
-until reset; do not navigate or switch its native collection while it is sized.
+is an explicit error, not a successful reset. Do not navigate or change the claimed source document or its native collection
+while it is sized. A verified return to the owning sidebar is tracked for safe
+rollback; do not manually change that terminal selection before reset.
 
 ```ts
 interface ViewportSize { height: number; width: number; }
@@ -174,7 +176,109 @@ def prepare_file_chooser_documentation(source: str) -> str:
     download = "{text:'waitForEvent(event: \"download\", options?: WaitForEventOptions): Promise<PlaywrightDownload>; // Wait for the next download to complete; call before clicking its download control.',references:[\"WaitForEventOptions\",\"PlaywrightDownload\"]},"
     source = source.replace(download, "")
     source = source.replace("// Wait for a file chooser.", "// Register before the native click. Safari supports direct inputs, labels, and input.click() in the trusted gesture; showPicker-only controls are unsupported.")
+    source = source.replace("// Register before the native click. Safari supports direct inputs, labels, and input.click() in the trusted gesture; showPicker-only controls are unsupported.",
+                            "// Safari may suspend extension callbacks while its native chooser is open. For known upload controls use the nativeUploads capability with explicit files approved before its opening click; do not replay an already delivered click.")
     source = source.replace("// Set the files for this chooser using absolute paths visible to the browser.", "// Choose explicit absolute local regular files in the native Safari panel after original upload approval. Multiple files must share a directory; no file bytes are read by the bridge.")
+    return source
+
+
+NATIVE_DIALOG_DOCUMENTATION = """# Safari Tab Capability: nativeDialogs
+Safari suspends extension execution while a native JavaScript dialog is open.
+Before clicking a control known to open one, use this single-operation capability
+instead of click-then-getJsDialog. Never repeat a click that already opened one;
+an unarmed blocking dialog must be dismissed manually before work can resume.
+
+`await (await tab.capabilities.get('nativeDialogs')).run({selector, type,
+message, accept, promptText?, timeout_ms?})`
+
+Specify the exact expected `type` (`alert`, `confirm`, or `prompt`) and full
+`message`, plus an explicit `accept` boolean. Alerts require `accept: true`.
+Only accepting a prompt permits `promptText`. The original selector engine
+resolves one actionable element, then a single native click and the registered
+response execute in the same owner/account/profile/session/turn/document scope.
+The native app checks the actual Safari window, page origin, type and exact
+message before responding. A mismatch leaves the modal open without guessing;
+manual dismissal may be needed before Safari can deliver that error to chat.
+The response is consumed once and expires after `timeout_ms` (default 10000,
+maximum 10000). Manual focus changes abort; input is never replayed.
+
+The result reports the actual `kind`, `type`, `message`, `accepted`,
+`promptTextApplied`, `responseVerified` and `done`. Read the page afterwards to
+verify its application result. Cross-origin iframe modals are unsupported.
+`getJsDialog()` retains its existing inspect/respond contract; it cannot make a
+new extension request run while Safari itself has suspended the extension.
+"""
+
+NATIVE_UPLOAD_DOCUMENTATION = """# Safari Tab Capability: nativeUploads
+Safari can suspend extension callbacks while its native file chooser is open.
+Use `await (await tab.capabilities.get('nativeUploads')).run({selector, files,
+timeout_ms?})` to approve explicit local files BEFORE the opening click.
+
+`selector` must identify exactly one visible enabled `input[type=file]` in the
+top-level or same-origin document. Hidden inputs and JavaScript-only buttons
+are unsupported. `files` contains explicit absolute regular local file paths;
+multiple files require the actual input's multiple attribute and one directory.
+The original upload approval runs before the native click. The exact source
+document/input and local file identities are rechecked after approval. No file
+contents, cookies or credentials pass through the browser bridge.
+
+The native app clicks once, verifies the exact source Safari window and its
+actual native panel, chooses the approved files, and verifies the panel closed
+before replying. The response expires after `timeout_ms` (default/maximum 10000).
+The result contains `kind: 'upload'`, `fileCount`, `responseVerified` and `done`.
+Read the page to verify its upload result. A mismatch or manual focus change
+leaves the panel untouched and reports uncertainty; never replay that click.
+The ordinary `waitForEvent('filechooser')` contract remains available, but cannot
+resume extension JavaScript while Safari's native modal blocks its event loop.
+"""
+
+
+def native_modal_sdk(base: str, click: str, define: str) -> str:
+    """Use the original locator-click transport and original security gate."""
+    return f'''class SafariNativeDialogsCapability extends {base}{{
+constructor({{browserId,documentation,info,tabId,transport}}){{super(transport,browserId,tabId,documentation,info)}}
+async run(options){{
+if(!options||typeof options!=="object"||Object.keys(options).some(key=>!["selector","type","message","accept","promptText","timeout_ms"].includes(key)))throw new Error("Specify an exact native dialog selector, type, message, and explicit response");
+const policy={{kind:"dialog",type:options.type,message:options.message,accept:options.accept,timeout_ms:options.timeout_ms??10000,...options.promptText===undefined?{{}}:{{promptText:options.promptText}}}};
+return this.transport.send({{command:{click}({{browser_id:this.browserId,tab_id:this.tabId,selector:options.selector,safari_native_modal:policy}})}})
+}}
+}}
+class SafariNativeUploadsCapability extends {base}{{
+constructor({{browserId,documentation,info,tabId,transport}}){{super(transport,browserId,tabId,documentation,info)}}
+async run(options){{
+if(!options||typeof options!=="object"||Object.keys(options).some(key=>!["selector","files","timeout_ms"].includes(key)))throw new Error("Specify one visible file-input selector and explicit local files");
+return this.transport.send({{command:{click}({{browser_id:this.browserId,tab_id:this.tabId,selector:options.selector,safari_native_modal:{{kind:"upload",files:options.files,timeout_ms:options.timeout_ms??10000}}}})}})
+}}
+}}
+var SafariNativeDialogsDefinition={define}({{capability:SafariNativeDialogsCapability,info:{{id:"nativeDialogs",description:"Respond to one exact expected native JavaScript dialog within its opening click, before Safari suspends extension callbacks."}}}}),
+SafariNativeUploadsDefinition={define}({{capability:SafariNativeUploadsCapability,info:{{id:"nativeUploads",description:"Approve explicit local files before clicking one visible file input, then complete its actual native Safari chooser atomically."}}}});
+'''
+
+
+def prepare_native_modal_host(source: str) -> str:
+    if "class SafariNativeDialogsCapability" not in source:
+        source = replace_once(source, '),NL=I({}),UT="playwright_locator_click"',
+                              ').extend({safari_native_modal:Lt().optional(),safari_upload_source:Lt().optional()}),NL=I({}),UT="playwright_locator_click"')
+        source = replace_once(source, 'var Dp=ni({capability:Nk,info:Mk}),Rp=[dk,nk,Qo,Ok,Dp]',
+                              native_modal_sdk("ri", "qT", "ni") + 'var Dp=ni({capability:Nk,info:Mk}),Rp=[dk,nk,Qo,Ok,Dp,SafariNativeDialogsDefinition,SafariNativeUploadsDefinition]')
+    for name, document in [("nativeDialogs", NATIVE_DIALOG_DOCUMENTATION), ("nativeUploads", NATIVE_UPLOAD_DOCUMENTATION)]:
+        key = f'"capabilities/tab/{name}":'
+        if key not in source:
+            source = replace_once(source, '"capabilities/tab/pageAssets":', key + json.dumps(document) + ',"capabilities/tab/pageAssets":')
+            source = replace_once(source, '{mode:"model",name:"capabilities/tab/pageAssets"}',
+                                  f'{{mode:"model",name:"capabilities/tab/{name}"}},{{mode:"model",name:"capabilities/tab/pageAssets"}}')
+    source = source.replace("// Get the active JavaScript dialog for this tab, if one is currently open.",
+                            "// Inspect an existing dialog. Safari suspends extension callbacks while native modals are open; for a known opening control use nativeDialogs.run before the click, not a click-then-inspect round trip.")
+    return source
+
+
+def prepare_kernel_worker(source: str) -> str:
+    if "class SafariNativeDialogsCapability" in source:
+        return source
+    source = replace_once(source, '}), $u = n({}), Ys = "playwright_locator_click";',
+                          '}).extend({safari_native_modal:Z().optional(),safari_upload_source:Z().optional()}), $u = n({}), Ys = "playwright_locator_click";')
+    source = replace_once(source, '\tconst jo = de({', native_modal_sdk("ce", "Xs", "de") + '\tconst jo = de({')
+    source = replace_once(source, '\t\tDo,\n\t\tjo\n', '\t\tDo,\n\t\tSafariNativeDialogsDefinition,\n\t\tSafariNativeUploadsDefinition,\n\t\tjo\n')
     return source
 
 
@@ -284,7 +388,8 @@ def prepare_background(source: str) -> str:
                           'apiSupportOverrides:' + json.dumps(API_SUPPORT_OVERRIDES, separators=(",", ":")))
     source = replace_once(source, 'browser:[Go.info,...await this.browserManagementEnabled?[Mo.info]:[]]',
                           'browser:[{...Go.info,description:"Set exact measured CSS dimensions by resizing the real ordinary Safari window. Native focus, screen and minimum-size limits apply. Read Safari-specific documentation and reset before finishing."},...await this.browserManagementEnabled?[{...Mo.info,description:"Organize ordinary Safari tabs and native named tab groups. Read Safari-specific documentation first."}]:[]]')
-    source = replace_once(source, 'tab:[y_,...await this.webMcpConfig?.enabled()?[Ao]:[]]', 'tab:[y_]')
+    source = replace_once(source, 'tab:[y_,...await this.webMcpConfig?.enabled()?[Ao]:[]]',
+                          'tab:[y_,{id:"nativeDialogs",description:"Respond to one exact expected native JavaScript dialog within its opening click. Read documentation first."},{id:"nativeUploads",description:"Approve explicit files before clicking a visible file input, then complete its actual native Safari chooser. Read documentation first."}]')
     source = replace_once(source, ',await n.endTurn(r)}async getInfo(e)',
                           ';try{await n.endTurn(r)}finally{await globalThis.ChatGPTSafariAgent.release(t,r)}}async getInfo(e)')
     return bridge_source() + "\n" + source
@@ -309,6 +414,11 @@ def prepare_kernel_host(source: str) -> str:
     source = prepare_file_chooser_documentation(source)
     source = prepare_content_export_documentation(source)
     source = prepare_assets_documentation(source)
+    source = prepare_native_modal_host(source)
+    source = source.replace("// Read clipboard items, including text and binary payloads.",
+                            "// Read this original session clipboard only; no OS clipboard read occurs. Supported native page copy/cut results retain their text/HTML/PNG/TIFF/JPEG/PDF/RTF MIME entries.")
+    source = source.replace("// Write clipboard items.",
+                            "// Store session MIME items only. Rich Cmd+V uses a short-lived native clipboard bridge, preserves prior user clipboard data in memory, and restores it only after its exact trusted page-event receipt unless a newer user copy supersedes it. Missing delivery receipt leaves safe temporary data and memory-only recovery pending; do not replay input or restart the app while pending. Supported native paste: plain/HTML/RTF text, PNG/TIFF/JPEG/PDF binary, 8 MiB. Unknown/file-URL types fail explicitly; no synthetic paste or silent plaintext downgrade.")
     source = source.replace("Read console log messages captured for this tab.",
                             "Read this turn's console capture (up to 500 messages, starting at first claim or navigation, for at most five minutes). Earlier browser logs are unavailable.")
     return BRIDGE_BEGIN + bridge_source() + "\n" + BRIDGE_END + source
@@ -327,7 +437,7 @@ def prepare_offscreen(source: str) -> str:
 
 def prepare_resources(resources: Path = RESOURCES) -> None:
     """Update host resources without requiring a duplicate upstream bundle."""
-    for name, transform in ((KERNEL_HOST, prepare_kernel_host), (KERNEL_OFFSCREEN, prepare_offscreen)):
+    for name, transform in ((KERNEL_HOST, prepare_kernel_host), (KERNEL_OFFSCREEN, prepare_offscreen), (KERNEL_WORKER, prepare_kernel_worker)):
         target = resources / name
         target.write_text(transform(target.read_text()))
     prepare_playwright_helper(resources)

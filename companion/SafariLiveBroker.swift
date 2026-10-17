@@ -21,6 +21,8 @@ final class SafariLiveBroker {
         var delivered = false
         var fileChooserTarget: [String: Any]?
         var inputTarget: [String: Any]?
+        var modalInputDelivered = false
+        var clipboardInputDelivered = false
     }
     private let input: ([String: Any], @escaping Reply) -> Void
     private let guardedInput: (([String: Any], @escaping () -> Bool, @escaping Reply) -> Void)?
@@ -32,6 +34,9 @@ final class SafariLiveBroker {
     private let viewport: ([String: Any], @escaping () -> Bool, @escaping Reply) -> Void
     private let cancelViewport: (String?) -> Void
     private let viewportStatus: (@escaping Reply) -> Void
+    private let clipboardReceipt: ([String: Any]) -> Void
+    private struct ClipboardReceipt { let id: String; let profile: String; let session: String; let scope: [String: String]; let expires: Date }
+    private var clipboardReceipts: [String: ClipboardReceipt] = [:]
     private var profiles: [String: Profile] = [:]
     private var operation: Operation?
     private var busy = false
@@ -58,6 +63,7 @@ final class SafariLiveBroker {
              reply(SafariLiveBroker.failure("VIEWPORT_UNAVAILABLE", "Native Safari viewport sizing is unavailable."))
           }, cancelViewport: @escaping (String?) -> Void = { _ in },
           viewportStatus: @escaping (@escaping Reply) -> Void = { reply in reply(["leaseActive": false, "restoration": "not-needed"]) },
+         clipboardReceipt: @escaping ([String: Any]) -> Void = { _ in },
          input: @escaping ([String: Any], @escaping Reply) -> Void) {
         self.input = input
         self.guardedInput = guardedInput
@@ -69,6 +75,7 @@ final class SafariLiveBroker {
         self.viewport = viewport
         self.cancelViewport = cancelViewport
         self.viewportStatus = viewportStatus
+        self.clipboardReceipt = clipboardReceipt
     }
 
     func handle(_ command: [String: Any], reply: @escaping Reply) {
@@ -76,6 +83,17 @@ final class SafariLiveBroker {
         switch command["action"] as? String {
         case "livePoll": poll(command, reply: reply)
         case "liveResolve": resolve(command, reply: reply)
+        case "liveClipboardReceipt":
+            guard let input = command["input"] as? [String: Any], let token = input["token"] as? String,
+                  let entry = clipboardReceipts[token], entry.expires > Date(), entry.id == command["id"] as? String,
+                  entry.profile == command["profileId"] as? String, entry.session == command["sessionId"] as? String,
+                  entry.scope == input["scope"] as? [String: String] else {
+                reply(Self.failure("STALE_CLIPBOARD_RECEIPT", "This clipboard observation has no matching delivered native shortcut.")); return
+            }
+            // A terminal observation can finish clipboard restoration after an
+            // owner/turn ends. It grants no input or page-read authority.
+            clipboardReceipts.removeValue(forKey: token)
+            clipboardReceipt(input); reply(["ok": true])
         case "liveViewport":
             guard let current = operation, current.delivered,
                   current.id == command["id"] as? String,
@@ -137,6 +155,72 @@ final class SafariLiveBroker {
                     : current.command["action"] as? String == "interact"),
                   (native["allowJavaScriptDialog"] as? Bool != true || current.command["action"] as? String == "dialog") else {
                 reply(Self.failure("STALE_OPERATION", "The live Safari input no longer belongs to an active command.")); return
+            }
+            let arguments = current.command["arguments"] as? [String: Any] ?? [:]
+            let clipboardInteractions = (arguments["interactions"] as? [[String: Any]] ?? []).filter { $0["type"] as? String == "clipboard" }
+            if native["clipboardPlan"] != nil || !clipboardInteractions.isEmpty {
+                guard current.command["action"] as? String == "interact", let owner = current.agentOwner,
+                      let agent = arguments["agentScope"] as? [String: String], agent["ownerId"] == owner,
+                      arguments["nativeModal"] == nil, clipboardInteractions.count == 1,
+                      (arguments["interactions"] as? [Any])?.count == 1 else {
+                    reply(Self.failure("INVALID_NATIVE_CLIPBOARD", "A transient clipboard shortcut requires one original agent interaction and its signed-in owner.")); return
+                }
+                if native["action"] as? String == "focus" {
+                    guard native["clipboardPlan"] == nil else { reply(Self.failure("INVALID_NATIVE_CLIPBOARD", "Clipboard contents cannot attach to focus.")); return }
+                } else {
+                    let expected = clipboardInteractions[0]
+                    guard !current.clipboardInputDelivered, native["action"] as? String == "key",
+                          let plan = native["clipboardPlan"] as? [String: Any], let scope = plan["scope"] as? [String: String], scope.count == 8,
+                          let receiptToken = plan["receiptToken"] as? String, UUID(uuidString: receiptToken) != nil,
+                          scope["profileId"] == current.profile, scope["ownerId"] == owner,
+                          ["accountScope", "sessionId", "turnId"].allSatisfy({ scope[$0] != nil && scope[$0] == agent[$0] }),
+                          scope["documentId"] == arguments["documentId"] as? String, scope["node"] == expected["node"] as? String,
+                          arguments["handle"] as? String == "live:\(current.profile):\(scope["tabId"] ?? "")",
+                          arguments["expectedUrl"] as? String == native["expectedUrl"] as? String,
+                          let operation = plan["operation"] as? String, operation == expected["operation"] as? String,
+                          native["key"] as? String == ["copy": "Meta+c", "cut": "Meta+x", "paste": "Meta+v"][operation] else {
+                        reply(Self.failure("INVALID_NATIVE_CLIPBOARD", "A native clipboard shortcut may be delivered once only for its exact authorized account, turn, document and focused node.")); return
+                    }
+                    if operation == "paste" {
+                        guard let items = expected["items"] as? NSArray, let supplied = plan["items"] as? NSArray, items.isEqual(supplied) else {
+                            reply(Self.failure("INVALID_NATIVE_CLIPBOARD", "Native paste bytes differ from the explicit session clipboard items.")); return
+                        }
+                    } else if plan["items"] != nil { reply(Self.failure("INVALID_NATIVE_CLIPBOARD", "Native copy/cut cannot import supplied clipboard contents.")); return }
+                    self.operation?.clipboardInputDelivered = true
+                    clipboardReceipts = clipboardReceipts.filter { $0.value.expires > Date() }
+                    clipboardReceipts[receiptToken] = ClipboardReceipt(id: current.id, profile: current.profile, session: current.session,
+                        scope: scope, expires: Date().addingTimeInterval(120))
+                }
+            }
+            if arguments["nativeModal"] != nil || native["modalPlan"] != nil {
+                guard current.command["action"] as? String == "interact", let owner = current.agentOwner,
+                      let policy = arguments["nativeModal"] as? NSDictionary,
+                      let agent = arguments["agentScope"] as? [String: String], agent["ownerId"] == owner else {
+                    reply(Self.failure("INVALID_NATIVE_MODAL", "Preregistered modal responses require the exact original agent command and signed-in owner.")); return
+                }
+                if native["action"] as? String == "focus" {
+                    guard native["modalPlan"] == nil else { reply(Self.failure("INVALID_NATIVE_MODAL", "A modal response cannot attach to focus.")); return }
+                } else {
+                    guard !current.modalInputDelivered, native["action"] as? String == "click",
+                          let plan = native["modalPlan"] as? [String: Any], let supplied = plan["policy"] as? NSDictionary, policy.isEqual(supplied),
+                          let scope = plan["scope"] as? [String: String], scope.count == 8,
+                          scope["profileId"] == current.profile, scope["ownerId"] == owner,
+                          ["accountScope", "sessionId", "turnId"].allSatisfy({ scope[$0] != nil && scope[$0] == agent[$0] }),
+                          scope["documentId"] == arguments["documentId"] as? String,
+                          arguments["handle"] as? String == "live:\(current.profile):\(scope["tabId"] ?? "")",
+                          native["expectedUrl"] as? String == arguments["expectedUrl"] as? String,
+                          let interactions = arguments["interactions"] as? [[String: Any]], interactions.count == 1,
+                          interactions[0]["type"] as? String == "click", interactions[0]["node"] as? String == scope["node"] else {
+                        reply(Self.failure("INVALID_NATIVE_MODAL", "A modal response may be consumed once only by its exact authorized source click, account, turn, document and node.")); return
+                    }
+                    if policy["kind"] as? String == "upload" {
+                        guard let source = arguments["uploadSource"] as? [String: Any], source["node"] as? String == scope["node"],
+                              let observed = source["isMultiple"] as? Bool, plan["isMultiple"] as? Bool == observed else {
+                            reply(Self.failure("UPLOAD_SOURCE_CHANGED", "The native upload no longer matches the original approved file input.")); return
+                        }
+                    }
+                    operation?.modalInputDelivered = true
+                }
             }
             dispatchInput(native, current: current, reply: reply)
         case "liveModal":
@@ -281,6 +365,14 @@ final class SafariLiveBroker {
                     "eventsPosted": value["eventsPosted"] as? Int ?? 0,
                     "dialogOpen": value["dialogOpen"] as? Bool ?? false,
                     "fileChooserOpen": value["fileChooserOpen"] as? Bool ?? false]
+                if let clipboard = value["nativeClipboard"] as? [String: Any] {
+                    // Diagnostics retain only fixed metadata, never MIME data.
+                    self?.lastInputObservation?["clipboard"] = [
+                        "operation": ["copy", "cut", "paste"].contains(clipboard["operation"] as? String ?? "") ? clipboard["operation"]! : "unknown",
+                        "trustedPageReceipt": clipboard["trustedPageReceipt"] as? Bool ?? false,
+                        "nativeDataRead": clipboard["nativeDataRead"] as? Bool ?? false,
+                        "restoration": ["restored", "unchanged", "newer-change-preserved"].contains(clipboard["clipboardRestoration"] as? String ?? "") ? clipboard["clipboardRestoration"]! : "unconfirmed"]
+                }
                 self?.inputObservedAt = Date()
             }
             if result["ok"] as? Bool == true,

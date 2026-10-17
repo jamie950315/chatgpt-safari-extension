@@ -38,6 +38,9 @@ function fixture() {
   const companion = { async runAgentCommand(command) {
     native.push(command);
     const { operation, groupTitle, newTitle, handle } = command.arguments;
+    if (operation === "inspectWindowSource") return { action: operation, mutationApplied: false, actionsPerformed: 0,
+      currentGroupTitle: null, currentGroupSharingState: "unshared", windowIdentifier: "native-window",
+      sourceCollection: { kind: "ungrouped", sharingState: "unshared", nativeWindowIdentifier: "native-window" } };
     if (operation === "createGroup" || operation === "moveToGroup") { groups.add(groupTitle); selected = groupTitle; }
     if (operation === "renameGroup") { groups.delete(groupTitle); groups.add(newTitle); }
     if (operation === "moveToUngrouped") selected = null;
@@ -195,7 +198,8 @@ test("window creation moves only its exact claimed unpinned nonowner tab", async
   const { value } = await f.call("windows", "create", { tabId: 10, focused: false });
   assert.deepEqual(f.creations, [{ tabId: 10, focused: false, type: "normal" }]);
   assert.equal(value.focused, false);
-  assert.deepEqual(f.native.map(command => command.arguments.operation), ["inspect"]);
+  assert.deepEqual(f.native.map(command => command.arguments.operation), ["inspectWindowSource"],
+    "an ungrouped source must not open the native group-inventory menu");
   assert.equal(f.tabs[0].id, before[0].id);
   assert.equal(f.tabs[0].url, before[0].url);
   assert.equal(f.tabs[0].windowId, value.id);
@@ -232,6 +236,25 @@ test("window creation rejects unsafe arguments, claims, owners, pinning and unve
   await assert.rejects(f.call("windows", "create", { tabId: 10 }), /unshared/);
   assert.equal(f.creations.length, 0);
   assert.equal((await f.audit()).changes.length, 0);
+});
+test("window transfer requires an exact ungrouped native source proof without group inventory", async () => {
+  for (const alter of [
+    result => ({ ...result, sourceCollection: undefined }),
+    result => ({ ...result, currentGroupSharingState: "unknown" }),
+    result => ({ ...result, windowIdentifier: "" }),
+    result => ({ ...result, sourceCollection: { ...result.sourceCollection, nativeWindowIdentifier: "another-window" } }),
+    result => ({ ...result, sourceCollection: { ...result.sourceCollection, sharingState: "unknown" } }),
+    result => ({ ...result, sourceCollection: { ...result.sourceCollection, kind: "named-tab-group" } }),
+  ]) {
+    const f = fixture(), run = f.companion.runAgentCommand;
+    f.companion.runAgentCommand = async command => {
+      assert.equal(command.arguments.operation, "inspectWindowSource");
+      return alter(await run(command));
+    };
+    await assert.rejects(f.call("windows", "create", { tabId: 10 }), /unshared/);
+    assert.equal(f.creations.length, 0);
+    assert.equal((await f.audit()).changes.length, 0);
+  }
 });
 test("window creation cannot invent success when the Safari API is missing or rejects", async () => {
   const unavailable = fixture();

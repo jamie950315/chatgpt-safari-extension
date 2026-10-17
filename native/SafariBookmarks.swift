@@ -32,6 +32,44 @@ final class SafariBookmarks {
         let expected: [Record]
         let replacements: [Identity: Identity]
     }
+    enum EditorReadiness { case waiting, ready, changed }
+
+    /// Proves native editor chrome without walking the bookmark inventory on
+    /// every guard. Inventory rows are read separately through AXRows; a web
+    /// document remains an explicit disqualifying surface, never its contents.
+    static func editorSurfaceNodes<Element>(_ root: Element, children: (Element) -> [Element],
+                                            role: (Element) -> String?, identifier: (Element) -> String?,
+                                            equal: (Element, Element) -> Bool,
+                                            limit: Int = 2048, maximumDepth: Int = 24) -> [Element]? {
+        guard limit > 0, maximumDepth >= 0 else { return nil }
+        var pending = [(root, 0)], result: [Element] = [], index = 0
+        while index < pending.count {
+            let (node, depth) = pending[index]; index += 1
+            result.append(node)
+            let kind = role(node)
+            if kind == "AXWebArea" || kind == kAXOutlineRole && identifier(node) == "Bookmarks" { continue }
+            let descendants = children(node)
+            if depth >= maximumDepth && !descendants.isEmpty { return nil }
+            for child in descendants where !pending.contains(where: { equal($0.0, child) }) {
+                guard pending.count < limit else { return nil }
+                pending.append((child, depth + 1))
+            }
+        }
+        return result
+    }
+
+    static func editorReadiness(address: String?, utilityURL: String, nativeOutlineCount: Int,
+                                nativeTitleMatchesOutline: Bool, hasWebArea: Bool) -> EditorReadiness {
+        let source = address == utilityURL || address == String(utilityURL.dropFirst("http://".count))
+        // Safari's native editor retains the previous page in its address
+        // field. Its actual native surface, not an assumed address navigation,
+        // proves that the one-shot Edit Bookmarks command has completed.
+        if (source || address == "bookmarks://"), nativeOutlineCount == 1, nativeTitleMatchesOutline, !hasWebArea { return .ready }
+        if address == "bookmarks://" { return .waiting }
+        if address == nil || address == "" || address == utilityURL
+            || address == String(utilityURL.dropFirst("http://".count)) { return .waiting }
+        return .changed
+    }
     private struct Lease { let profile: String; var identity: Identity }
     private var leases: [String: Lease] = [:]
     private var roots: [String: String] = [:]
@@ -518,18 +556,27 @@ final class SafariBookmarks {
         init(window: AXUIElement, authorized: @escaping () -> Bool, buttonAuthorized: ((CGMouseButton) -> Bool)? = nil) throws {
             self.window = window; self.authorized = authorized
             self.buttonAuthorized = buttonAuthorized
-            guard authorized(), let outline = Self.nodes(window).first(where: { Self.string($0, kAXIdentifierAttribute) == "Bookmarks" && Self.string($0, kAXRoleAttribute) == kAXOutlineRole }) else {
+            guard authorized(), let surface = Self.surface(window) else {
                 throw Failure(code: "BOOKMARK_EDITOR_UNAVAILABLE", message: "The guarded native Safari bookmarks editor is unavailable.")
             }
-            self.outline = outline
-            let search = Self.nodes(window).filter { Self.string($0, kAXIdentifierAttribute) == "BookmarksSearchField" }
+            let outlines = surface.filter { Self.string($0, kAXIdentifierAttribute) == "Bookmarks" && Self.string($0, kAXRoleAttribute) == kAXOutlineRole }
+            guard outlines.count == 1 else { throw Failure(code: "BOOKMARK_EDITOR_UNAVAILABLE", message: "Safari did not expose one exact native bookmark outline.") }
+            self.outline = outlines[0]
+            let search = surface.filter { Self.string($0, kAXIdentifierAttribute) == "BookmarksSearchField" }
             guard search.count == 1, Self.string(search[0], kAXValueAttribute) == "" else {
                 throw Failure(code: "BOOKMARK_SEARCH_ACTIVE", message: "Safari's native bookmark editor has an active or unverifiable search filter. Clear that editor's search before using complete bookmark operations.")
             }
         }
         func check() throws {
-            guard authorized(), Self.nodes(window).contains(where: { CFEqual($0, outline) }) else {
-                throw Failure(code: "FOCUS_CHANGED", message: "The guarded Safari bookmarks editor changed. Do not repeat a delivered update.", mutationApplied: mutated)
+            let ownerCurrent = authorized()
+            let surface = Self.surface(window)
+            let outlineCurrent = surface?.contains(where: {
+                CFEqual($0, outline) && Self.string($0, kAXRoleAttribute) == kAXOutlineRole && Self.string($0, kAXIdentifierAttribute) == "Bookmarks"
+            }) == true
+            let searches = surface?.filter { Self.string($0, kAXIdentifierAttribute) == "BookmarksSearchField" } ?? []
+            let searchEmpty = searches.count == 1 && Self.string(searches[0], kAXValueAttribute) == ""
+            guard ownerCurrent, outlineCurrent, searchEmpty else {
+                throw Failure(code: "FOCUS_CHANGED", message: "The guarded Safari bookmarks editor changed. Do not repeat a delivered update. Native editor check: authorized=\(ownerCurrent), surfaceComplete=\(surface != nil), outlineCurrent=\(outlineCurrent), searchEmpty=\(searchEmpty).", mutationApplied: mutated)
             }
         }
         func rows() throws -> [AXUIElement] {
@@ -856,6 +903,12 @@ final class SafariBookmarks {
                 if let children = attribute(node, kAXChildrenAttribute) as? [AXUIElement] { pending.append(contentsOf: children.reversed()) }
             }
             return result
+        }
+        static func surface(_ window: AXUIElement) -> [AXUIElement]? {
+            SafariBookmarks.editorSurfaceNodes(window, children: {
+                (attribute($0, kAXChildrenAttribute) as? [AXUIElement] ?? [])
+                    + (attribute($0, "AXSheets") as? [AXUIElement] ?? [])
+            }, role: { string($0, kAXRoleAttribute) }, identifier: { string($0, kAXIdentifierAttribute) }, equal: { CFEqual($0, $1) })
         }
     }
 }

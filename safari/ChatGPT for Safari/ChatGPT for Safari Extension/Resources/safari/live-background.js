@@ -241,6 +241,17 @@
       }
       if (matches.length !== 1) return reject("STRICT_LOCATOR", `The locator resolved to ${matches.length} elements; use an unambiguous locator.`);
       let element = matches[0];
+      if (kind === "safari_native_upload_inspect") {
+        if (!element.matches("input[type=file]") || !visible(element) || element.disabled) return reject("INVALID_UPLOAD_SOURCE", "Native upload requires one visible enabled file input; hidden or JavaScript-only upload controls are unsupported.");
+        const source = command.safari_upload_source;
+        if (source && (source.url !== location.href || source.documentId !== state.documentId || source.snapshotId !== state.snapshotId
+          || state.nodes.get(source.node) !== element || source.isMultiple !== element.multiple)) {
+          return reject("UPLOAD_SOURCE_CHANGED", "The exact approved file input/document changed during upload consent. No opening click was delivered.");
+        }
+        if (!state.snapshotId || state.url !== location.href) { state.nodes.clear(); state.snapshotId = newId(); state.url = location.href; }
+        const node = source?.node || "q" + newId(); state.nodes.set(node, element);
+        return { ok: true, result: { node, documentId: state.documentId, snapshotId: state.snapshotId, url: location.href, isMultiple: element.multiple } };
+      }
       if (kind === "safari_locator_focus") {
         const target = injected.retarget(element, "follow-label");
         if (!target || typeof target.focus !== "function") return reject("NOT_FOCUSABLE", "The locator does not identify a focusable element.");
@@ -283,7 +294,39 @@
         if (element.matches("input:not([type=password]),textarea,select")) item.value = element.value.slice(0, 1000);
         nodes.push(item);
       }
-      const text = roots().map(root => root.body?.innerText ?? root.innerText ?? root.textContent ?? "").join("\n");
+      const rootText = root => {
+        if (root.nodeType === 9) {
+          // An unrendered iframe's innerText falls back to raw textContent.
+          // Keep visible same-origin frame text, not hidden document sources.
+          let frame = root.defaultView?.frameElement;
+          while (frame) {
+            if (!visible(frame)) return "";
+            frame = frame.ownerDocument?.defaultView?.frameElement;
+          }
+          return root.body?.innerText || "";
+        }
+        // ShadowRoot has no innerText. Its textContent includes extension CSS
+        // (for example DarkReader), script sources and hidden template text.
+        // Filter just that fallback, without changing the document extractor.
+        const doc = root.ownerDocument, walker = doc.createTreeWalker(root, 4), parts = [];
+        let node;
+        while ((node = walker.nextNode())) {
+          let parent = node.parentElement || root.host, readable = true;
+          const textParent = parent;
+          while (parent) {
+            if (["SCRIPT", "STYLE", "TEMPLATE", "NOSCRIPT"].includes(parent.tagName)) { readable = false; break; }
+            const style = parent.ownerDocument.defaultView.getComputedStyle(parent);
+            if (style.display === "none" || Number(style.opacity) === 0 || parent === textParent && ["hidden", "collapse"].includes(style.visibility)) { readable = false; break; }
+            parent = parent.parentElement || parent.getRootNode?.().host || parent.ownerDocument.defaultView.frameElement;
+          }
+          if (!readable || !node.textContent?.trim()) continue;
+          const range = doc.createRange(); range.selectNodeContents(node);
+          if (![...range.getClientRects()].some(rect => rect.width > 0 && rect.height > 0)) continue;
+          parts.push(node.textContent);
+        }
+        return parts.join("\n");
+      };
+      const text = roots().map(rootText).filter(Boolean).join("\n");
       return { ok: true, result: { url: location.href, title: document.title, documentId: state.documentId,
         snapshotId: state.snapshotId, text: text.slice(0, args.maxLength), truncated: text.length > args.maxLength, nodes,
         focusedNode: [...state.nodes].find(([, element]) => element === active())?.[0] || null,
@@ -294,6 +337,34 @@
       return reject("STALE_TARGET", "The page or snapshot changed. Read the page again before interacting.");
     }
     if (operation === "check") return { ok: true, result: { url: location.href } };
+    if (operation === "clipboard_arm") {
+      const source = state.nodes.get(args.node), runtime = globalThis.browser?.runtime || globalThis.chrome?.runtime;
+      if (!source?.isConnected || !runtime?.sendMessage || typeof args.token !== "string" || !["copy", "cut", "paste"].includes(args.clipboardOperation)) {
+        return reject("CLIPBOARD_RECEIPT_UNAVAILABLE", "The exact source-bound clipboard event observer is unavailable.");
+      }
+      const matches = event => {
+        if (!event.isTrusted || state.documentId !== args.documentId || state.snapshotId !== args.snapshotId || state.url !== location.href
+          || !source.isConnected || !event.composedPath().some(node => node === source || node?.nodeType && contains(source, node))) return false;
+        return true;
+      };
+      const finish = () => { clearTimeout(timer); document.removeEventListener(args.clipboardOperation, observed, true); };
+      const observed = event => {
+        if (!matches(event)) return;
+        finish();
+        const receipt = { type: "chatgpt-safari:clipboard-receipt", token: args.token, clipboardOperation: args.clipboardOperation,
+          documentId: state.documentId, snapshotId: state.snapshotId, url: location.href };
+        // A new task runs after the trusted event's dispatch/default action;
+        // capture-phase arrival alone is not native clipboard completion.
+        setTimeout(() => {
+          if (source.isConnected && state.documentId === receipt.documentId && location.href === receipt.url) runtime.sendMessage(receipt).catch(() => {});
+        }, 0);
+      };
+      // A late event can complete native cleanup after the command timed out;
+      // it grants no new input authority and never captures unrelated events.
+      const timer = setTimeout(finish, 120000);
+      document.addEventListener(args.clipboardOperation, observed, true);
+      return { ok: true, result: { armed: true } };
+    }
     if (operation === "filechooser_arm") {
       state.fileChooserObserver?.stop();
       const token = args.token, runtime = globalThis.browser?.runtime || globalThis.chrome?.runtime;
@@ -323,6 +394,9 @@
     }
     const element = args.node ? state.nodes.get(args.node) : document.documentElement;
     if (!element?.isConnected) return reject("STALE_TARGET", "This node is no longer in the page. Read the page again.");
+    if (operation === "upload_source") return element.matches("input[type=file]") && !element.disabled && visible(element)
+      ? { ok: true, result: { isMultiple: element.multiple } }
+      : reject("UPLOAD_SOURCE_CHANGED", "The approved native upload source is no longer a visible enabled file input.");
     if (operation === "focused") {
       // Native event posting is asynchronous. Observe delivery without posting
       // another click or changing focus ourselves.
@@ -389,8 +463,9 @@
   function createLive(api, environment = root) {
     let profileId, timer, stopped = false, polling = false;
     const sessionId = environment.crypto.randomUUID();
-    const frameResolutions = new Map(), fileInputObservations = new Map(), fileChoosers = new Map();
+    const frameResolutions = new Map(), fileInputObservations = new Map(), fileChoosers = new Map(), clipboardReceipts = new Map();
     const delay = ms => new Promise(resolve => environment.setTimeout(resolve, ms));
+    const unarmedDialogGuidance = "Safari may suspend extension callbacks while this unarmed native dialog is open. If delivery stalls, dismiss that existing dialog manually; do not repeat its opening click. For a new known dialog action, preregister the exact response with the nativeDialogs capability's run() before its single click.";
     const send = async command => {
       const nativeInput = ["liveInput", "liveModal", "liveDialog"].includes(command.action);
       let callbackTimer, response;
@@ -428,11 +503,42 @@
     };
     const describe = tab => ({ handle: `live:${profileId}:${tab.id}`, profileId, tabId: tab.id, windowId: tab.windowId,
       title: tab.title || "", url: tab.url || "", active: !!tab.active, status: tab.status });
+    async function navigationSourceUrl(tabId) {
+      if (!Number.isSafeInteger(tabId) || tabId <= 0) throw fail("INVALID_HANDLE", "A current native Safari tab ID is required.");
+      const tab = await api.tabs.get(tabId);
+      if (tab.incognito) throw fail("PRIVATE_TAB", "Private Safari tabs are not controlled by this backend.");
+      if (typeof tab.url === "string" && tab.url) return tab.url;
+      if (tab.url != null && tab.url !== "" || typeof api.webNavigation?.getAllFrames !== "function") {
+        throw fail("TAB_URL_UNAVAILABLE", "Safari did not expose a committed tab URL or a native top-frame identity. The source was not assumed to be blank.");
+      }
+      if (tab.pendingUrl != null && tab.pendingUrl !== "" && tab.pendingUrl !== "about:blank") {
+        throw fail("STALE_TARGET", "The tab has a different pending navigation. It was not treated as blank or navigated again.");
+      }
+      const frames = await api.webNavigation.getAllFrames({ tabId });
+      const top = Array.isArray(frames) ? frames.filter(frame => frame.frameId === 0) : [];
+      if (top.length !== 1 || top[0].parentFrameId !== -1 || top[0].url !== "about:blank" || top[0].errorOccurred === true) {
+        throw fail("TAB_URL_UNAVAILABLE", "Safari's native top frame did not prove an exact about:blank document. No missing URL was converted into a blank page.");
+      }
+      const current = await api.tabs.get(tabId);
+      if (current.id !== tabId || current.incognito || current.windowId !== tab.windowId
+        || current.url != null && current.url !== "" && current.url !== "about:blank"
+        || current.pendingUrl != null && current.pendingUrl !== "" && current.pendingUrl !== "about:blank") {
+        throw fail("STALE_TARGET", "The exact native tab changed after its blank-frame observation. No navigation or close was delivered.");
+      }
+      // Operation-local proof only: do not rewrite the browser Tab object,
+      // persist an alias, or permit blank DOM reads or arbitrary internal URLs.
+      return "about:blank";
+    }
     async function target(handle, expectedUrl, allowBlank = false) {
       const parts = String(handle).split(":");
       if (parts.length !== 3 || parts[0] !== "live" || parts[1] !== profileId || !/^\d+$/.test(parts[2])) throw fail("INVALID_HANDLE", "Use a handle from this profile's live_list_tabs result.");
-      const tab = await api.tabs.get(Number(parts[2]));
+      let tab = await api.tabs.get(Number(parts[2]));
       if (tab.incognito) throw fail("PRIVATE_TAB", "Private Safari tabs are not controlled by this backend.");
+      if (tab.url == null || tab.url === "") {
+        if (!allowBlank || expectedUrl !== "about:blank") throw fail("TAB_URL_UNAVAILABLE", "Safari has not exposed this tab's committed URL. Its website document was not read or acted on.");
+        tab = { ...tab, url: await navigationSourceUrl(tab.id) };
+      }
+      if (tab.url === "about:blank" && !allowBlank) throw fail("BLANK_DOCUMENT", "This is a valid newly created about:blank tab, not a website document. Navigate this same claimed tab to its intended HTTP/HTTPS URL before reading, locating, or interacting; do not create a replacement tab.");
       if (!(allowBlank && tab.url === "about:blank" && expectedUrl === "about:blank")) url(tab.url);
       if (expectedUrl !== undefined && tab.url !== expectedUrl) throw fail("STALE_TARGET", "The tab navigated. Read its current page before acting.");
       return tab;
@@ -442,6 +548,17 @@
       return unwrap(value?.result);
     }
     api.runtime.onMessage?.addListener((message, sender) => {
+      if (message?.type === "chatgpt-safari:clipboard-receipt") {
+        const pending = clipboardReceipts.get(message.token);
+        if (!pending || Date.now() > pending.expires || sender.tab?.id !== pending.tabId || sender.frameId !== pending.frameId
+          || sender.url !== pending.url || message.url !== pending.url || message.documentId !== pending.scope.documentId
+          || message.snapshotId !== pending.snapshotId || message.clipboardOperation !== pending.operation) return;
+        clipboardReceipts.delete(message.token);
+        api.runtime.sendNativeMessage("dev.jamie.chatgpt-safari", { operation: "companion", command: {
+          action: "liveClipboardReceipt", id: pending.id, profileId, sessionId,
+          input: { token: message.token, scope: pending.scope } } }).catch(() => {});
+        return;
+      }
       if (message?.type === "chatgpt-safari:file-input") {
         const pending = fileInputObservations.get(message.token);
         if (!pending || sender.tab?.id !== pending.tabId || sender.frameId !== pending.frameId || sender.url !== pending.url
@@ -601,7 +718,7 @@
         const created = await api.tabs.create({ url: url(args.url), active: true, ...(args.windowId === undefined ? {} : { windowId: args.windowId }) });
         return describe(await ready(created.id));
       }
-      const tab = await target(args.handle, ["navigate", "history", "select_tab", "close_tab"].includes(action) ? args.expectedUrl : undefined, action === "navigate");
+      const tab = await target(args.handle, ["navigate", "history", "select_tab", "close_tab"].includes(action) ? args.expectedUrl : undefined, ["navigate", "close_tab"].includes(action));
       if (action === "viewport") return environment.ChatGPTSafariViewport.run({ ...request, sessionId }, selection);
       if (action === "read_page") return read(tab, args.maxLength);
       if (action === "dom_query") {
@@ -699,7 +816,7 @@
         return action === "download_link_inspect" ? downloads.inspect(tab, args) : downloads.execute(request, tab, args);
       }
       if (action === "organize") {
-        if (typeof args.expectedUrl !== "string" || !["inspect", "createGroup", "moveToGroup", "moveToUngrouped", "renameGroup"].includes(args.operation)) throw fail("INVALID_ARGUMENT", "A native Safari organization operation and expectedUrl are required.");
+        if (typeof args.expectedUrl !== "string" || !["inspect", "inspectWindowSource", "createGroup", "moveToGroup", "moveToUngrouped", "renameGroup"].includes(args.operation)) throw fail("INVALID_ARGUMENT", "A native Safari organization operation and expectedUrl are required.");
         const selectedBounds = await focus(tab, selection);
         assertTime();
         unwrap(await send({ action: "liveInput", id: request.id, profileId, sessionId,
@@ -726,6 +843,10 @@
       if (action !== "interact") throw fail("UNKNOWN_ACTION", "Unknown live Safari action.");
       if (typeof args.documentId !== "string" || typeof args.snapshotId !== "string" ||
           !Array.isArray(args.interactions) || args.interactions.length < 1 || args.interactions.length > 20) throw fail("INVALID_ARGUMENT", "A fresh page snapshot and 1–20 interactions are required.");
+      if (args.nativeModal && (!request.agentOwner || args.agentScope?.ownerId !== request.agentOwner || !args.agentScope?.accountScope
+        || args.interactions.length !== 1 || args.interactions[0].type !== "click" || typeof args.interactions[0].node !== "string"
+        || args.interactions[0].button && args.interactions[0].button !== "left" || (args.interactions[0].clickCount ?? 1) !== 1
+        || args.interactions[0].modifiers?.length || args.frameId)) throw fail("INVALID_NATIVE_MODAL", "Native modal plans require a single original-owner/account-bound plain top-level click.");
       const frameId = args.frameId || 0;
       const framePath = args.framePath || [];
       if (!Number.isSafeInteger(frameId) || frameId < 0 || !Array.isArray(framePath) || framePath.length > 8
@@ -766,11 +887,15 @@
         for (const interaction of args.interactions) {
           selection?.assertCurrent();
           assertTime();
-          if (!["click", "type", "key", "scroll", "move", "drag", "select"].includes(interaction.type) ||
+          if (!["click", "type", "key", "scroll", "move", "drag", "select", "clipboard"].includes(interaction.type) ||
               (!["scroll", "move", "drag", "click"].includes(interaction.type) && typeof interaction.node !== "string") ||
               (interaction.type === "click" && typeof interaction.node !== "string" && !interaction.point)) throw fail("INVALID_ARGUMENT", "Each interaction requires a supported type and page node or viewport point.");
           if (interaction.type === "type" && (typeof interaction.value !== "string" || interaction.value.length > 12000)) throw fail("INVALID_ARGUMENT", "Type requires text of at most 12000 UTF-16 code units.");
           if (interaction.type === "key" && (typeof interaction.key !== "string" || interaction.key.length > 80)) throw fail("UNSUPPORTED_KEY", "Use a page key with optional Meta, Control, Alt, and Shift modifiers.");
+          if (interaction.type === "clipboard" && (!request.agentOwner || args.agentScope?.ownerId !== request.agentOwner || !args.agentScope.accountScope
+            || args.nativeModal || args.interactions.length !== 1 || !["copy", "cut", "paste"].includes(interaction.operation))) {
+            throw fail("INVALID_NATIVE_CLIPBOARD", "A transient clipboard operation requires one original-owner/account-bound focused-page shortcut.");
+          }
           const current = await observe(() => target(args.handle, tab.url));
           const window = await observe(() => api.windows.get(tab.windowId));
           if (!current.active || !window.focused) throw fail("FOCUS_CHANGED", "The selected Safari tab/window lost focus. No input was replayed.");
@@ -803,7 +928,7 @@
             }
             await scopedPage("pointCheck", { ...args, node: interaction.node, point: localGeometry.point });
             let token, observation;
-            if (["click", "key"].includes(kind) && request.agentOwner !== undefined) {
+            if (["click", "key"].includes(kind) && request.agentOwner !== undefined && !args.nativeModal && interaction.type !== "clipboard") {
               token = environment.crypto.randomUUID();
               observation = { tabId: tab.id, frameId, url: framePath.at(-1)?.childUrl || tab.url,
                 documentId: args.documentId, snapshotId: args.snapshotId };
@@ -814,8 +939,19 @@
             }
             let result;
             assertTime();
+            let modalPlan;
+            if (args.nativeModal) {
+              if (kind !== "click") throw fail("INVALID_NATIVE_MODAL", "A preregistered native modal cannot attach to another input type.");
+              if (args.nativeModal.kind === "upload") {
+                const source = await scopedPage("upload_source", { ...args, node: interaction.node });
+                if (args.uploadSource?.node !== interaction.node || source.isMultiple !== args.uploadSource?.isMultiple) throw fail("UPLOAD_SOURCE_CHANGED", "The approved source file input changed before the native click.");
+              }
+              modalPlan = { policy: args.nativeModal, scope: { profileId, tabId: String(tab.id), documentId: args.documentId, node: interaction.node,
+                ownerId: request.agentOwner, accountScope: args.agentScope.accountScope, sessionId: args.agentScope.sessionId, turnId: args.agentScope.turnId },
+                ...(args.nativeModal.kind === "upload" ? { isMultiple: args.uploadSource.isMultiple } : {}) };
+            }
             result = unwrap(await send({ action: "liveInput", id: request.id, profileId, sessionId,
-              input: { action: kind, ...geometry, windowBounds, ...extra } }));
+              input: { action: kind, ...geometry, windowBounds, ...extra, ...(modalPlan ? { modalPlan } : {}) } }));
             if (observation?.value && !observation.ambiguous) openedFileInput = observation.value;
             nativeSteps.push({ action: kind, node: interaction.node, ...result });
             if (result.eventsPosted > 0) { inputDelivered = true; lastDelivered = { type: kind, node: interaction.node, result, recorded: false }; }
@@ -839,7 +975,7 @@
             fileChoosers.set(result.fileChooser.id, { tabId: tab.id, url: tab.url, windowBounds, scope,
               ownerId: request.agentOwner, sessionId: scope.sessionId, turnId: scope.turnId, isMultiple: observedInput.isMultiple });
             return { completed, tab: describe(current), fileChooserOpen: true, fileChooser: { ...result.fileChooser, scope },
-              nextAction: "Use the registered original file chooser's setFiles after upload approval. No later input was delivered." };
+              nextAction: "Use the registered chooser's setFiles only while callback delivery remains available. If Safari suspends callbacks, manually dismiss this existing panel without replaying its click; use nativeUploads.run with explicit approved files for a new known upload action." };
           };
           activeFileChooserOpened = fileChooserOpened;
           if (interaction.type === "type" && interaction.requireFocused !== true) {
@@ -849,22 +985,35 @@
             }
             if (clicked.dialogOpen === true) {
               completed.push({ type: "click", node: interaction.node, result: clicked }); selection?.holdDialog?.();
-              return { completed, tab: describe(current), dialogOpen: true, nextAction: "Inspect the current JavaScript dialog before continuing. No text or later input was delivered." };
+              return { completed, tab: describe(current), dialogOpen: true, nextAction: unarmedDialogGuidance + " No text or later input was delivered." };
             }
             await scopedPage("focused", { ...args, node: interaction.node });
           }
           // A key must not implicitly click/activate a button or move a caret.
-          if (interaction.type === "key" || (interaction.type === "type" && interaction.requireFocused === true)) await scopedPage("focused", { ...args, node: interaction.node });
-          const result = await native(interaction.type, { text: interaction.value, replaceAll: interaction.replaceAll === true,
+          if (["key", "clipboard"].includes(interaction.type) || (interaction.type === "type" && interaction.requireFocused === true)) await scopedPage("focused", { ...args, node: interaction.node });
+          const clipboardPlan = interaction.type === "clipboard" ? { operation: interaction.operation,
+            ...(interaction.operation === "paste" ? { items: interaction.items } : {}),
+            receiptToken: environment.crypto.randomUUID(),
+            scope: { profileId, tabId: String(tab.id), documentId: args.documentId, node: interaction.node, ownerId: request.agentOwner,
+              accountScope: args.agentScope.accountScope, sessionId: args.agentScope.sessionId, turnId: args.agentScope.turnId } } : undefined;
+          if (clipboardPlan) {
+            for (const [token, pending] of clipboardReceipts) if (Date.now() > pending.expires) clipboardReceipts.delete(token);
+            if (clipboardReceipts.size >= 8) throw fail("CLIPBOARD_RECEIPT_BUSY", "Unresolved native clipboard receipts must finish before opening another transient bridge.");
+            clipboardReceipts.set(clipboardPlan.receiptToken, { id: request.id, tabId: tab.id, frameId, url: framePath.at(-1)?.childUrl || tab.url,
+              scope: clipboardPlan.scope, snapshotId: args.snapshotId, operation: interaction.operation, expires: Date.now() + 120000 });
+            await scopedPage("clipboard_arm", { ...args, node: interaction.node, token: clipboardPlan.receiptToken, clipboardOperation: interaction.operation });
+          }
+          const result = await native(clipboardPlan ? "key" : interaction.type, { text: interaction.value, replaceAll: interaction.replaceAll === true,
             key: interaction.key, deltaX: interaction.deltaX, deltaY: interaction.deltaY,
             clickCount: interaction.clickCount, button: interaction.button, modifiers: interaction.modifiers, path: interaction.path,
-            options: interaction.options, multiple: interaction.multiple });
+            options: interaction.options, multiple: interaction.multiple,
+            ...(clipboardPlan ? { clipboardPlan, key: { copy: "Meta+c", cut: "Meta+x", paste: "Meta+v" }[interaction.operation] } : {}) });
           completed.push({ type: interaction.type, node: interaction.node, result });
           if (lastDelivered?.result === result) lastDelivered.recorded = true;
           if (result.fileChooserOpen === true) return fileChooserOpened();
           if (result.dialogOpen === true) {
             selection?.holdDialog?.();
-            return { completed, tab: describe(current), dialogOpen: true, nextAction: "Inspect the current JavaScript dialog before continuing. Later input was not delivered." };
+            return { completed, tab: describe(current), dialogOpen: true, nextAction: unarmedDialogGuidance + " Later input was not delivered." };
           }
           await delay(80);
         }
@@ -886,7 +1035,7 @@
               if (modal.fileChooserOpen === true && activeFileChooserOpened) return await activeFileChooserOpened();
               selection?.holdDialog?.();
               return { completed, tab: describe(lastCurrent), dialogOpen: true,
-                nextAction: "Inspect the current JavaScript dialog before continuing. The delivered input and blocked page read were not repeated." };
+                nextAction: unarmedDialogGuidance + " The delivered input and blocked page read were not repeated." };
             }
           } catch (nativeError) {
             error.message += ` Native modal inspection failed: ${nativeError.message}`;
@@ -952,7 +1101,7 @@
     function releaseFileChoosers({ sessionId: originalSession, turnId }) {
       for (const [id, chooser] of fileChoosers) if (chooser.sessionId === originalSession && (turnId == null || chooser.turnId === turnId)) fileChoosers.delete(id);
     }
-    return { start, poll, execute, releaseLogs, releaseFileChoosers,
+    return { start, poll, execute, releaseLogs, releaseFileChoosers, navigationSourceUrl,
       stop() { stopped = true; environment.clearInterval(timer); fileChoosers.clear(); fileInputObservations.clear(); } };
   }
   if (typeof module === "object" && module.exports) module.exports = { createLive, pageOperation, consoleCapture };

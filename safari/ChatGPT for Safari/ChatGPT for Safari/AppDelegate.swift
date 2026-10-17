@@ -44,6 +44,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }, viewportStatus: { [weak self] reply in
         guard let self else { reply(["leaseActive": false, "restoration": "unconfirmed"]); return }
         self.viewport.status { result in DispatchQueue.main.async { reply(result) } }
+    }, clipboardReceipt: { [weak self] input in
+        self?.liveInput.acknowledgeClipboard(input)
     }) { [weak self] command, reply in
         guard let self else { reply(["ok": false, "error": ["code": "APP_CLOSED", "message": "The Safari companion was closed."]]); return }
         self.liveInput.handle(command) { result in DispatchQueue.main.async { reply(result) } }
@@ -107,7 +109,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 } else {
                     self.personalData.handle(request, nativeProfileUUID: nativeProfile, isAuthorized: authorized) { result in DispatchQueue.main.async { reply(result) } }
                 }
-            } else if ["live", "livePoll", "liveResolve", "liveInputAck", "liveInputCallbackTimeout", "liveInput", "liveDownload", "liveOrganize", "liveCapture", "liveDialog", "liveModal", "liveFileChooser", "liveViewport"].contains(command["action"] as? String ?? ""), let self {
+            } else if ["live", "livePoll", "liveResolve", "liveInputAck", "liveInputCallbackTimeout", "liveClipboardReceipt", "liveInput", "liveDownload", "liveOrganize", "liveCapture", "liveDialog", "liveModal", "liveFileChooser", "liveViewport"].contains(command["action"] as? String ?? ""), let self {
                 self.live.handle(command, reply: reply)
             } else if (command["action"] as? String)?.hasPrefix("embedded") == true {
                 EmbeddedSideChatController.shared.handle(command: command, reply: reply)

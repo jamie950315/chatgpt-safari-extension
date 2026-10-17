@@ -12,6 +12,30 @@ test("native focus delivery is observed without replaying the click", async () =
   assert.equal(response.ok, true);
   assert.equal(response.result.focused, true);
 });
+test("clipboard receipts require a trusted exact source event and wait for event completion without reading data", () => {
+  const listeners = new Map(), timers = new Map(), sent = []; let nextTimer = 0;
+  const source = { isConnected: true, contains() { return false; } }, other = { nodeType: 1 };
+  const document = { activeElement: source, addEventListener(type, listener) { listeners.set(type, listener); },
+    removeEventListener(type, listener) { if (listeners.get(type) === listener) listeners.delete(type); } };
+  const location = { href: "https://example.test/" };
+  const state = { documentId: "doc", snapshotId: "snap", url: location.href, nodes: new Map([["n1", source]]) };
+  const operation = require("node:vm").runInNewContext(`(${pageOperation.toString()})`, {
+    document, location, __chatGPTSafariLiveDocument: state,
+    setTimeout(callback, ms) { const id = ++nextTimer; timers.set(id, { callback, ms }); return id; }, clearTimeout(id) { timers.delete(id); },
+    browser: { runtime: { async sendMessage(message) { sent.push(message); } } } });
+  assert.equal(operation("clipboard_arm", { documentId: "doc", snapshotId: "snap", node: "n1", token: "opaque-once", clipboardOperation: "paste" }).result.armed, true);
+  const observe = listeners.get("paste"), event = (trusted, node) => ({ isTrusted: trusted, composedPath: () => [node],
+    get clipboardData() { throw new Error("Observer must never read clipboard contents"); } });
+  observe(event(false, source)); observe(event(true, other));
+  state.documentId = "other"; observe(event(true, source)); state.documentId = "doc";
+  assert.equal(sent.length, 0); assert.equal(listeners.get("paste"), observe);
+  observe(event(true, source));
+  assert.equal(sent.length, 0, "capture-phase arrival is not completion"); assert.equal(listeners.has("paste"), false);
+  assert.equal([...timers.values()].some(timer => timer.ms === 120000), false);
+  for (const timer of timers.values()) timer.callback();
+  assert.deepEqual(JSON.parse(JSON.stringify(sent)), [{ type: "chatgpt-safari:clipboard-receipt", token: "opaque-once", clipboardOperation: "paste",
+    documentId: "doc", snapshotId: "snap", url: location.href }]);
+});
 test("turn-scoped console capture preserves real page console methods, bounds messages, and cleans up without changing later site wrappers", () => {
   const vm = require("node:vm"), listeners = new Map(); let consoleCalls = 0;
   const original = () => { consoleCalls++; };
@@ -56,6 +80,39 @@ test("WebMCP detection reports only actual document provider methods without ins
     assert.equal(result.originOpaque, false); assert.equal(Object.keys(result).length, 3);
     assert.equal(document.modelContext, modelContext);
   }
+});
+test("live page text excludes shadow stylesheet/script/template sources while retaining visible shadow and iframe text", () => {
+  const location = { href: "https://example.test/" }, document = { nodeType: 9, title: "Owned fixture", body: { innerText: "Visible page body" } };
+  document.defaultView = { getComputedStyle: element => ({ display: "block", opacity: "1", visibility: "visible", ...element.style }) };
+  const element = (tagName, style = {}, doc = document) => ({ tagName, style, ownerDocument: doc, parentElement: null,
+    getRootNode() { return document; }, getBoundingClientRect() { return { width: 100, height: 20 }; } });
+  const host = element("SECTION"), shadow = { nodeType: 11, ownerDocument: document, host, querySelectorAll() { return []; } }; host.shadowRoot = shadow;
+  const parent = (tagName, style) => { const node = element(tagName, style); node.getRootNode = () => shadow; return node; };
+  shadow.textNodes = [
+    { textContent: "[data-darkreader-inline-bgcolor] { background: secret-style; }", parentElement: parent("STYLE") },
+    { textContent: "provider script source", parentElement: parent("SCRIPT") },
+    { textContent: "template-only text", parentElement: parent("TEMPLATE") },
+    { textContent: "noscript-only text", parentElement: parent("NOSCRIPT") },
+    { textContent: "hidden shadow text", parentElement: parent("DIV", { display: "none" }) },
+    { textContent: "invisible shadow text", parentElement: parent("DIV", { visibility: "hidden" }) },
+    { textContent: "Visible shadow button", parentElement: parent("BUTTON") },
+    { textContent: "Visible direct shadow text", parentElement: null },
+  ];
+  document.createTreeWalker = root => { let index = 0; return { nextNode() { return root.textNodes[index++] || null; } }; };
+  document.createRange = () => ({ selectNodeContents() {}, getClientRects() { return [{ width: 20, height: 10 }]; } });
+  const frame = element("IFRAME"); frame.title = "Owned same-origin frame"; frame.src = "https://example.test/frame";
+  const frameDocument = { nodeType: 9, body: { innerText: "Visible iframe body" }, defaultView: { frameElement: frame }, querySelectorAll() { return []; } }; frame.contentDocument = frameDocument;
+  document.querySelectorAll = selector => selector === "*" ? [host, frame] : selector === "iframe" ? [frame] : [];
+  const operation = vmOperation({ document, location, crypto: require("node:crypto").webcrypto, Uint8Array,
+    getComputedStyle: document.defaultView.getComputedStyle, innerWidth: 1000, innerHeight: 700, scrollX: 0, scrollY: 0 });
+  const result = operation("read", { maxLength: 3000 }).result;
+  assert.match(result.text, /Visible page body/); assert.match(result.text, /Visible shadow button/);
+  assert.match(result.text, /Visible direct shadow text/); assert.match(result.text, /Visible iframe body/);
+  assert.doesNotMatch(result.text, /darkreader|secret-style|script source|template-only|noscript-only|hidden shadow|invisible shadow/);
+  assert.equal(result.truncated, false);
+  frame.style.display = "none";
+  assert.doesNotMatch(operation("read", { maxLength: 3000 }).result.text, /Visible iframe body/);
+  function vmOperation(context) { return require("node:vm").runInNewContext(`(${pageOperation.toString()})`, context); }
 });
 function fixture(fastLoadingObservation = false) {
   const profileId = "55555555-5555-4555-8555-555555555555", calls = [], scripts = [], listeners = [];
@@ -107,6 +164,82 @@ test("only owner-bound original-agent input enters the operation-scoped sidebar 
   await assert.rejects(f.binding.execute(request), { code: "INVALID_OWNER" });
   assert.equal(f.calls.length, before, "a missing sidebar owner cannot fall back to unscoped input");
 });
+test("an explicit native modal plan travels with one click before any blocked callback or page observation", async () => {
+  const f = fixture(); await f.binding.start();
+  const policy = { kind: "dialog", type: "prompt", message: "Exact?", accept: true, promptText: "Answer", timeout_ms: 10000 };
+  const actual = { kind: "dialog", type: "prompt", message: "Exact?", accepted: true, responseVerified: true, done: true };
+  f.setSidebar({ async withAgentSelection(_owner, _tab, operation) { return operation({ async select() {}, assertCurrent() {} }); } });
+  f.setPage(script => ({ ok: true, result: script.args[0] === "read" ? { url: f.tab.url, documentId: "doc", snapshotId: "after", nodes: [] }
+    : { expectedUrl: f.tab.url, point: { x: 50, y: 50 }, viewport: { width: 1000, height: 700 } } }));
+  f.setNative(command => {
+    if (command.input?.action === "click") {
+      assert.deepEqual(command.input.modalPlan, { policy, scope: { profileId: f.profileId, tabId: "12", documentId: "doc", node: "n1",
+        ownerId: "owner", accountScope: "account", sessionId: "work-session", turnId: "work-turn" } });
+      assert.equal(f.scripts.some(script => script.args[0] === "filechooser_arm"), false, "no modal-time extension message is needed");
+      return { ok: true, result: { eventsPosted: 4, nativeModal: actual } };
+    }
+    return { ok: true, result: { eventsPosted: 0 } };
+  });
+  const request = { ...f.request("interact", { handle: `live:${f.profileId}:12`, expectedUrl: f.tab.url, documentId: "doc", snapshotId: "snap", nativeModal: policy,
+    agentScope: { ownerId: "owner", accountScope: "account", sessionId: "work-session", turnId: "work-turn" },
+    interactions: [{ type: "click", node: "n1" }] }), agentOwner: "owner" };
+  const result = await f.binding.execute(request);
+  assert.equal(result.completed[0].result.nativeModal, actual);
+  assert.deepEqual(f.calls.filter(call => call.input?.action).map(call => call.input.action), ["focus", "click"]);
+  await assert.rejects(f.binding.execute({ ...request, agentOwner: undefined }), { code: "INVALID_NATIVE_MODAL" });
+});
+test("approved native upload source cannot rebind to another node, document, snapshot, or multiple flag", () => {
+  const crypto = require("node:crypto").webcrypto, location = { href: "https://example.test/" };
+  let element = { disabled: false, multiple: false, matches: value => value === "input[type=file]" };
+  const state = { documentId: "document", snapshotId: "snapshot", url: location.href, nodes: new Map() };
+  const operation = require("node:vm").runInNewContext(`(${pageOperation.toString()})`, { document: {}, location, crypto, Uint8Array,
+    __chatGPTSafariLiveDocument: state, __chatGPTSafariPlaywright: { parseSelector: value => value, querySelectorAll: () => [element], elementState: () => ({ matches: true }) } });
+  const source = operation("query", { command: { type: "safari_native_upload_inspect", selector: "input[type=file]" } }).result;
+  assert.equal(source.isMultiple, false); assert.equal(source.documentId, "document");
+  const inspect = () => operation("query", { command: { type: "safari_native_upload_inspect", selector: "input[type=file]", safari_upload_source: source } });
+  assert.equal(inspect().ok, true);
+  element.multiple = true; assert.equal(inspect().error.code, "UPLOAD_SOURCE_CHANGED"); element.multiple = false;
+  state.snapshotId = "other-snapshot"; assert.equal(inspect().error.code, "UPLOAD_SOURCE_CHANGED"); state.snapshotId = "snapshot";
+  state.documentId = "other-document"; assert.equal(inspect().error.code, "UPLOAD_SOURCE_CHANGED"); state.documentId = "document";
+  element = { ...element }; assert.equal(inspect().error.code, "UPLOAD_SOURCE_CHANGED");
+});
+test("rich session paste uses one scoped trusted shortcut with explicit MIME bytes and no implicit click", async () => {
+  const f = fixture(); await f.binding.start();
+  const items = [{ entries: [{ mime_type: "text/plain", text: "Plain" }, { mime_type: "text/html", text: "<b>Rich</b>" }] }];
+  f.setSidebar({ async withAgentSelection(_owner, _tab, operation) { return operation({ async select() {}, assertCurrent() {} }); } });
+  f.setPage(script => ({ ok: true, result: script.args[0] === "read" ? { url: f.tab.url, documentId: "doc", snapshotId: "after", nodes: [] }
+    : { expectedUrl: f.tab.url, point: { x: 50, y: 50 }, viewport: { width: 1000, height: 700 } } }));
+  f.setNative(command => {
+    if (command.input?.action === "key") {
+      assert.equal(command.input.key, "Meta+v");
+      assert.match(command.input.clipboardPlan.receiptToken, /^[0-9a-f-]{36}$/i);
+      assert.deepEqual(command.input.clipboardPlan, { operation: "paste", items, receiptToken: command.input.clipboardPlan.receiptToken, scope: { profileId: f.profileId, ownerId: "owner", accountScope: "account",
+        sessionId: "work-session", turnId: "work-turn", tabId: "12", documentId: "doc", node: "n1" } });
+      return { ok: true, result: { eventsPosted: 2, nativeClipboard: { operation: "paste", nativeKeyDelivered: true, trustedPageReceipt: true, nativeDataRead: true, clipboardRestoration: "restored" } } };
+    }
+    return { ok: true, result: { eventsPosted: 0 } };
+  });
+  const request = { ...f.request("interact", { handle: `live:${f.profileId}:12`, expectedUrl: f.tab.url, documentId: "doc", snapshotId: "snap",
+    agentScope: { ownerId: "owner", accountScope: "account", sessionId: "work-session", turnId: "work-turn" },
+    interactions: [{ type: "clipboard", operation: "paste", node: "n1", items }] }), agentOwner: "owner" };
+  const result = await f.binding.execute(request);
+  assert.equal(result.completed[0].type, "clipboard"); assert.equal(result.completed[0].result.nativeClipboard.clipboardRestoration, "restored");
+  assert.deepEqual(f.calls.filter(call => call.input?.action).map(call => call.input.action), ["focus", "key"]);
+  assert.equal(f.scripts.some(script => script.args[0] === "filechooser_arm"), false);
+  const arm = f.scripts.find(script => script.args[0] === "clipboard_arm").args[1];
+  assert.equal(arm.clipboardItems, undefined, "event observers receive no clipboard bytes");
+  const observation = { type: "chatgpt-safari:clipboard-receipt", token: arm.token, clipboardOperation: "paste", documentId: "doc", snapshotId: "snap", url: f.tab.url };
+  const sender = { tab: { id: 12 }, frameId: 0, url: f.tab.url };
+  for (const changed of [{ token: "wrong" }, { clipboardOperation: "copy" }, { documentId: "other" }, { snapshotId: "other" }, { url: "https://other.test/" }]) f.message({ ...observation, ...changed }, sender);
+  for (const changed of [{ tab: { id: 13 } }, { frameId: 1 }, { url: "https://other.test/" }]) f.message(observation, { ...sender, ...changed });
+  assert.equal(f.calls.some(call => call.action === "liveClipboardReceipt"), false);
+  f.message(observation, sender); f.message(observation, sender);
+  const receipts = f.calls.filter(call => call.action === "liveClipboardReceipt");
+  assert.equal(receipts.length, 1);
+  assert.deepEqual(Object.keys(receipts[0].input).sort(), ["scope", "token"]);
+  assert.equal(receipts[0].input.scope.node, "n1");
+  await assert.rejects(f.binding.execute({ ...request, agentOwner: undefined }), { code: "INVALID_NATIVE_CLIPBOARD" });
+});
 test("only native group moves connect their confirmed native result to the sidebar transition lease", async () => {
   const f = fixture(); await f.binding.start();
   const calls = [];
@@ -125,6 +258,9 @@ test("only native group moves connect their confirmed native result to the sideb
   calls.length = 0;
   await f.binding.execute(request("inspect"));
   assert.deepEqual(calls, [undefined], "read-only native inventory cannot defer arbitrary user activation");
+  calls.length = 0;
+  await f.binding.execute(request("inspectWindowSource"));
+  assert.deepEqual(calls, [undefined], "read-only window-source proof cannot acquire a native group-move lease");
 });
 test("poll discovery never launches the companion; real handles bind the profile and tab", async () => {
   const f = fixture(); await f.binding.start();
@@ -187,10 +323,57 @@ test("stale snapshots and navigation are rejected before any native input", asyn
 });
 test("a newly leased about:blank tab can navigate but cannot be read as a website", async () => {
   const f = fixture(); await f.binding.start(); f.tab.url = "about:blank";
-  await assert.rejects(f.binding.execute(f.request("read_page", { handle: `live:${f.profileId}:12` })), { code: "INVALID_URL" });
+  await assert.rejects(f.binding.execute(f.request("read_page", { handle: `live:${f.profileId}:12` })), { code: "BLANK_DOCUMENT" });
   const result = await f.binding.execute(f.request("navigate", { handle: `live:${f.profileId}:12`, expectedUrl: "about:blank", url: "https://example.com/created" }));
   assert.equal(f.calls.at(-1).update.url, "https://example.com/created");
   assert.equal(result.tabId, 12);
+});
+test("the exact newly claimed about:blank tab can close without opening an internal-page control path", async () => {
+  const f = fixture(); await f.binding.start(); f.tab.url = "about:blank";
+  const handle = `live:${f.profileId}:12`;
+  await assert.rejects(f.binding.execute(f.request("close_tab", { handle })), /expectedUrl|HTTP\/HTTPS/);
+  await assert.rejects(f.binding.execute(f.request("close_tab", { handle: "live:other-profile:12", expectedUrl: "about:blank" })), { code: "INVALID_HANDLE" });
+  const result = await f.binding.execute(f.request("close_tab", { handle, expectedUrl: "about:blank" }));
+  assert.deepEqual(result, { closed: true, handle });
+  assert.deepEqual(f.calls.filter(value => value.remove), [{ remove: 12 }]);
+  assert.equal(f.scripts.length, 0);
+  f.tab.url = "safari://Bookmarks";
+  await assert.rejects(f.binding.execute(f.request("close_tab", { handle, expectedUrl: f.tab.url })), { code: "INVALID_URL" });
+  assert.equal(f.calls.filter(value => value.remove).length, 1);
+});
+test("missing and empty tab URLs permit blank navigation only with an exact native top-frame proof", async () => {
+  for (const missing of [undefined, ""]) {
+    const f = fixture(); await f.binding.start(); f.tab.url = missing;
+    const nativeQueries = [];
+    f.api.webNavigation = { async getAllFrames(query) { nativeQueries.push(query); return [{ frameId: 0, parentFrameId: -1, url: "about:blank", errorOccurred: false }]; } };
+    assert.equal(await f.binding.navigationSourceUrl(12), "about:blank");
+    await assert.rejects(f.binding.execute(f.request("read_page", { handle: `live:${f.profileId}:12` })), { code: "TAB_URL_UNAVAILABLE" });
+    assert.equal(f.scripts.length, 0);
+    const result = await f.binding.execute(f.request("navigate", { handle: `live:${f.profileId}:12`, expectedUrl: "about:blank", url: "https://example.test/new" }));
+    assert.equal(result.tabId, 12); assert.equal(f.calls.at(-1).update.url, "https://example.test/new");
+    assert.deepEqual(nativeQueries, [{ tabId: 12 }, { tabId: 12 }]);
+    assert.equal(f.tab.url, missing, "native Tab metadata is not rewritten or retained as a blank alias");
+    await f.binding.execute(f.request("close_tab", { handle: `live:${f.profileId}:12`, expectedUrl: "about:blank" }));
+    assert.equal(f.calls.at(-1).remove, 12);
+  }
+});
+test("unknown, errored, pending, ambiguous, stale or internal native frame metadata never becomes blank authority", async () => {
+  for (const frames of [null, [], [{ frameId: 1, parentFrameId: 0, url: "about:blank" }],
+    [{ frameId: 0, parentFrameId: -1, url: "safari://Bookmarks" }], [{ frameId: 0, parentFrameId: -1, url: "https://example.test/" }],
+    [{ frameId: 0, parentFrameId: -1, url: "about:blank", errorOccurred: true }],
+    [{ frameId: 0, parentFrameId: -1, url: "about:blank" }, { frameId: 0, parentFrameId: -1, url: "about:blank" }]]) {
+    const f = fixture(); await f.binding.start(); f.tab.url = undefined;
+    f.api.webNavigation = { async getAllFrames() { return frames; } };
+    await assert.rejects(f.binding.navigationSourceUrl(12), { code: "TAB_URL_UNAVAILABLE" });
+    assert.equal(f.scripts.length, 0); assert.equal(f.calls.some(value => value.update || value.remove), false);
+  }
+  const f = fixture(); await f.binding.start(); f.tab.url = undefined;
+  await assert.rejects(f.binding.navigationSourceUrl(12), { code: "TAB_URL_UNAVAILABLE" });
+  f.api.webNavigation = { async getAllFrames() { f.tab.windowId = 9; return [{ frameId: 0, parentFrameId: -1, url: "about:blank" }]; } };
+  await assert.rejects(f.binding.navigationSourceUrl(12), { code: "STALE_TARGET" });
+  f.tab.pendingUrl = "https://example.test/pending";
+  await assert.rejects(f.binding.navigationSourceUrl(12), { code: "STALE_TARGET" });
+  assert.equal(f.calls.some(value => value.update || value.remove), false);
 });
 test("a real native modal stops input before DOM focus/readback and holds the sidebar selection", async () => {
   const f = fixture(); await f.binding.start(); const events = [];

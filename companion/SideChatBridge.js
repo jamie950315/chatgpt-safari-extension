@@ -24,6 +24,8 @@ globalThis.__CHATGPT_SAFARI_ADAPTER_READY__ = (async () => {
   const nativeHandler = window.webkit?.messageHandlers?.chatgptSidechat;
   if (!relayMode && (!nativeHandler || typeof nativeHandler.postMessage !== "function")) return;
   let relayPort, connectResolve, connectReject;
+  let documentRecoveryCheckpoint, unloadingRecoveryCheckpoint;
+  const validRecoverySequence = value => Number.isSafeInteger(value) && value >= 0 && value <= 1_000_000_000;
   const relayPending = new Map();
   const handshake = { readyPosted: false, connectMessages: 0, parentSourceMatched: false,
     parentTokenMatched: false, parentOriginKind: "none" };
@@ -37,12 +39,18 @@ globalThis.__CHATGPT_SAFARI_ADAPTER_READY__ = (async () => {
         handshake.parentTokenMatched = event.data.token === relay.bridgeToken;
         handshake.parentOriginKind = parentOriginMatches(event.origin) ? "expected" : event.origin === "null" ? "opaque" : "other";
       }
-      if (relayPort || event.source !== window.parent || !parentOriginMatches(event.origin)
+      if (relayPort || !event.isTrusted || event.source !== window.parent || !parentOriginMatches(event.origin)
         || event.data?.type !== "chatgpt-safari-provider:connect" || event.data.token !== relay.bridgeToken
+        || !validRecoverySequence(event.data.documentRecoverySequence)
         || event.ports?.length !== 1) return;
       relayPort = event.ports[0];
+      documentRecoveryCheckpoint = event.data.documentRecoverySequence;
       clearTimeout(connectTimer);
       relayPort.onmessage = ({ data }) => {
+        if (data?.type === "document_recovery_checkpoint") {
+          if (validRecoverySequence(data.sequence) && data.sequence >= documentRecoveryCheckpoint) documentRecoveryCheckpoint = data.sequence;
+          return;
+        }
         if (data?.type === "event") { api.receive(data.payload); return; }
         if (data?.type !== "reply" || typeof data.id !== "string") return;
         const pending = relayPending.get(data.id);
@@ -55,7 +63,20 @@ globalThis.__CHATGPT_SAFARI_ADAPTER_READY__ = (async () => {
       handshake.readyPosted = true;
       connectResolve();
     });
-    window.addEventListener("pagehide", () => disconnectRelay(), { once: true });
+    window.addEventListener("beforeunload", event => {
+      if (event.isTrusted && relayPort && validRecoverySequence(documentRecoveryCheckpoint)) {
+        // Capture before the navigation request can produce a native receipt.
+        // A cancelled beforeunload does not itself authorize a remount.
+        unloadingRecoveryCheckpoint = documentRecoveryCheckpoint;
+      }
+    });
+    window.addEventListener("pagehide", event => {
+      if (!event.isTrusted) return;
+      if (event.isTrusted && relayPort && validRecoverySequence(unloadingRecoveryCheckpoint)) {
+        relayPort.postMessage({ type: "provider_document_unloaded", recoverySequence: unloadingRecoveryCheckpoint });
+      }
+      disconnectRelay();
+    });
     // Connect before original entry execution. Waiting for iframe.load can
     // deadlock the original context loader while other modules are compiling.
     window.parent.postMessage({ type: "chatgpt-safari-provider:ready", token: relay.bridgeToken,
@@ -63,6 +84,7 @@ globalThis.__CHATGPT_SAFARI_ADAPTER_READY__ = (async () => {
   }
   function disconnectRelay() {
     relayPort?.close();
+    relayPort = undefined;
     for (const pending of relayPending.values()) { clearTimeout(pending.timer); pending.reject(new Error("The Safari sidebar disconnected")); }
     relayPending.clear();
   }
@@ -107,6 +129,32 @@ globalThis.__CHATGPT_SAFARI_ADAPTER_READY__ = (async () => {
       ...(known.includes(error.message) ? { reason: error.message } : {}) });
   }
   if (relayMode) {
+    let trustedInputCounter = 0;
+    const observeComposerInput = event => {
+      if (!event.isTrusted) return;
+      const composer = document.querySelector("#prompt-textarea");
+      if (composer && composer.isConnected !== false
+        && (event.target === composer || composer.contains?.(event.target))) {
+        trustedInputCounter = Math.min(1_000_000_000, trustedInputCounter + 1);
+      }
+    };
+    document.addEventListener("input", observeComposerInput, true);
+    const composerHealth = () => {
+      const composer = document.querySelector("#prompt-textarea");
+      if (!composer || composer.isConnected === false) return {};
+      const text = typeof composer.value === "string" ? composer.value : composer.innerText ?? composer.textContent;
+      const active = document.activeElement;
+      const send = document.querySelector('button[data-testid="send-button"], button#composer-submit-button:not([data-testid="stop-button"])');
+      // Only presence/focus/editability and native input counts leave this
+      // document. Never report draft text, selection, event data or key values.
+      return {
+        composerHasText: typeof text === "string" && text.trim().length > 0,
+        composerFocused: active === composer || !!(active && composer.contains?.(active)),
+        composerEditable: composer.isContentEditable === true
+          || ["INPUT", "TEXTAREA"].includes(composer.tagName) && !composer.disabled && !composer.readOnly,
+        ...(send && send.isConnected !== false ? { sendDisabled: send.disabled === true || send.getAttribute?.("aria-disabled") === "true" } : {}),
+      };
+    };
     const originalError = console.error;
     console.error = function(...args) { for (const value of args) captureError(value); return originalError.apply(this, args); };
     window.addEventListener("error", event => captureError(event.error));
@@ -117,10 +165,13 @@ globalThis.__CHATGPT_SAFARI_ADAPTER_READY__ = (async () => {
         connections: siteAdapter.connections, contexts: diagnostics.outbound.context || 0,
         streamCalls: siteAdapter.streamCalls,
         failures: diagnostics.failures, scriptErrors: diagnostics.scriptErrors,
-        unhandledRejections: diagnostics.unhandledRejections, channelConnected: relayPort != null, ...handshake,
+        unhandledRejections: diagnostics.unhandledRejections, channelConnected: relayPort != null,
+        trustedInputCounter, ...composerHealth(), ...handshake,
         errors: caughtErrors.map(error => ({ kind: error.kind, frames: error.frames.slice(0, 4), ...(error.reason ? { reason: error.reason } : {}) })) }).catch(() => {});
     }, 2000);
-    window.addEventListener("pagehide", () => clearInterval(report), { once: true });
+    window.addEventListener("pagehide", () => {
+      clearInterval(report); document.removeEventListener("input", observeComposerInput, true);
+    }, { once: true });
   }
   function validRecord(value) { return value != null && typeof value === "object" && !Array.isArray(value); }
   function validRequestId(value) { return typeof value === "string" && value.length > 0 && value.length <= 128; }

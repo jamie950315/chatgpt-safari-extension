@@ -3874,7 +3874,7 @@
 		]).optional(),
 		force: k().optional(),
 		timeout_ms: u().int().positive().optional()
-	}), $u = n({}), Ys = "playwright_locator_click";
+	}).extend({safari_native_modal:Z().optional(),safari_upload_source:Z().optional()}), $u = n({}), Ys = "playwright_locator_click";
 	function Xs(e) {
 		return new m(Ys, Ks, e);
 	}
@@ -6482,6 +6482,23 @@ Locator diagnostics: \${JSON.stringify({
 		].join(\`
 \`);
 	}
+class SafariNativeDialogsCapability extends ce{
+constructor({browserId,documentation,info,tabId,transport}){super(transport,browserId,tabId,documentation,info)}
+async run(options){
+if(!options||typeof options!=="object"||Object.keys(options).some(key=>!["selector","type","message","accept","promptText","timeout_ms"].includes(key)))throw new Error("Specify an exact native dialog selector, type, message, and explicit response");
+const policy={kind:"dialog",type:options.type,message:options.message,accept:options.accept,timeout_ms:options.timeout_ms??10000,...options.promptText===undefined?{}:{promptText:options.promptText}};
+return this.transport.send({command:Xs({browser_id:this.browserId,tab_id:this.tabId,selector:options.selector,safari_native_modal:policy})})
+}
+}
+class SafariNativeUploadsCapability extends ce{
+constructor({browserId,documentation,info,tabId,transport}){super(transport,browserId,tabId,documentation,info)}
+async run(options){
+if(!options||typeof options!=="object"||Object.keys(options).some(key=>!["selector","files","timeout_ms"].includes(key)))throw new Error("Specify one visible file-input selector and explicit local files");
+return this.transport.send({command:Xs({browser_id:this.browserId,tab_id:this.tabId,selector:options.selector,safari_native_modal:{kind:"upload",files:options.files,timeout_ms:options.timeout_ms??10000}})})
+}
+}
+var SafariNativeDialogsDefinition=de({capability:SafariNativeDialogsCapability,info:{id:"nativeDialogs",description:"Respond to one exact expected native JavaScript dialog within its opening click, before Safari suspends extension callbacks."}}),
+SafariNativeUploadsDefinition=de({capability:SafariNativeUploadsCapability,info:{id:"nativeUploads",description:"Approve explicit local files before clicking one visible file input, then complete its actual native Safari chooser atomically."}});
 	const jo = de({
 		capability: Bo,
 		info: Mo
@@ -6490,6 +6507,8 @@ Locator diagnostics: \${JSON.stringify({
 		Qn,
 		So,
 		Do,
+		SafariNativeDialogsDefinition,
+		SafariNativeUploadsDefinition,
 		jo
 	], gm = vm(Lo), wm = ({ browserId: e, capabilities: t, documentation: a, tabId: r, transport: s }) => {
 		const c = {};

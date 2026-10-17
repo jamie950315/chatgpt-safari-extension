@@ -64,8 +64,8 @@ struct ProviderRelayRequest {
 
 enum ProviderRelayDiagnostics {
     static let maximumBytes = 8 * 1024
-    static let counters: Set<String> = ["usedOrigin", "usedConnection", "connections", "contexts", "streamCalls", "failures", "scriptErrors", "unhandledRejections", "connectMessages"]
-    static let booleans: Set<String> = ["channelConnected", "readyPosted", "parentSourceMatched", "parentTokenMatched"]
+    static let counters: Set<String> = ["usedOrigin", "usedConnection", "connections", "contexts", "streamCalls", "failures", "scriptErrors", "unhandledRejections", "connectMessages", "trustedInputCounter"]
+    static let booleans: Set<String> = ["channelConnected", "readyPosted", "parentSourceMatched", "parentTokenMatched", "composerHasText", "composerFocused", "composerEditable", "sendDisabled"]
     static let kinds: Set<String> = ["Error", "TypeError", "ReferenceError", "RangeError", "SyntaxError", "SecurityError", "DOMException", "UnhandledRejection", "ModuleLoadError", "UnknownError"]
     static let reasons: Set<String> = ["The side-chat extension is unavailable", "The Safari owner tab is no longer available", "The Safari side-chat context request timed out", "The ChatGPT account changed", "Load failed"]
 
@@ -201,14 +201,13 @@ struct ProviderRelayPolicy {
         return Self.staticAssetPath(parts.percentEncodedPath)
     }
 
-    /// A browser reload uses the deliberately clean document URL, not fetch's
-    /// capability header. Keep that request unauthorized; only its inert error
-    /// document may ask the exact containing wrapper for a fresh native entry.
+    /// A reload uses the deliberately clean document URL, not fetch's header.
+    /// Keep it unauthorized; native code records only a sequence receipt. The
+    /// wrapper also requires its authenticated old document's unload signal.
     func documentRecoveryParent(for request: ProviderRelayRequest, enabled: Bool) -> String? {
         guard enabled, Self.validParent(parentExtensionOrigin), request.method == "GET", request.body.isEmpty,
               request.headers["x-chatgpt-relay"] == nil,
               request.headers["accept"]?.lowercased().contains("text/html") == true,
-              request.headers["sec-fetch-dest"].map({ $0 == "iframe" }) ?? true,
               let local = URLComponents(string: localOrigin + request.target),
               !(local.queryItems ?? []).contains(where: { $0.name == providerRelayKeyParameter || $0.name == providerRelayInlineParameter }),
               let rejection = rejection(for: request, enabled: enabled), rejection.0 == 401,

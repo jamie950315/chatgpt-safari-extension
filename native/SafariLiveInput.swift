@@ -183,6 +183,58 @@ final class SafariLiveInput: @unchecked Sendable {
         }
     }
 
+    /// A one-command response authorized before its native opening click.
+    /// No response or file selection survives this input operation.
+    struct ModalPlan {
+        let policy: [String: Any]
+        let scope: [String: String]
+        let kind: String
+        let timeout: TimeInterval
+        let type: String?
+        let message: String?
+        let accept: Bool?
+        let promptText: String?
+        let files: [SafariFileChooser.LocalFile]
+        let multiple: Bool
+
+        init(_ raw: Any?, request: Request) throws {
+            guard request.action == "click", request.clickCount == 1, request.button == .left, request.modifiers.isEmpty,
+                  let raw = raw as? [String: Any], let policy = raw["policy"] as? [String: Any],
+                  let scope = raw["scope"] as? [String: String],
+                  Set(scope.keys) == ["profileId", "tabId", "documentId", "node", "ownerId", "accountScope", "sessionId", "turnId"],
+                  scope.values.allSatisfy({ !$0.isEmpty && $0.utf16.count <= 512 && !$0.contains("\0") }),
+                  let tab = Int(scope["tabId"]!), tab > 0, String(tab) == scope["tabId"],
+                  let kind = policy["kind"] as? String, ["dialog", "upload"].contains(kind),
+                  let timeout = SafariLiveInput.number(policy["timeout_ms"]), (1...10_000).contains(timeout), timeout.rounded() == timeout else {
+                throw Failure(code: "INVALID_NATIVE_MODAL", message: "A native modal response requires one plain click and its exact original owner/account/profile/turn/tab/document/node scope.")
+            }
+            self.policy = policy; self.scope = scope; self.kind = kind; self.timeout = timeout / 1000
+            if kind == "dialog" {
+                guard Set(policy.keys).isSubset(of: ["kind", "timeout_ms", "type", "message", "accept", "promptText"]),
+                      let type = policy["type"] as? String, ["alert", "confirm", "prompt"].contains(type),
+                      let message = policy["message"] as? String, message.utf16.count <= 8000,
+                      let accept = SafariLiveInput.boolean(policy["accept"]), type != "alert" || accept,
+                      policy["promptText"] == nil || (type == "prompt" && accept && policy["promptText"] is String),
+                      (policy["promptText"] as? String)?.utf16.count ?? 0 <= 20_000 else {
+                    throw Failure(code: "INVALID_NATIVE_MODAL", message: "Specify the exact alert/confirm/prompt message and an explicit accept boolean; promptText is only valid when accepting a prompt.")
+                }
+                self.type = type; self.message = message; self.accept = accept; promptText = policy["promptText"] as? String
+                files = []; multiple = false
+            } else {
+                guard Set(policy.keys) == ["kind", "timeout_ms", "files"], let multiple = SafariLiveInput.boolean(raw["isMultiple"]) else {
+                    throw Failure(code: "INVALID_NATIVE_MODAL", message: "An approved native upload requires explicit files and the exact observed source input's multiple flag.")
+                }
+                do { files = try SafariFileChooser.files(policy["files"], multiple: multiple) }
+                catch let failure as SafariFileChooser.Failure { throw Failure(code: failure.code, message: failure.message) }
+                self.multiple = multiple; type = nil; message = nil; accept = nil; promptText = nil
+            }
+        }
+
+        func matches(type: String, message: String) -> Bool {
+            kind == "dialog" && self.type == type && self.message == message
+        }
+    }
+
     struct MappedPoint {
         let point: CGPoint
         let scaleX: CGFloat
@@ -289,7 +341,11 @@ final class SafariLiveInput: @unchecked Sendable {
     private let queue = DispatchQueue(label: "dev.jamie.chatgpt-safari.live-input")
     private var dialogLease: (id: String, node: AXUIElement, window: AXUIElement, url: String)?
     private let bookmarks = SafariBookmarks()
+    private let armedFileChooser = SafariFileChooser()
+    private let nativeClipboard = SafariNativeClipboard()
     private var currentAuthorization: (() -> Bool)?
+
+    func acknowledgeClipboard(_ input: [String: Any]) { nativeClipboard.acknowledge(input) }
 
     init() {
         // NSRunningApplication's dynamic properties refresh with the main run
@@ -328,10 +384,17 @@ final class SafariLiveInput: @unchecked Sendable {
                     reply(["ok": true, "result": try modalStatus(command)]); return
                 }
                 let request = try Request(command)
-                let result = try perform(request)
+                let plan = try command["modalPlan"].map { try ModalPlan($0, request: request) }
+                let clipboard = try command["clipboardPlan"].map { try SafariNativeClipboard.Plan($0, key: request.key) }
+                guard clipboard == nil || request.action == "key" && plan == nil else {
+                    throw Failure(code: "INVALID_NATIVE_CLIPBOARD", message: "A transient clipboard shortcut cannot attach to a click, modal response or unrelated input action.")
+                }
+                let result = try perform(request, modalPlan: plan, clipboardPlan: clipboard)
                 reply(["ok": true, "result": result])
             } catch let failure as Failure {
                 reply(Self.failureResponse(failure))
+            } catch let failure as SafariNativeClipboard.Failure {
+                reply(Self.failureResponse(Failure(code: failure.code, message: failure.message)))
             } catch {
                 reply(["ok": false, "error": ["code": "NATIVE_INPUT_FAILED", "message": "Native Safari input failed."]])
             }
@@ -408,6 +471,7 @@ final class SafariLiveInput: @unchecked Sendable {
     func manageBookmarks(_ command: [String: Any], profileIdentity: String, isAuthorized: @escaping () -> Bool,
                          reply: @escaping ([String: Any]) -> Void) {
         queue.async { [self] in
+            var guardStage = "none"
             do {
                 guard Self.onMain(isAuthorized), let method = command["method"] as? String,
                       ["getTree", "search", "get", "getChildren", "getSubTree", "update", "createFolder", "create", "remove", "removeTree", "move"].contains(method),
@@ -426,31 +490,57 @@ final class SafariLiveInput: @unchecked Sendable {
                 var editorPhase = false
                 let deadline = Date().addingTimeInterval(20)
                 func stableWindow(postedButton: CGMouseButton? = nil) -> Bool {
-                    guard Self.onMain(isAuthorized), self.frontmostApplication()?.processIdentifier == front.processIdentifier,
-                          self.focusedApplicationPID() == front.processIdentifier,
-                          let focused = self.element(app, kAXFocusedWindowAttribute), CFEqual(focused, window),
-                          self.string(window, kAXIdentifierAttribute) == identifier,
-                          let bounds = self.frame(window), Self.close(bounds, target.windowBounds, tolerance: 8),
-                          Date() < deadline else { return false }
+                    guard Self.onMain(isAuthorized) else { guardStage = "owner"; return false }
+                    guard self.frontmostApplication()?.processIdentifier == front.processIdentifier else { guardStage = "frontmost_process"; return false }
+                    guard self.focusedApplicationPID() == front.processIdentifier else { guardStage = "focused_application"; return false }
+                    guard let focused = self.element(app, kAXFocusedWindowAttribute), CFEqual(focused, window) else { guardStage = "focused_window"; return false }
+                    guard self.string(window, kAXIdentifierAttribute) == identifier else { guardStage = "window_identity"; return false }
+                    guard let bounds = self.frame(window), Self.close(bounds, target.windowBounds, tolerance: 8) else { guardStage = "window_bounds"; return false }
+                    guard Date() < deadline else { guardStage = "deadline"; return false }
                     let input = self.inputState(.combinedSessionState)
                     guard input.heldModifiers.isEmpty,
                           (!input.leftMouseDown || postedButton == .left),
                           (!input.rightMouseDown || postedButton == .right),
-                          (!input.middleMouseDown || postedButton == .center) else { return false }
+                          (!input.middleMouseDown || postedButton == .center) else { guardStage = "input"; return false }
                     return true
                 }
+                func surfaceNodes() -> [AXUIElement]? {
+                    SafariBookmarks.editorSurfaceNodes(window, children: {
+                        (attribute($0, kAXChildrenAttribute) as? [AXUIElement] ?? [])
+                            + (attribute($0, "AXSheets") as? [AXUIElement] ?? [])
+                    }, role: { string($0, kAXRoleAttribute) }, identifier: { string($0, kAXIdentifierAttribute) }, equal: { CFEqual($0, $1) })
+                }
                 let addressValue = { [self] in
-                    let address = self.nativeNodes(window).first { self.string($0, kAXIdentifierAttribute) == "WEB_BROWSER_ADDRESS_AND_SEARCH_FIELD" }
+                    let address = surfaceNodes()?.first { self.string($0, kAXIdentifierAttribute) == "WEB_BROWSER_ADDRESS_AND_SEARCH_FIELD" }
                     return address.flatMap { self.string($0, kAXValueAttribute) }
                 }
                 let utilityAddress = { (value: String?) in
                     value == target.expectedURL || value == String(target.expectedURL.dropFirst("http://".count))
                 }
-                let boundPage = { [self] in
-                    let value = addressValue()
-                    if value == target.expectedURL || value == String(target.expectedURL.dropFirst("http://".count)) { return true }
-                    return editorPhase && value == "bookmarks://"
-                        && self.nativeNodes(window).filter { self.string($0, kAXIdentifierAttribute) == "Bookmarks" }.count == 1
+                func editorObservation() -> (readiness: SafariBookmarks.EditorReadiness, addressKind: String, outlineCount: Int,
+                                              addressMatchesOutline: Bool, titleMatchesOutline: Bool, hasWebArea: Bool, documentKind: String, surfaceComplete: Bool) {
+                    let surface = surfaceNodes(), nodes = surface ?? []
+                    let address = nodes.first { string($0, kAXIdentifierAttribute) == "WEB_BROWSER_ADDRESS_AND_SEARCH_FIELD" }.flatMap { string($0, kAXValueAttribute) }
+                    let outlines = nodes.filter { string($0, kAXIdentifierAttribute) == "Bookmarks" && string($0, kAXRoleAttribute) == kAXOutlineRole }
+                    let label = outlines.count == 1 ? string(outlines[0], kAXDescriptionAttribute) : nil
+                    let addressMatchesOutline = label.map { !$0.isEmpty && address == $0 } ?? false
+                    let titleMatchesOutline = label.map { !$0.isEmpty && string(window, kAXTitleAttribute) == $0 } ?? false
+                    let hasWebArea = nodes.contains { string($0, kAXRoleAttribute) == "AXWebArea" }
+                    let document = string(window, kAXDocumentAttribute) ?? pageURL(window)
+                    let documentKind = document == nil ? "unavailable" : document == "bookmarks://" ? "bookmarks" : utilityAddress(document) ? "utility" : "other"
+                    let addressKind = utilityAddress(address) ? "utility" : address == "bookmarks://" ? "bookmarks" : address == nil || address == "" ? "empty" : addressMatchesOutline ? "outline_label" : "other"
+                    return (SafariBookmarks.editorReadiness(address: address, utilityURL: target.expectedURL, nativeOutlineCount: outlines.count,
+                                nativeTitleMatchesOutline: titleMatchesOutline, hasWebArea: hasWebArea), addressKind, min(outlines.count, 2),
+                            addressMatchesOutline, titleMatchesOutline, hasWebArea, documentKind, surface != nil)
+                }
+                let boundPage = {
+                    if editorPhase {
+                        let observation = editorObservation()
+                        guard observation.surfaceComplete else { guardStage = "editor_surface"; return false }
+                        guard observation.readiness == .ready else { guardStage = "editor_identity"; return false }
+                    } else if !utilityAddress(addressValue()) { guardStage = "utility_identity"; return false }
+                    guardStage = "none"
+                    return true
                 }
                 let valid = { stableWindow() && boundPage() }
                 let validWithPostedButton = { (button: CGMouseButton) in stableWindow(postedButton: button) && boundPage() }
@@ -466,11 +556,22 @@ final class SafariLiveInput: @unchecked Sendable {
                     }
                     editorPhase = true
                     let transitionDeadline = Date().addingTimeInterval(2)
-                    while stableWindow(), (utilityAddress(addressValue()) || addressValue() == "bookmarks://"), Date() < transitionDeadline {
-                        if addressValue() == "bookmarks://", nativeNodes(window).filter({ string($0, kAXIdentifierAttribute) == "Bookmarks" }).count == 1 { return }
-                        Thread.sleep(forTimeInterval: 0.025)
+                    var observation = editorObservation()
+                    var windowStable = true
+                    while Date() < transitionDeadline {
+                        windowStable = stableWindow()
+                        guard windowStable else { break }
+                        observation = editorObservation()
+                        switch observation.readiness {
+                        case .ready: return
+                        case .changed: break
+                        case .waiting:
+                            Thread.sleep(forTimeInterval: 0.025)
+                            continue
+                        }
+                        break
                     }
-                    throw Failure(code: "BOOKMARK_EDITOR_UNAVAILABLE", message: "Safari did not expose the exact temporary window's native bookmarks editor.")
+                    throw Failure(code: "BOOKMARK_EDITOR_UNAVAILABLE", message: "Safari did not expose the exact temporary window's native bookmarks editor. Native editor result: addressKind=\(observation.addressKind), documentKind=\(observation.documentKind), outlineCount=\(observation.outlineCount), windowStable=\(windowStable), addressMatchesOutline=\(observation.addressMatchesOutline), titleMatchesOutline=\(observation.titleMatchesOutline), hasWebArea=\(observation.hasWebArea), surfaceComplete=\(observation.surfaceComplete), guardStage=\(guardStage).")
                 }
                 func utilityPage(_ operation: () throws -> Void) throws {
                     guard valid(), let address = nativeNodes(window).first(where: { string($0, kAXIdentifierAttribute) == "WEB_BROWSER_ADDRESS_AND_SEARCH_FIELD" }),
@@ -511,9 +612,13 @@ final class SafariLiveInput: @unchecked Sendable {
                 }
                 reply(["ok": true, "result": result])
             } catch let failure as SafariBookmarks.Failure {
-                reply(Self.failureResponse(Failure(code: failure.code, message: failure.message,
+                let message = failure.code == "FOCUS_CHANGED" ? failure.message + " Native guard stage: \(guardStage)." : failure.message
+                reply(Self.failureResponse(Failure(code: failure.code, message: message,
                     details: ["mutationApplied": failure.mutationApplied, "doNotReplay": failure.mutationApplied])))
-            } catch let failure as Failure { reply(Self.failureResponse(failure)) }
+            } catch let failure as Failure {
+                reply(Self.failureResponse(failure.code == "FOCUS_CHANGED"
+                    ? Failure(code: failure.code, message: failure.message + " Native guard stage: \(guardStage).", details: failure.details) : failure))
+            }
             catch { reply(Self.failureResponse(Failure(code: "BOOKMARK_OPERATION_FAILED", message: "Safari's native bookmark operation failed."))) }
         }
     }
@@ -546,7 +651,14 @@ final class SafariLiveInput: @unchecked Sendable {
             "mainThreadSafariFrontmost": mainFront?.bundleIdentifier == "com.apple.Safari",
             "backgroundThreadSafariFrontmost": backgroundFront?.bundleIdentifier == "com.apple.Safari"
         ]
+        // Application identifiers explain a foreground refusal without
+        // collecting window titles, documents, or account information.
+        result["frontmostApplication"] = mainFront?.bundleIdentifier ?? "unknown"
+        if let focusedPID {
+            result["focusedApplication"] = Self.onMain { NSRunningApplication(processIdentifier: focusedPID)?.bundleIdentifier } ?? "unknown"
+        }
         result["inputState"] = inputStatesData()
+        result["clipboard"] = nativeClipboard.recoveryStatus()
         if let focusedPID {
             result["accessibilitySafariFrontmost"] = safariApplications().contains { $0.processIdentifier == focusedPID }
             result["frontmostObserversAgree"] = focusedPID == mainFront?.processIdentifier
@@ -824,20 +936,40 @@ final class SafariLiveInput: @unchecked Sendable {
         ["left": rect.minX, "top": rect.minY, "width": rect.width, "height": rect.height]
     }
 
-    private func perform(_ request: Request) throws -> [String: Any] {
+    private func perform(_ request: Request, modalPlan: ModalPlan? = nil, clipboardPlan: SafariNativeClipboard.Plan? = nil) throws -> [String: Any] {
         var eventCount = 0
         do {
-            return try performNative(request, eventCount: &eventCount)
+            return try performNative(request, eventCount: &eventCount, modalPlan: modalPlan, clipboardPlan: clipboardPlan)
         } catch var failure as Failure {
-            failure.eventsPosted = eventCount
+            failure.eventsPosted = max(failure.eventsPosted, eventCount)
+            if modalPlan != nil || clipboardPlan != nil, eventCount > 0 {
+                failure.details = (failure.details ?? [:]).merging(["mutationApplied": true, "doNotReplay": true]) { _, new in new }
+            }
             throw failure
         }
     }
 
-    private func performNative(_ request: Request, eventCount: inout Int) throws -> [String: Any] {
+    private func performNative(_ request: Request, eventCount: inout Int, modalPlan: ModalPlan? = nil,
+                               clipboardPlan: SafariNativeClipboard.Plan? = nil) throws -> [String: Any] {
         let context = try context(for: request)
         guard let source = CGEventSource(stateID: .hidSystemState) else {
             throw Failure(code: "NATIVE_INPUT_FAILED", message: "Could not create the native event source.")
+        }
+        if let clipboardPlan {
+            let focused = try focusedPageElement(context, editable: clipboardPlan.operation != "copy")
+            do {
+                let value = try nativeClipboard.perform(clipboardPlan, validate: { try self.validateStable(context, expectedFocus: focused) }, sendKey: { posted in
+                    try self.validateStable(context, expectedFocus: focused)
+                    let key = Self.nativeKey(request.key!)!
+                    try self.postKey(source: source, code: key.code, flags: key.flags, didPost: {
+                        eventCount += 2; posted()
+                    })
+                })
+                return ["action": request.action, "backend": "macOS Accessibility + CGEvent", "eventsPosted": eventCount,
+                        "pageIdentityVerified": true, "nativeClipboard": value]
+            } catch let failure as SafariNativeClipboard.Failure {
+                throw Failure(code: failure.code, message: failure.message)
+            }
         }
         switch request.action {
         case "select":
@@ -963,6 +1095,11 @@ final class SafariLiveInput: @unchecked Sendable {
         }
         var result: [String: Any] = ["action": request.action, "backend": "macOS Accessibility + CGEvent",
                                     "eventsPosted": eventCount, "pageIdentityVerified": true]
+        if let modalPlan {
+            result["nativeModal"] = try completeModal(modalPlan, context: context, eventCount: &eventCount)
+            result["eventsPosted"] = eventCount
+            return result
+        }
         if request.action == "click" {
             // The delivered click may synchronously block WebKit with a real
             // JavaScript modal. Observe native state, never inject another read
@@ -1080,7 +1217,7 @@ final class SafariLiveInput: @unchecked Sendable {
         }
     }
 
-    private func postKey(source: CGEventSource, code: CGKeyCode, flags: CGEventFlags) throws {
+    private func postKey(source: CGEventSource, code: CGKeyCode, flags: CGEventFlags, didPost: () -> Void = {}) throws {
         guard let down = CGEvent(keyboardEventSource: source, virtualKey: code, keyDown: true),
               let up = CGEvent(keyboardEventSource: source, virtualKey: code, keyDown: false) else {
             throw Failure(code: "NATIVE_INPUT_FAILED", message: "Could not create native keyboard events.")
@@ -1088,6 +1225,7 @@ final class SafariLiveInput: @unchecked Sendable {
         down.flags = flags
         up.flags = []
         down.post(tap: .cghidEventTap)
+        didPost()
         up.post(tap: .cghidEventTap)
     }
 
@@ -1250,21 +1388,35 @@ final class SafariLiveInput: @unchecked Sendable {
         }
         origin.path = ""; origin.query = nil; origin.fragment = nil
         let originString = origin.string ?? ""
-        let labels = nativeNodes(dialog).compactMap { string($0, kAXValueAttribute) ?? string($0, kAXDescriptionAttribute) }
+        // The Safari-authored origin header is a direct static-text child.
+        // Never treat the dialog's own value, message subtree, or prompt field
+        // as origin evidence: those values are controlled by the webpage.
+        let headers = (attribute(dialog, kAXChildrenAttribute) as? [AXUIElement] ?? []).filter {
+            string($0, kAXRoleAttribute) == kAXStaticTextRole && string($0, kAXIdentifierAttribute) != "SFDialogViewMessageText"
+        }.compactMap { string($0, kAXValueAttribute) ?? string($0, kAXDescriptionAttribute) }
         let address = nodes.first { string($0, kAXIdentifierAttribute) == "WEB_BROWSER_ADDRESS_AND_SEARCH_FIELD" }
             .flatMap { string($0, kAXValueAttribute) }
         var noScheme = URLComponents(string: target.expectedURL)!
         noScheme.scheme = nil
         let displayed = String((noScheme.string ?? "").dropFirst(2)).trimmingCharacters(in: CharacterSet(charactersIn: "/"))
         let observed = address?.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
-        guard !originString.isEmpty, labels.contains(where: { $0.contains(originString) }),
+        guard !originString.isEmpty, headers.count == 1, Self.dialogHeaderMatchesOrigin(headers[0], expectedURL: target.expectedURL),
               address == target.expectedURL || observed == displayed else {
             throw Failure(code: "DIALOG_IDENTITY_CHANGED", message: "The JavaScript dialog's origin or selected page no longer matches the requested tab.")
         }
         return dialog
     }
 
-    private func dialogWindow(_ target: Target) throws -> AXUIElement {
+    static func dialogHeaderMatchesOrigin(_ header: String, expectedURL: String) -> Bool {
+        guard var origin = URLComponents(string: expectedURL), ["http", "https"].contains(origin.scheme ?? ""),
+              origin.host?.isEmpty == false, origin.user == nil, origin.password == nil else { return false }
+        origin.path = ""; origin.query = nil; origin.fragment = nil
+        guard let value = origin.string else { return false }
+        let escaped = NSRegularExpression.escapedPattern(for: value)
+        return header.range(of: "(^|[\\s「“\"'])" + escaped + "($|[\\s」”\"'：])", options: .regularExpression) != nil
+    }
+
+    private func dialogWindow(_ target: Target, expectedWindow: AXUIElement? = nil) throws -> AXUIElement {
         try requireCurrentAuthorization()
         try requireUnlockedSession()
         guard AXIsProcessTrusted(), let front = frontmostApplication(), Self.isAppleSafari(front),
@@ -1275,11 +1427,71 @@ final class SafariLiveInput: @unchecked Sendable {
         guard !inputState(.combinedSessionState).active else {
             throw Failure(code: "USER_INPUT_ACTIVE", message: "Release held modifier keys and mouse buttons before handling Safari dialogs.")
         }
-        guard let window = element(app, kAXFocusedWindowAttribute), let bounds = frame(window),
-              Self.close(bounds, target.windowBounds, tolerance: 8) else {
+        guard let focused = element(app, kAXFocusedWindowAttribute) else {
             throw Failure(code: "WINDOW_CHANGED", message: "The JavaScript dialog belongs to a different Safari window.")
         }
+        // An attached upload sheet can itself be AXFocusedWindow and has
+        // different bounds. Resolve only its exact native source ancestor;
+        // completeModal still compares that source with the opening-click
+        // window object before permitting any response or file selection.
+        var candidates = expectedWindow.map { [$0] } ?? [focused]
+        if expectedWindow == nil {
+            for candidate in (attribute(app, kAXWindowsAttribute) as? [AXUIElement] ?? []).prefix(64)
+                where !candidates.contains(where: { CFEqual($0, candidate) }) { candidates.append(candidate) }
+        }
+        let matches = candidates.filter { candidate in
+            frame(candidate).map { Self.close($0, target.windowBounds, tolerance: 8) } == true
+                && SafariFileChooser.focusedModalBelongsToSource(focused, source: candidate)
+        }
+        guard matches.count == 1, let window = matches.first else {
+            throw Failure(code: "WINDOW_CHANGED", message: "The native modal does not retain the exact focused source Safari window.")
+        }
         return window
+    }
+
+    static func dialogResponseButtonIndex(operation: String, type: String, buttonCount: Int,
+                                          defaultIndices: [Int], cancelIndices: [Int], enabled: Set<Int>, pressable: Set<Int>) throws -> Int {
+        guard ["accept", "dismiss"].contains(operation), ["alert", "confirm", "prompt"].contains(type),
+              type == "alert" ? buttonCount == 1 : buttonCount == 2 else {
+            throw Failure(code: "DIALOG_RESPONSE_UNVERIFIABLE", message: "Safari did not expose the exact native response-button structure.")
+        }
+        let selected: Int
+        if type == "alert" {
+            guard defaultIndices.allSatisfy({ $0 == 0 }), cancelIndices.allSatisfy({ $0 == 0 }) else {
+                throw Failure(code: "DIALOG_RESPONSE_UNVERIFIABLE", message: "Safari's native alert-button identity was inconsistent.")
+            }
+            selected = 0
+        } else {
+            guard let primary = defaultIndices.first, let cancel = cancelIndices.first,
+                  (0..<buttonCount).contains(primary), (0..<buttonCount).contains(cancel), primary != cancel,
+                  defaultIndices.allSatisfy({ $0 == primary }), cancelIndices.allSatisfy({ $0 == cancel }) else {
+                throw Failure(code: "DIALOG_RESPONSE_UNVERIFIABLE", message: "Safari did not identify distinct default and cancel buttons inside this exact native dialog.")
+            }
+            selected = operation == "accept" ? primary : cancel
+        }
+        guard enabled.contains(selected), pressable.contains(selected) else {
+            throw Failure(code: "DIALOG_RESPONSE_UNAVAILABLE", message: "The exact native response button is not enabled or does not support AXPress.")
+        }
+        return selected
+    }
+
+    private func dialogResponseButton(_ dialog: AXUIElement, window: AXUIElement, operation: String, type: String) throws -> AXUIElement {
+        let buttons = (attribute(dialog, kAXChildrenAttribute) as? [AXUIElement] ?? []).filter { string($0, kAXRoleAttribute) == kAXButtonRole }
+        let allButtons = nativeNodes(dialog).filter { string($0, kAXRoleAttribute) == kAXButtonRole }
+        guard allButtons.count == buttons.count else {
+            throw Failure(code: "DIALOG_RESPONSE_UNVERIFIABLE", message: "The native dialog contains an unexpected nested response control.")
+        }
+        func indices(_ name: String) -> [Int] {
+            [dialog, window].compactMap { element($0, name) }.map { value in buttons.firstIndex(where: { CFEqual($0, value) }) ?? -1 }
+        }
+        let enabled = Set(buttons.indices.filter { bool(buttons[$0], kAXEnabledAttribute) == true })
+        let pressable = Set(buttons.indices.filter { index in
+            var actions: CFArray?
+            return AXUIElementCopyActionNames(buttons[index], &actions) == .success && (actions as? [String])?.contains(kAXPressAction) == true
+        })
+        let index = try Self.dialogResponseButtonIndex(operation: operation, type: type, buttonCount: buttons.count,
+            defaultIndices: indices(kAXDefaultButtonAttribute), cancelIndices: indices(kAXCancelButtonAttribute), enabled: enabled, pressable: pressable)
+        return buttons[index]
     }
 
     private func requireCurrentAuthorization() throws {
@@ -1362,6 +1574,80 @@ final class SafariLiveInput: @unchecked Sendable {
         committed = true
     }
 
+    /// Safari suspends its extension callback loop while a native modal is open.
+    /// Observe and consume the explicit response in the app before replying to
+    /// the opening click, without a later JS round trip or a repeated click.
+    private func completeModal(_ plan: ModalPlan, context: Context, eventCount: inout Int) throws -> [String: Any] {
+        let base: [String: Any] = ["expectedUrl": context.request.expectedURL,
+                                  "windowBounds": Self.boundsData(context.request.windowBounds)]
+        let target = try Target(base)
+        let deadline = Date().addingTimeInterval(plan.timeout)
+        let originalAuthorization = currentAuthorization
+        currentAuthorization = { Date() < deadline && (originalAuthorization?() ?? true) }
+        defer { currentAuthorization = originalAuthorization }
+        // Wait only for our already-posted mouse-up to reach the native queue;
+        // this is not a retry or a substitute for observing the actual modal.
+        Thread.sleep(forTimeInterval: 0.05)
+        repeat {
+            if Date() >= deadline { break }
+            try requireCurrentAuthorization()
+            let window = try dialogWindow(target, expectedWindow: context.window)
+            guard CFEqual(window, context.window), focusedApplicationPID() == context.pid else {
+                throw Failure(code: "WINDOW_CHANGED", message: "The native modal's original Safari window changed after its delivered click.")
+            }
+            let dialog = try verifiedDialog(window, target: target)
+            let panels = nativeNodes(window).filter { string($0, kAXIdentifierAttribute) == "open-panel" }
+            if let dialog {
+                guard plan.kind == "dialog", panels.isEmpty else {
+                    throw Failure(code: "NATIVE_MODAL_MISMATCH", message: "Safari opened a JavaScript dialog instead of the explicitly approved upload. Nothing was dismissed or uploaded.")
+                }
+                let inspected = try handleDialog(base.merging(["operation": "inspect"]) { _, new in new })
+                guard let observed = inspected["dialog"] as? [String: Any],
+                      let id = observed["id"] as? String, let type = observed["type"] as? String,
+                      let message = nativeNodes(dialog).first(where: { string($0, kAXIdentifierAttribute) == "SFDialogViewMessageText" })
+                        .flatMap({ string($0, kAXValueAttribute) }), plan.matches(type: type, message: message) else {
+                    dialogLease = nil
+                    throw Failure(code: "NATIVE_MODAL_MISMATCH", message: "The actual JavaScript dialog type or exact message differs from the preregistered response. The dialog was left open; no response was guessed.")
+                }
+                guard let still = try verifiedDialog(window, target: target), CFEqual(still, dialog) else {
+                    throw Failure(code: "STALE_DIALOG", message: "The preregistered dialog changed before its one-time response.")
+                }
+                var response = base.merging(["operation": plan.accept! ? "accept" : "dismiss", "dialogId": id]) { _, new in new }
+                if let prompt = plan.promptText { response["promptText"] = prompt }
+                do { _ = try handleDialog(response) }
+                catch var failure as Failure { failure.eventsPosted += eventCount; throw failure }
+                eventCount += 1
+                return ["kind": "dialog", "type": type, "message": message, "accepted": plan.accept!,
+                        "promptTextApplied": plan.promptText != nil, "responseVerified": true, "done": true]
+            }
+            if !panels.isEmpty {
+                guard plan.kind == "upload", panels.count == 1 else {
+                    throw Failure(code: "NATIVE_MODAL_MISMATCH", message: "Safari opened a file chooser instead of the exact preregistered JavaScript dialog. No file was chosen and the panel was left open.")
+                }
+                do {
+                    guard try SafariFileChooser.files(plan.policy["files"], multiple: plan.multiple) == plan.files else {
+                        throw Failure(code: "UPLOAD_FILE_CHANGED", message: "An approved local file changed identity after the opening click. Nothing was uploaded.")
+                    }
+                    var command = base.merging(["action": "fileChooser", "operation": "inspect", "isMultiple": plan.multiple,
+                                                "scope": plan.scope.filter { $0.key != "accountScope" }]) { _, new in new }
+                    let authorized = { (try? self.requireCurrentAuthorization()) != nil && Date() < deadline }
+                    let inspected = try armedFileChooser.perform(command, authorized: authorized)
+                    guard let chooser = inspected["fileChooser"] as? [String: Any], let id = chooser["id"] as? String else {
+                        throw Failure(code: "FILE_CHOOSER_UNVERIFIABLE", message: "The approved source input did not retain an exact native file chooser.")
+                    }
+                    command["operation"] = "setFiles"; command["chooserId"] = id; command["files"] = plan.policy["files"]
+                    _ = try armedFileChooser.perform(command, authorized: authorized)
+                    return ["kind": "upload", "done": true, "fileCount": plan.files.count, "responseVerified": true]
+                } catch let failure as SafariFileChooser.Failure {
+                    throw Failure(code: failure.code, message: failure.message, eventsPosted: eventCount,
+                                  details: ["mutationApplied": failure.mutationApplied, "doNotReplay": true])
+                }
+            }
+            Thread.sleep(forTimeInterval: 0.025)
+        } while Date() < deadline
+        throw Failure(code: "NATIVE_MODAL_TIMEOUT", message: "The delivered click did not produce its exact preregistered native modal before the deadline. No response, automatic dismissal, or input replay was performed.")
+    }
+
     private func handleDialog(_ command: [String: Any]) throws -> [String: Any] {
         let target = try Target(command)
         let window = try dialogWindow(target)
@@ -1397,27 +1683,43 @@ final class SafariLiveInput: @unchecked Sendable {
               CFEqual(lease.node, dialog), CFEqual(lease.window, window), lease.url == target.expectedURL else {
             throw Failure(code: "STALE_DIALOG", message: "Inspect the current JavaScript dialog before responding; an earlier dialog cannot be replayed.")
         }
+        let button = try dialogResponseButton(dialog, window: window, operation: operation, type: type)
+        _ = try dialogWindow(target, expectedWindow: window)
         if let prompt = command["promptText"] as? String {
             guard operation == "accept", type == "prompt", prompt.utf16.count <= 20_000, let field = fields.first,
-                  AXUIElementSetAttributeValue(field, kAXValueAttribute as CFString, prompt as CFString) == .success else {
+                  AXUIElementSetAttributeValue(field, kAXValueAttribute as CFString, prompt as CFString) == .success,
+                  string(field, kAXValueAttribute) == prompt else {
                 throw Failure(code: "DIALOG_INPUT_FAILED", message: "Safari did not accept text in that JavaScript prompt.")
             }
         }
-        _ = try dialogWindow(target)
+        _ = try dialogWindow(target, expectedWindow: window)
         guard let current = try verifiedDialog(window, target: target), CFEqual(current, dialog),
-              let source = CGEventSource(stateID: .hidSystemState) else {
+              CFEqual(try dialogResponseButton(current, window: window, operation: operation, type: type), button) else {
             throw Failure(code: "STALE_DIALOG", message: "The JavaScript dialog changed before the response was delivered.")
         }
         dialogLease = nil
-        try postKey(source: source, code: operation == "accept" || type == "alert" ? 36 : 53, flags: [])
+        // Setting AXValue does not establish the prompt field's keyboard
+        // responder. Press Safari's exact native semantic button once instead
+        // of assuming Return reaches that responder. No key/click fallback or
+        // replay is allowed after an uncertain native response.
+        guard AXUIElementPerformAction(button, kAXPressAction as CFString) == .success else {
+            throw Failure(code: "DIALOG_RESPONSE_UNCERTAIN", message: "Safari did not confirm its one-time native dialog button action. Inspect current state; do not repeat it.", eventsPosted: 1,
+                          details: ["mutationApplied": true, "doNotReplay": true])
+        }
         let deadline = Date().addingTimeInterval(1)
-        repeat {
-            if !nativeNodes(window).contains(where: { string($0, kAXIdentifierAttribute) == "AXSafariModalDialog" && CFEqual($0, dialog) }) {
-                return ["done": true]
-            }
-            Thread.sleep(forTimeInterval: 0.025)
-        } while Date() < deadline
-        throw Failure(code: "DIALOG_OUTCOME_UNCONFIRMED", message: "The dialog response was delivered but closure was not confirmed. Inspect current state; do not repeat it.", eventsPosted: 2,
+        do {
+            repeat {
+                _ = try dialogWindow(target, expectedWindow: window)
+                if !nativeNodes(window).contains(where: { string($0, kAXIdentifierAttribute) == "AXSafariModalDialog" && CFEqual($0, dialog) }) {
+                    return ["done": true, "eventsPosted": 1, "nativeResponse": "AXPress"]
+                }
+                Thread.sleep(forTimeInterval: 0.025)
+            } while Date() < deadline
+        } catch {
+            throw Failure(code: "DIALOG_OUTCOME_UNCONFIRMED", message: "The native dialog button was pressed, but its exact source window or foreground changed before closure was confirmed. Inspect current state; do not repeat it.", eventsPosted: 1,
+                          details: ["mutationApplied": true, "doNotReplay": true])
+        }
+        throw Failure(code: "DIALOG_OUTCOME_UNCONFIRMED", message: "The native dialog button response was delivered but closure was not confirmed. Inspect current state; do not repeat it.", eventsPosted: 1,
                       details: ["mutationApplied": true, "doNotReplay": true])
     }
 

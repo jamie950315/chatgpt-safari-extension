@@ -92,6 +92,31 @@ final class SafariFileChooser {
         return observed == expected || observed.trimmingCharacters(in: CharacterSet(charactersIn: "/")) == withoutScheme.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
     }
 
+    static func modalFocusMatches(sourceIsFocused: Bool, focusedRole: String?, focusedIdentifier: String?, attachedToSource: Bool) -> Bool {
+        sourceIsFocused || focusedRole == kAXSheetRole && ["open-panel", "GoToWindow"].contains(focusedIdentifier ?? "") && attachedToSource
+    }
+
+    /// Safari can expose its attached open/Go-to sheet as AXFocusedWindow.
+    /// Only a recognized native sheet with the exact source in its public
+    /// parent chain may stand in for focus on that source window.
+    static func focusedModalBelongsToSource(_ focused: AXUIElement, source: AXUIElement) -> Bool {
+        if CFEqual(focused, source) { return true }
+        func attribute(_ node: AXUIElement, _ name: String) -> CFTypeRef? {
+            var value: CFTypeRef?
+            return AXUIElementCopyAttributeValue(node, name as CFString, &value) == .success ? value : nil
+        }
+        var visited = [focused], current = focused, attached = false
+        for _ in 0..<32 {
+            guard let parent = attribute(current, kAXParentAttribute), CFGetTypeID(parent) == AXUIElementGetTypeID() else { break }
+            let node = parent as! AXUIElement
+            if CFEqual(node, source) { attached = true; break }
+            if visited.contains(where: { CFEqual($0, node) }) { break }
+            visited.append(node); current = node
+        }
+        return modalFocusMatches(sourceIsFocused: false, focusedRole: attribute(focused, kAXRoleAttribute) as? String,
+                                 focusedIdentifier: attribute(focused, kAXIdentifierAttribute) as? String, attachedToSource: attached)
+    }
+
     static func nativeChildren(_ children: [AXUIElement], sheets: [AXUIElement], visited: [AXUIElement]) -> [AXUIElement] {
         var result: [AXUIElement] = []
         for node in children + sheets where !visited.contains(where: { CFEqual($0, node) }) && !result.contains(where: { CFEqual($0, node) }) {
@@ -251,7 +276,8 @@ final class SafariFileChooser {
                     .compactMap { string($0, kAXValueAttribute) }
                 return addresses.count == 1 && SafariFileChooser.matchesPageAddress(addresses[0], expected: target.url)
             }
-            guard matching.count == 1, let window = matching.first, let focused = element(app, kAXFocusedWindowAttribute), CFEqual(window, focused) else {
+            guard matching.count == 1, let window = matching.first, let focused = element(app, kAXFocusedWindowAttribute),
+                  SafariFileChooser.focusedModalBelongsToSource(focused, source: window) else {
                 throw Failure(code: "WINDOW_CHANGED", message: "The upload panel no longer belongs to the exact focused source Safari window.")
             }
             return (pid, app, window)

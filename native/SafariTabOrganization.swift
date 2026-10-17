@@ -27,6 +27,15 @@ final class SafariTabOrganization {
         var data: [String: Any] { ["index": index, "title": title, "url": url] }
     }
 
+    struct WindowSource: Equatable {
+        let pickerIdentifier: String
+        let groupTitle: String?
+        var kind: String { groupTitle == nil ? "ungrouped" : "named-tab-group" }
+        // A named collection needs its own positive sharing proof. A header
+        // alone never authorizes moving tabs out of a shared/unknown group.
+        var sharingState: String { groupTitle == nil ? "unshared" : "unknown" }
+    }
+
     struct Request {
         let action: String
         let target: SafariLiveInput.Target
@@ -38,8 +47,8 @@ final class SafariTabOrganization {
 
         init(_ command: [String: Any]) throws {
             guard let action = command["action"] as? String,
-                  ["inspect", "createGroup", "moveToGroup", "moveToUngrouped", "renameGroup", "selectGroup"].contains(action) else {
-                throw Failure(code: "INVALID_ARGUMENTS", message: "Expected inspect, createGroup, moveToGroup, moveToUngrouped, renameGroup, or selectGroup.")
+                  ["inspect", "inspectWindowSource", "createGroup", "moveToGroup", "moveToUngrouped", "renameGroup", "selectGroup"].contains(action) else {
+                throw Failure(code: "INVALID_ARGUMENTS", message: "Expected inspect, inspectWindowSource, createGroup, moveToGroup, moveToUngrouped, renameGroup, or selectGroup.")
             }
             if command["color"] != nil || command["collapsed"] != nil {
                 throw Failure(code: "UNSUPPORTED_GROUP_PROPERTY", message: "Safari Tab Groups do not expose Chrome group colors or collapse state.")
@@ -163,6 +172,14 @@ final class SafariTabOrganization {
         return String(identifier.dropFirst(prefix.count)).removingPercentEncoding
     }
 
+    static func windowSource(_ pickerIdentifiers: [String]) throws -> WindowSource {
+        guard !pickerIdentifiers.isEmpty, Set(pickerIdentifiers).count == 1,
+              let identifier = pickerIdentifiers.first, let title = groupTitle(identifier) else {
+            throw Failure(code: "WINDOW_SOURCE_UNVERIFIED", message: "Safari did not expose one exact native source collection identity. No window creation was delivered.")
+        }
+        return WindowSource(pickerIdentifier: identifier, groupTitle: title.isEmpty ? nil : title)
+    }
+
     static func selectedTabIdentity(_ tabs: [(identifier: String, title: String?)], pageURLs: [String]) throws -> SelectedTab {
         let active = tabs.enumerated().filter { entry in
             guard entry.element.identifier.hasPrefix("TabBarTab?"),
@@ -241,6 +258,32 @@ final class SafariTabOrganization {
                          actions: inout Int, mutationApplied: inout Bool,
                          tabBarRestoration: inout String?, sidebarRestoration: inout String?) throws -> [String: Any] {
         let request = context.request
+        if request.action == "inspectWindowSource" {
+            // windows.create moves a requested native tab, not a Tab Group.
+            // Observe the selected collection without clicking its picker or
+            // opening an unrelated group inventory/sharing menu.
+            func source() throws -> WindowSource {
+                let identifiers = nativeNodes(context.window).compactMap { node -> String? in
+                    guard let identifier = string(node, kAXIdentifierAttribute), identifier.hasPrefix("TabGroupPickerButton?"),
+                          frame(node).map({ !$0.isEmpty }) == true else { return nil }
+                    return identifier
+                }
+                return try Self.windowSource(identifiers)
+            }
+            try stable(context, isAuthorized: isAuthorized)
+            let observed = try source()
+            try stable(context, isAuthorized: isAuthorized)
+            guard try source() == observed else {
+                throw Failure(code: "WINDOW_SOURCE_CHANGED", message: "The native source collection changed during window-transfer preflight. No window creation was delivered.")
+            }
+            return ["action": request.action, "backend": "macOS Accessibility", "scope": "existing_safari_tabs",
+                    "windowIdentifier": context.windowIdentifier,
+                    "currentGroupTitle": observed.groupTitle as Any? ?? NSNull(),
+                    "currentGroupSharingState": observed.sharingState,
+                    "sourceCollection": ["kind": observed.kind, "sharingState": observed.sharingState,
+                                         "nativeWindowIdentifier": context.windowIdentifier],
+                    "actionsPerformed": 0, "mutationApplied": false]
+        }
         var revealedTabBar = false
         let originalSidebarVisible = nativeSidebarVisible(context)
         var sidebarRestoreAttempted = false

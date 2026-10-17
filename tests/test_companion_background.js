@@ -352,3 +352,47 @@ test("original favicon warmup invalidation is owner-bound and released with acco
   assert.equal(f.mentionListeners.size, 0);
   assert.equal(f.invalidations.length, 3, "open, auth change and close clear original agent developer capture");
 });
+
+test("native document reload receipts route only through the current embedded owner and never refresh its session", async () => {
+  const f = fixture({ embedded: true });
+  await f.binding.open(owner);
+  try {
+    const changes = f.sessionChanges.length;
+    for (const sequence of [-1, 0, 1.5, "1", 1_000_000_001]) {
+      f.setResponse({ ok: true, requests: [], documentRecoverySequence: sequence }); await f.binding.poll();
+    }
+    assert.equal(f.runtimeMessages.length, 0);
+    f.setResponse({ ok: true, requests: [], documentRecoverySequence: 1 });
+    await f.binding.poll(); await f.binding.poll();
+    assert.deepEqual(f.runtimeMessages, [{ type: "chatgpt-safari:provider-document-recovery", instanceId: owner.instanceId,
+      tabId: owner.tabId, windowId: owner.windowId, sequence: 1 }]);
+    assert.equal(f.sessionChanges.length, changes);
+    f.setResponse({ ok: true, requests: [], documentRecoverySequence: 2 }); await f.binding.poll();
+    assert.equal(f.runtimeMessages.at(-1).sequence, 2);
+    const count = f.runtimeMessages.length;
+    f.setResponse({ ok: true, requests: [], documentRecoverySequence: 1 });
+    await f.binding.frameRequest(owner, { operation: "host", method: "authStateChanged", params: { state: "signed_out" } });
+    await f.binding.poll();
+    assert.equal(f.runtimeMessages.length, count + 1, "Account teardown resets native receipt deduplication for the next session");
+  } finally { await f.binding.close(owner); }
+  const native = fixture();
+  native.setResponse({ ok: true, requests: [], documentRecoverySequence: 1 });
+  await native.binding.open(owner);
+  try { assert.equal(native.runtimeMessages.length, 0, "The nonembedded app profile has no wrapper receipt channel"); }
+  finally { await native.binding.close(owner); }
+});
+
+test("an in-flight receipt cannot target a replacement state even if its token and tab tuple are reused", async () => {
+  const f = fixture({ embedded: true });
+  await f.binding.open(owner);
+  let finish;
+  f.setResponse(command => command.action === "embeddedPoll"
+    ? new Promise(resolve => { finish = resolve; }) : { ok: true });
+  const oldPoll = f.binding.poll(), replacement = { ...owner };
+  await f.binding.open(replacement);
+  finish({ ok: true, requests: [], documentRecoverySequence: 3 }); await oldPoll;
+  assert.equal(f.runtimeMessages.length, 0);
+  f.setResponse({ ok: true, requests: [], documentRecoverySequence: 4 });
+  try { await f.binding.poll(); assert.equal(f.runtimeMessages[0].sequence, 4); }
+  finally { await f.binding.close(replacement); }
+});

@@ -21,6 +21,9 @@ This is a development-signed conversion of Chrome extension 1.26.1005.11759.
   signal to its exact wrapper. Re-entry must retain the same account/provider
   scope; never refresh the session to hide this failure, put keys in storage or
   cookies, or expose a bridge token in the error document.
+  Recovery requires a newer native document receipt paired with the current
+  authenticated channel's unload checkpoint. Ignore unsolicited/stale signals;
+  permit only one same-account re-entry until a fresh document handshake.
 - Establish the exact-frame provider channel from its capability-bound document
   readiness signal before original entry initialization. Waiting for iframe
   `load` deadlocks the original context loader when module compilation delays it.
@@ -76,27 +79,75 @@ This is a development-signed conversion of Chrome extension 1.26.1005.11759.
   preserve real frame sender/document chains for cross-origin locators. Never
   move upstream `Dc` into MAIN: its required realm lockdown freezes page
   intrinsics. Public Safari AppleEvents cannot select an isolated realm.
-- Clipboard state belongs to the original session, not the OS clipboard.
-  Intercept clipboard chords in every DOM/CUA/locator key route. Console capture
-  starts at claim, is bounded to the active turn/five minutes, and must be
-  released on account/owner/turn teardown. Asset bundles use the existing
-  operation-bound private writer and original consent, not fabricated paths.
+  Locators, open shadow roots, native option selection, dialogs, uploads and
+  viewport/cropped/full-page screenshots keep their original high-level API
+  routes; do not replace trusted native input with DOM-dispatched events.
+- Clipboard API items belong to the original session. `SafariNativeClipboard`
+  temporarily bridges supported plain/HTML/RTF/PNG/TIFF/JPEG/PDF items through
+  NSPasteboard and native shortcuts. Preserve every prior item/type/data only in
+  memory; restore only after the exact node/document/snapshot/nonce-bound trusted
+  event receipt, with observed-generation checks. Never import unknown copy/cut
+  generations, expose prior clipboard data, dereference file URLs, or claim
+  public pasteboard APIs provide cross-process atomic writer identity. Unknown
+  delivered copy/cut retains prior memory even before publication. Late exact
+  receipts may finish cleanup; newer observed generations must not be overwritten.
+  Do not restart the app while `live_status.clipboard.pending` is true.
+  Intercept clipboard chords in every DOM/CUA/locator key route.
+  Console capture starts at claim/navigation, is bounded to 500 messages and the
+  active turn/five minutes, and releases on account/owner/turn teardown. Asset
+  bundles use the operation-bound private writer and original download/fetch
+  consent, not fabricated paths.
+- `native/SafariViewport.swift` and `Resources/safari/viewport-background.js`
+  resize the real ordinary Safari window, not CDP device metrics, DPR, mobile
+  emulation or page zoom. Resolve the current turn's claimed logical-active tab;
+  never guess a focused user tab. Require the sidebar's same native window,
+  exact document/CSS measurements and signed native foreground/window proof.
+  Preserve the first original bounds; make at most three measured adjustments.
+  Only a genuinely completed sidebar-owner restoration may `commitReturnPage`
+  for rollback. It must not expand normal resize/check page authority. Reset
+  and turn/owner/account cleanup never select tabs, activate windows, or overwrite
+  manual focus/move/resize/URL changes. Preserve an unconfirmed native lease and
+  its explicit `live_status.viewport` outcome rather than silently losing it.
 - History uses trusted SFExtensionProfileKey observations and exact read-only
   metadata/store binding. Unknown mappings never select a default store.
   Bookmarks use a capability-addressed inert temporary page and native editor;
   preserve the owning sidebar and never write Safari's live plist. Row handles
-  bind native identity, profile, and account epoch.
+  bind native identity, profile, and account epoch. Await the sole temporary
+  tab's exact completed navigation; do not create another tab after a readiness
+  race. Bind the editor to its retained utility address and unique native
+  outline/title; Safari's editor need not expose a WebArea. CRUD uses real
+  Add Bookmark/editor/context-menu actions with exact
+  destination and complete before/after hierarchy proof. Built-in collections
+  are protected; nonempty folder deletion requires `removeTree`. Movement uses
+  trusted native drag into an explicit visible folder, appends only, and verifies
+  the entire subtree and unrelated hierarchy. No root drops, explicit insertion
+  indices, offscreen targets, or replay of an uncertain mutation.
 - `SafariFileChooser` accepts only a native-opened panel and its exact observed
   DOM input/profile/document/owner/session/turn lease. Keep original upload
   approval, native file/path readback, and no-replay outcomes. Never substitute
   DOM file assignments or guessed inputs. Native input authorization is checked
   again after serial-queue admission and before later events.
+- The original Tab capabilities `nativeDialogs.run` and `nativeUploads.run`
+  register one native click plus its exact response before Safari suspends
+  extension callbacks. Keep the original browser/upload security gate.
+  Dialogs require a known exact type/full message and explicit accept boolean;
+  only an accepting prompt may set prompt text. Uploads require one visible,
+  enabled top-level/same-origin file input, explicit regular same-directory
+  files and the actual multiple attribute. Recheck document/node/file inode
+  after approval. Both default to and allow at most 10 seconds. A source/window/
+  origin/type/message mismatch or focus change leaves the modal untouched;
+  never replay the click. Ordinary click/getJsDialog and filechooser-event
+  contracts remain, but unarmed modal round trips can stall and may require
+  manual dismissal. Do not claim them as installed working from native-only proof.
 - Notifications use the containing app's real UserNotifications authorization
   and scheduling acknowledgment. Only an explicit diagnostics button requests
   permission; no silent empty successes or invented display receipts.
 - Chat tab mentions retain the original consent-gated `executeTabRead` extractor.
   Use its existing 80,000-character traversal/output bounds; do not replace Chat
   requests or turn the owner-only `tabContext` event into cross-tab page access.
+  Native Ask ChatGPT attaches selected text, rather than inserting composer text.
+  Website prompt invocations may prefill the composer; neither path submits
+  automatically or replaces an existing draft.
 - Work's management capability uses actual Safari tab APIs and native named
   Tab Groups through `SafariTabOrganization`. Require claimed tabs for changes,
   exact native window/page/title identity, and operation-bound cancellation.
@@ -116,12 +167,24 @@ This is a development-signed conversion of Chrome extension 1.26.1005.11759.
   Reject duplicate names and shared or unverifiable groups. Do not advertise
   unsupported management methods or fabricate Chrome-only audit snapshots.
 - Work downloads inspect a current DOM link, then run the original download
-  consent/policy before same-origin Safari fetch. Bind each 48 KiB chunk and
+  consent/policy before ordinary-profile Safari fetch. Cross-origin HTTP(S)
+  links additionally require real credentialed CORS. Bind each 48 KiB chunk and
   native writer call to the live operation/profile/owner/document/link. Reject
-  redirects, cross-origin/blob/JavaScript-button downloads; cap at 32 MiB/30 s.
+  unapproved redirects and blob/JavaScript-button verified downloads; cap at
+  32 MiB/30 s. Never infer completion from a click or a new file in Downloads.
   Save completed files privately in Downloads with collision-safe names and
   quarantine; never open them automatically. Cancel partials on owner change,
   background restart, failure, timeout, and shutdown. No cookies leave Safari.
+- `Tab.content.exportGsuite` derives official Google Workspace export URLs;
+  `exportYouTubeTranscript` uses a fixed current-video player/timedtext helper
+  and restores the prior captions state. Keep original download approval,
+  account/profile/owner/session/turn/document binding and bounded native writing;
+  return paths only after real bytes are saved. Generic `Tabs.content` and
+  `ContentAPI.export` remain disabled as in the original extension.
+- WebMCP remains unadvertised: the installed fixed provider probe exposed no
+  `document.modelContext.getTools/executeTool`. Never invent a provider or tools.
+  Top Sites/recently closed lack a verified Safari profile-bound provider;
+  preserve explicit errors rather than history substitutes or fake restore IDs.
 - Safari does not implement manifest `sandbox.pages`. The original packaged
   worker runs at a separate capability-bound `chatgpt-kernel-*.localhost` origin
   served by `CompanionControlServer`, without extension APIs, credentials, or
@@ -201,6 +264,18 @@ Preserve original downloads, browser profiles, login state, drafts, and user
 tabs. Test only owned pages, do not restart Safari, and stop owned probes.
 Do not alter the installed OpenAI app/plugin or Chrome host registration.
 Build artifacts, private configuration backups, and probe reports stay ignored.
+Use only owned synthetic bookmarks for acceptance; do not send private bookmark
+inventories to the cloud agent.
+
+Current installed acceptance remains open for dialog responses, uploads,
+bookmark CRUD, YouTube transcript export, new blank-tab lifecycle, and updated
+website prompt prefill/provider-reload lifecycle. Keep source/protocol checks separate from
+original Work completion and retain still-valid accepted results below.
+
+Installed native Ask ChatGPT passed selected-text attachment in the same
+conversation: an empty composer remained empty with Send disabled and no
+submission. A second selection retained the exact existing composer draft
+alongside its attachment.
 
 The installed original sidebar Work agent passed existing-tab text entry,
 Apply button input/readback, and same-tab Next page navigation with the ordinary
@@ -208,6 +283,23 @@ HTTP-only session retained. The conversation survived inline remount and its
 response finished normally. This path used the original cloud agent and native
 backend, without a separate MCP client or isolated website session. Keep future
 acceptance distinct from tunnel-only and isolated-worker checks.
+
+The installed original Work path also read open-shadow and same/cross-origin
+frame content, selected Blue with trusted native input, round-tripped its virtual
+clipboard text, read the full-page bottom and saved an observed SVG asset bundle
+with its real manifest and no failures. Its response finished normally. The
+bundle directory was mode 0700; completed files were mode 0600 with quarantine.
+
+The installed original Work viewport capability set exact CSS dimensions
+1200x650, reset successfully, and finished normally. A fresh same-page read
+confirmed the original 1473x836 viewport; native status reported no active lease
+and restoration `restored`. This is original Work acceptance, not MCP-only proof.
+
+The installed original Work path captured a new claimed-page console event after
+trusted note/Apply input, then completed a credentialed CORS download with the
+original one-time source and exact-destination approvals. The real file matched
+the exact 53-byte UTF-8 response, including Chinese text, with mode 0600 and
+quarantine; the original response finished normally.
 
 The installed original Work sidebar also claimed two specified scratch tabs,
 reordered them through Safari tab APIs, and read back their exact final order.
@@ -223,3 +315,12 @@ foreground/window checks and stop on manual focus changes. Safe selection
 diagnostics report fixed failure stages/codes, not page contents or credentials;
 management errors retain fixed native outcome fields in their message because
 the upstream kernel does not preserve arbitrary error metadata.
+
+Installed original Work rich clipboard acceptance passed HTML paste, rich
+copy/cut and paste-back, and a 68-byte PNG paste with a trusted Files event and
+one editor image. Native status confirmed restoration with no pending recovery.
+
+Installed original Work Google Sheets CSV export passed with 1,408 real bytes,
+30 data rows, mode 0600 and quarantine. Ordinary windows.create passed once for
+an existing claimed scratch tab, retaining its native tab ID and URL. Blank-tab
+create/claim/goto remains a separate acceptance gate.

@@ -31,6 +31,7 @@ import Foundation
         precondition(openedState["ok"] as? Bool == true)
         precondition((openedState["state"] as? [String: Any])?["ownerAvailable"] as? Bool == true)
         precondition((command("embeddedEntry")["entry"] as? [String: Any])?["authentication"] != nil)
+        precondition(command("embeddedPoll")["documentRecoverySequence"] == nil)
         precondition(command("embeddedBrowserSession")["session"] is NSNull)
         precondition(command("embeddedAuth", fields: ["authOperation": "open"])["ok"] as? Bool == true && opened == [false])
         precondition(command("embeddedAuth", fields: ["authOperation": "importCookies"])["ok"] as? Bool == false)
@@ -40,12 +41,15 @@ import Foundation
         sessionResult = .success(())
         precondition(command("embeddedAuth", fields: ["authOperation": "resume"])["ok"] as? Bool == true)
         precondition((command("embeddedEntry")["entry"] as? [String: Any])?["providerURL"] is String)
+        precondition(command("embeddedPoll")["documentRecoverySequence"] as? Int == 0)
+        precondition(command("embeddedPoll", token: "stale")["ok"] as? Bool == false)
         let epoch = controller.authorization(owner: owner, profile: profile)
         precondition(epoch != nil && controller.authorization(owner: "stale", profile: profile) == nil)
         let expired = command("embeddedAuth", fields: ["state": "expired"])
         precondition((expired["authentication"] as? [String: Any])?["state"] as? String == "expired")
         precondition(cancelled == [owner] && command("embeddedBrowserSession")["session"] is NSNull)
         precondition(controller.authorization(owner: owner, profile: profile) == nil)
+        precondition(command("embeddedPoll")["documentRecoverySequence"] == nil)
         hold = true
         var resumed: [String: Any]?
         controller.handle(command: ["action": "embeddedAuth", "ownerToken": owner, "authOperation": "resume"]) { resumed = $0 }

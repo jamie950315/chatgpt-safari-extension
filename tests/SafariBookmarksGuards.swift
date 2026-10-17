@@ -1,7 +1,60 @@
 import Foundation
 
 @main struct SafariBookmarksGuardChecks {
+    private final class SurfaceNode {
+        let role: String
+        let identifier: String?
+        var children: [SurfaceNode]
+        init(_ role: String, _ identifier: String? = nil, _ children: [SurfaceNode] = []) {
+            self.role = role; self.identifier = identifier; self.children = children
+        }
+    }
     static func main() throws {
+        let outline = SurfaceNode("AXOutline", "Bookmarks", (0..<3000).map { _ in SurfaceNode("AXRow") })
+        let address = SurfaceNode("AXTextField", "WEB_BROWSER_ADDRESS_AND_SEARCH_FIELD")
+        let search = SurfaceNode("AXTextField", "BookmarksSearchField")
+        let window = SurfaceNode("AXWindow", nil, [SurfaceNode("AXGroup", nil, [outline, search]), SurfaceNode("AXToolbar", nil, [address])])
+        var traversedContents = false
+        func surface(_ root: SurfaceNode, limit: Int = 2048, depth: Int = 24) -> [SurfaceNode]? {
+            SafariBookmarks.editorSurfaceNodes(root, children: {
+                if $0 === outline { traversedContents = true }
+                return $0.children
+            }, role: { $0.role }, identifier: { $0.identifier }, equal: { $0 === $1 }, limit: limit, maximumDepth: depth)
+        }
+        let chrome = surface(window)!
+        precondition(!traversedContents && chrome.count == 6 && chrome.contains { $0 === address } && chrome.contains { $0 === search },
+                     "Expanded bookmark inventory must not consume or delay the separate native chrome identity traversal")
+        let foreignPage = SurfaceNode("AXWebArea", nil, [SurfaceNode("AXOutline", "Bookmarks")])
+        window.children.append(foreignPage)
+        let withPage = surface(window)!
+        precondition(withPage.contains { $0 === foreignPage } && withPage.filter { $0.identifier == "Bookmarks" }.count == 1,
+                     "A web document remains visible as disqualifying identity evidence; its DOM cannot provide a native outline")
+        window.children.removeLast()
+        let secondOutline = SurfaceNode("AXOutline", "Bookmarks")
+        window.children.append(secondOutline)
+        precondition(surface(window)!.filter { $0.identifier == "Bookmarks" }.count == 2,
+                     "Pruning inventory cannot hide another native editor surface")
+        window.children.removeLast()
+        precondition(surface(window, limit: 5) == nil && surface(window, depth: 1) == nil,
+                     "A partial native chrome tree cannot establish exact editor identity")
+        window.children.append(window.children[0])
+        precondition(surface(window)!.count == 6, "Duplicate AXChildren/AXSheets identities must be counted once")
+        let utility = "http://chatgpt-utility-fixture.localhost:1234/bookmarks/synthetic"
+        for address in [nil, "", utility, String(utility.dropFirst("http://".count)), "bookmarks://"] {
+            precondition(SafariBookmarks.editorReadiness(address: address, utilityURL: utility, nativeOutlineCount: 0, nativeTitleMatchesOutline: true, hasWebArea: false) == .waiting)
+        }
+        precondition(SafariBookmarks.editorReadiness(address: "bookmarks://", utilityURL: utility, nativeOutlineCount: 1, nativeTitleMatchesOutline: true, hasWebArea: false) == .ready)
+        precondition(SafariBookmarks.editorReadiness(address: "bookmarks://", utilityURL: utility, nativeOutlineCount: 2, nativeTitleMatchesOutline: true, hasWebArea: false) == .waiting)
+        for address in [utility, String(utility.dropFirst("http://".count))] {
+            precondition(SafariBookmarks.editorReadiness(address: address, utilityURL: utility, nativeOutlineCount: 1, nativeTitleMatchesOutline: true, hasWebArea: false) == .ready,
+                         "The observed native editor keeps the exact source in its address field")
+            precondition(SafariBookmarks.editorReadiness(address: address, utilityURL: utility, nativeOutlineCount: 1, nativeTitleMatchesOutline: true, hasWebArea: true) == .waiting,
+                         "An ordinary web page must not impersonate the native editor outline")
+            precondition(SafariBookmarks.editorReadiness(address: address, utilityURL: utility, nativeOutlineCount: 1, nativeTitleMatchesOutline: false, hasWebArea: false) == .waiting)
+        }
+        for address in ["https://example.test/other", "file:///tmp/test", "Unverified native label"] {
+            precondition(SafariBookmarks.editorReadiness(address: address, utilityURL: utility, nativeOutlineCount: 1, nativeTitleMatchesOutline: true, hasWebArea: false) == .changed)
+        }
         let identity = SafariBookmarks.Identity(parents: ["Favorites", "Research"], title: "Example", url: "https://example.test/")
         let record = SafariBookmarks.Record(identity: identity, depth: 2, index: 0)
         let position = try SafariBookmarks.resolve(identity, in: [record])

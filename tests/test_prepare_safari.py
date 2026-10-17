@@ -52,6 +52,35 @@ assert.equal(calls,0);listener(event);
 setImmediate(()=>{assert.equal(calls,1);assert.equal(response.id,"fixture");assert.equal(response.ok,true);assert.equal(closed,true)});
 '''.replace("SOURCE", json.dumps(source)))
 
+    def test_native_modal_capabilities_use_original_click_transport_and_parse_in_the_real_worker(self):
+        helper = module.prepare_safari_agent
+        host = helper.prepare_kernel_host((ROOT / "unpacked" / helper.KERNEL_HOST).read_text())
+        worker = helper.prepare_kernel_worker((ROOT / "unpacked" / helper.KERNEL_WORKER).read_text())
+        self.assertEqual(helper.prepare_kernel_worker(worker), worker)
+        self.assertIn("safari_native_modal:Lt().optional()", host)
+        self.assertIn('"capabilities/tab/nativeDialogs":', host)
+        self.assertIn('"capabilities/tab/nativeUploads":', host)
+        self.run_javascript(r'''
+const assert=require("node:assert/strict"),vm=require("node:vm");
+const bundle=WORKER,start=bundle.indexOf("var c=")+6,end=bundle.indexOf("`,o=typeof self",start)+1;
+assert.ok(start>5&&end>start);const worker=vm.runInNewContext(bundle.slice(start,end));new vm.Script(worker);
+const calls=[],actual={kind:"dialog",type:"prompt",message:"Exact?",accepted:true,responseVerified:true,done:true};
+class Base{constructor(transport,browserId,tabId,documentation,info){Object.assign(this,{transport,browserId,tabId,documentation,info})}}
+const scope={Base,click:payload=>({type:"playwright_locator_click",...payload}),define:value=>value};
+vm.createContext(scope);vm.runInContext(SDK,scope);
+const transport={async send(value){calls.push(value.command);return actual}};
+const options={browserId:"0",tabId:"12",transport};
+const dialog=new scope.SafariNativeDialogsDefinition.capability(options),upload=new scope.SafariNativeUploadsDefinition.capability(options);
+(async()=>{
+assert.equal(await dialog.run({selector:"button",type:"prompt",message:"Exact?",accept:true,promptText:"Answer"}),actual);
+assert.equal(calls[0].type,"playwright_locator_click");assert.equal(calls[0].tab_id,"12");assert.equal(calls[0].safari_native_modal.timeout_ms,10000);
+assert.equal(calls[0].safari_native_modal.promptText,"Answer");
+await upload.run({selector:"input[type=file]",files:["/owned/fixture.txt"]});
+assert.equal(calls[1].safari_native_modal.kind,"upload");assert.equal(calls[1].safari_native_modal.files[0],"/owned/fixture.txt");
+await assert.rejects(dialog.run({selector:"button",force:true}),/exact native dialog/);assert.equal(calls.length,2);
+})().catch(error=>{console.error(error);process.exitCode=1});
+'''.replace("WORKER", json.dumps(worker)).replace("SDK", json.dumps(helper.native_modal_sdk("Base", "click", "define"))))
+
     def test_original_tab_context_reads_open_authenticated_tabs_with_bounded_content(self):
         background = module.prepare_safari_agent.prepare_background(module.prepare(module.SOURCE.read_text()))
         # Execute only the preserved reader functions, never the application

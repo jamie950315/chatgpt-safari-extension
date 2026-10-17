@@ -56,6 +56,32 @@ try {
   api.runtime.onMessage?.addListener(mentionInvalidated);
   let entry, frame, authScreen, previousContext, providerDocument;
   let recoveryPending = false, recoveryAttempted = false;
+  let documentRecoverySequence, unloadedRecoverySequence;
+  const validRecoverySequence = value => Number.isSafeInteger(value) && value >= 0 && value <= 1_000_000_000;
+  function checkpointRecovery() {
+    if (channel && unloadedRecoverySequence === undefined) channel.postMessage({ type: "document_recovery_checkpoint", sequence: documentRecoverySequence });
+  }
+  function tryRecover() {
+    if (disposed || authScreen || recoveryPending || recoveryAttempted || !providerDocument
+      || !validRecoverySequence(unloadedRecoverySequence) || unloadedRecoverySequence < entry.documentRecoverySequence
+      || documentRecoverySequence <= unloadedRecoverySequence) return;
+    if (typeof entry.accountScope !== "string" || !entry.accountScope) {
+      fail(new Error("ChatGPT could not reconnect. Close and reopen the sidebar to continue.")); return;
+    }
+    recoveryPending = true; recoveryAttempted = true;
+    clearInterval(interval); channel?.close(); channel = undefined;
+    void loadProvider(entry.accountScope).catch(fail).finally(() => { recoveryPending = false; });
+  }
+  const recoveryReceipt = (message, sender) => {
+    if (disposed || sender.id !== api.runtime.id || sender.tab != null || message?.type !== "chatgpt-safari:provider-document-recovery"
+      || message.instanceId !== owner.instanceId || message.tabId !== owner.tabId || message.windowId !== owner.windowId
+      || !validRecoverySequence(message.sequence) || message.sequence <= 0 || !entry
+      || message.sequence <= documentRecoverySequence) return;
+    documentRecoverySequence = message.sequence;
+    checkpointRecovery();
+    tryRecover();
+  };
+  api.runtime.onMessage?.addListener(recoveryReceipt);
   async function loadProvider(expectedAccountScope) {
     const next = await invoke({ operation: "entry" });
     if (disposed) return;
@@ -68,11 +94,13 @@ try {
     }
     const url = new URL(next.providerURL);
     if (url.protocol !== "http:" || !/^chatgpt-provider-[a-z0-9-]+\.localhost$/u.test(url.hostname)
-      || url.origin !== next.providerOrigin || typeof next.bridgeToken !== "string" || next.bridgeToken.length < 32) {
+      || url.origin !== next.providerOrigin || typeof next.bridgeToken !== "string" || next.bridgeToken.length < 32
+      || !validRecoverySequence(next.documentRecoverySequence)) {
       throw new Error("The native relay returned an invalid provider address");
     }
     clearInterval(interval); channel?.close(); channel = undefined;
     providerDocument = undefined; previousContext = undefined; entry = next; authScreen = undefined;
+    documentRecoverySequence = next.documentRecoverySequence; unloadedRecoverySequence = undefined;
     frame = document.createElement("iframe");
     frame.title = "ChatGPT side chat";
     frame.referrerPolicy = "no-referrer";
@@ -121,31 +149,26 @@ try {
     else surface.replaceChildren(screen);
   }
   async function observeContext() {
-    if (disposed || !channel) return;
-    const value = await host("context", { includeSelection: true });
+    if (disposed || !channel || unloadedRecoverySequence !== undefined) return;
+    const observedChannel = channel, observedDocument = providerDocument;
+    const stillCurrent = () => !disposed && channel === observedChannel && providerDocument === observedDocument && unloadedRecoverySequence === undefined;
+    let value;
+    try { value = await host("context", { includeSelection: true }); }
+    catch (error) { if (stillCurrent()) throw error; else return; }
+    if (!stillCurrent()) return;
     const next = JSON.stringify(value.context);
     if (previousContext != null && previousContext !== next) {
-      channel.postMessage({ type: "event", payload: { type: "browser_side_chat_context_invalidated", protocolVersion: 2 } });
+      observedChannel.postMessage({ type: "event", payload: { type: "browser_side_chat_context_invalidated", protocolVersion: 2 } });
     }
     previousContext = next;
   }
   window.addEventListener("message", event => {
     if (disposed || !frame || !event.isTrusted || event.source !== frame.contentWindow || event.origin !== entry.providerOrigin) return;
-    if (event.data?.type === "chatgpt-safari-provider:document-capability-missing") {
-      if (recoveryPending) return;
-      if (recoveryAttempted || typeof entry.accountScope !== "string" || !entry.accountScope) {
-        fail(new Error("ChatGPT could not reconnect. Close and reopen the sidebar to continue.")); return;
-      }
-      recoveryPending = true; recoveryAttempted = true;
-      clearInterval(interval); channel?.close(); channel = undefined;
-      void loadProvider(entry.accountScope).catch(fail).finally(() => { recoveryPending = false; });
-      return;
-    }
     if (event.data?.type !== "chatgpt-safari-provider:ready" || event.data.token !== entry.bridgeToken
       || typeof event.data.documentId !== "string" || !/^[0-9a-f-]{36}$/iu.test(event.data.documentId)
       || event.data.documentId === providerDocument) return;
     providerDocument = event.data.documentId;
-    recoveryAttempted = false;
+    recoveryAttempted = false; unloadedRecoverySequence = undefined;
     clearInterval(interval);
     channel?.close();
     const pair = new MessageChannel();
@@ -154,7 +177,17 @@ try {
     let inFlight = 0;
     channel.onmessage = async ({ data }) => {
       if (disposed || channel !== ownedChannel) return;
+      if (data?.type === "provider_document_unloaded") {
+        if (unloadedRecoverySequence !== undefined || !validRecoverySequence(data.recoverySequence)
+          || data.recoverySequence < entry.documentRecoverySequence || data.recoverySequence > documentRecoverySequence) return;
+        unloadedRecoverySequence = data.recoverySequence;
+        clearInterval(interval);
+        tryRecover();
+        return;
+      }
+      if (unloadedRecoverySequence !== undefined) return;
       if (data?.type === "ready") {
+        checkpointRecovery();
         clearInterval(interval);
         interval = setInterval(() => { void observeContext().catch(fail); }, 1000);
         void observeContext().catch(fail);
@@ -177,12 +210,14 @@ try {
         if (!disposed && channel === currentChannel) currentChannel.postMessage({ type: "reply", id: data.id, error: error.message });
       } finally { inFlight--; }
     };
-    frame.contentWindow.postMessage({ type: "chatgpt-safari-provider:connect", token: entry.bridgeToken }, entry.providerOrigin, [pair.port2]);
+    frame.contentWindow.postMessage({ type: "chatgpt-safari-provider:connect", token: entry.bridgeToken,
+      documentRecoverySequence }, entry.providerOrigin, [pair.port2]);
   });
   window.addEventListener("pagehide", () => {
     disposed = true; clearInterval(interval); channel?.close(); api.storage?.onChanged?.removeListener(storageChanged);
     for (const name of tabEvents) api.tabs?.[name]?.removeListener(tabsChanged);
     api.runtime.onMessage?.removeListener(mentionInvalidated);
+    api.runtime.onMessage?.removeListener(recoveryReceipt);
   }, { once: true });
   await loadProvider();
 } catch (error) { fail(error); }

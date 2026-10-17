@@ -25,6 +25,13 @@ import ApplicationServices
         precondition(merged.count == 2 && CFEqual(merged[0], application) && CFEqual(merged[1], sheet))
         let unseen = SafariFileChooser.nativeChildren([application], sheets: [sheet, sameApplication], visited: [application])
         precondition(unseen.count == 1 && CFEqual(unseen[0], sheet), "AXSheets-only nodes must be traversed while duplicate edges and ancestor cycles are ignored")
+        precondition(SafariFileChooser.modalFocusMatches(sourceIsFocused: true, focusedRole: kAXWindowRole, focusedIdentifier: nil, attachedToSource: false))
+        for identifier in ["open-panel", "GoToWindow"] {
+            precondition(SafariFileChooser.modalFocusMatches(sourceIsFocused: false, focusedRole: kAXSheetRole, focusedIdentifier: identifier, attachedToSource: true))
+            precondition(!SafariFileChooser.modalFocusMatches(sourceIsFocused: false, focusedRole: kAXSheetRole, focusedIdentifier: identifier, attachedToSource: false), "An identically named sheet from another window must not inherit source authority")
+        }
+        precondition(!SafariFileChooser.modalFocusMatches(sourceIsFocused: false, focusedRole: kAXWindowRole, focusedIdentifier: "open-panel", attachedToSource: true))
+        precondition(!SafariFileChooser.modalFocusMatches(sourceIsFocused: false, focusedRole: kAXSheetRole, focusedIdentifier: "unrelated-dialog", attachedToSource: true))
         let root = FileManager.default.temporaryDirectory.appendingPathComponent("safari-filechooser-test-" + UUID().uuidString)
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: false)
         defer { try? FileManager.default.removeItem(at: root) }
@@ -77,6 +84,6 @@ import ApplicationServices
         let cancel = try chooser.perform(base, authorized: { true })["fileChooser"] as! [String: Any]
         _ = try chooser.perform(merging(["operation": "cancel", "chooserId": cancel["id"]!]), authorized: { true })
         precondition(native.cancels == 1)
-        print("File chooser protocol: exact source/native lease, observed multiple, explicit local files, cancellation, and uncertain-submission no-replay passed. No native UI or file contents were read.")
+        print("File chooser protocol: exact source/native lease, attached-sheet source focus, observed multiple, explicit local files, cancellation, and uncertain-submission no-replay passed. No native UI or file contents were read.")
     }
 }

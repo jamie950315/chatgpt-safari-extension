@@ -48,6 +48,15 @@
       && (!/^[1-9]\d*$/u.test(command.tab_id || "") || !Number.isSafeInteger(Number(command.tab_id))))) {
       throw new Error("A Safari agent command requires its browser and claimed tab IDs.");
     }
+    if (command.safari_native_modal !== undefined) {
+      if (command.type !== "playwright_locator_click") throw new Error("Only a single native locator click may preregister a modal response.");
+      if (command.safari_native_modal?.kind === "upload") {
+        const source = await context.api.executeUnhandledCommand({ type: "browser_safari_command",
+          command: { ...command, type: "safari_native_upload_inspect" } });
+        await context.security.ensureFileUploadAllowed(Number(command.tab_id));
+        return context.api.executeUnhandledCommand({ type: "browser_safari_command", command: { ...command, safari_upload_source: source } });
+      }
+    }
     if (["dom_cua_download_media", "playwright_locator_download_media", "cua_download_media"].includes(command.type)) {
       const link = await context.api.executeUnhandledCommand({ type: "browser_safari_command",
         command: { ...command, type: "safari_download_inspect", sourceType: command.type } });

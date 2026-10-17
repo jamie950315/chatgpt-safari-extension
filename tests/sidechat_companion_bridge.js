@@ -7,7 +7,7 @@ class MockEvent { constructor(type, options = {}) { this.type = type; Object.ass
 class MockCustomEvent extends MockEvent {}
 function fixture(options = {}) {
   const listeners = new Map(), documentListeners = new Map(), attributes = new Map();
-  const requests = [], messages = [], events = [];
+  const requests = [], messages = [], events = [], reports = [], intervals = new Map();
   const publishedCandidates = [];
   const composer = { textContent: "", isConnected: true };
   const actualOrigin = options.relay ? "http://chatgpt-provider-test.localhost:1234" : "https://chatgpt.com";
@@ -37,7 +37,7 @@ function fixture(options = {}) {
     window.ChatGPTSafariProviderRelay = {
       providerOrigin: actualOrigin, parentExtensionOrigin: "safari-web-extension://actual-owner",
       bridgeToken: "test-owner-token-at-least-32-characters", runtimeURL: "https://chatgpt.com/cdn/assets/633146.c3403bd103.js",
-      report: async () => {},
+      report: async value => { reports.push(value); },
       importURL: value => value.replace("https://chatgpt.com", actualOrigin),
       upstreamURL: value => value.replace(actualOrigin, "https://chatgpt.com"),
     };
@@ -55,47 +55,54 @@ function fixture(options = {}) {
     addEventListener: (type, callback) => on(documentListeners, type, callback),
     removeEventListener: (type, callback) => off(documentListeners, type, callback),
   };
+  let intervalID = 0;
   const sandbox = { window, document, location: { origin: actualOrigin, href: actualOrigin + "/?surface=browser_side_chat" },
     URL, Event: MockEvent, CustomEvent: MockCustomEvent, Date, console: { ...console }, setTimeout, clearTimeout, setInterval, clearInterval, queueMicrotask,
     crypto: require("node:crypto").webcrypto, __testRuntime: options.runtime };
+  if (options.manualIntervals) {
+    sandbox.setInterval = (callback, milliseconds) => { intervals.set(++intervalID, { callback, milliseconds }); return intervalID; };
+    sandbox.clearInterval = id => intervals.delete(id);
+  }
   const runtimeImport = 'import(relayMode ? relay.importURL(runtimeURL) : runtimeURL)';
   const input = options.runtime ? source.replace(runtimeImport, "Promise.resolve({ __webpack_require__: globalThis.__testRuntime })") : source;
   vm.runInNewContext(input, sandbox);
-  return { window, document, composer, requests, messages, events, attributes, publishedCandidates,
+  return { window, document, composer, requests, messages, events, attributes, publishedCandidates, reports,
     ready: sandbox.__CHATGPT_SAFARI_ADAPTER_READY__,
-    emitMessage: event => emit(listeners, { type: "message", ...event }),
+    emitMessage: event => emit(listeners, { type: "message", isTrusted: true, ...event }),
     input: () => emit(documentListeners, new MockEvent("input", { isTrusted: true })),
+    emitInput: event => emit(documentListeners, event instanceof MockEvent ? event : new MockEvent("input", event)),
+    tickReport: () => { for (const item of intervals.values()) if (item.milliseconds === 2000) item.callback(); },
     gesture: trusted => emit(documentListeners, new MockEvent("pointerdown", { isTrusted: trusted })) };
 }
 const flush = () => new Promise(resolve => setImmediate(resolve));
 
-async function invocationFixture() {
+async function invocationFixture(options = {}) {
   const runtime = { m: {}, c: {}, d(exports, getters) {
     for (const [name, get] of Object.entries(getters)) Object.defineProperty(exports, name, { get });
   } };
-  const f = fixture({ relay: true, runtime });
+  const f = fixture({ ...options, relay: true, runtime });
   await f.ready;
   const relay = f.window.ChatGPTSafariProviderRelay, sent = [];
-  const port = { close() {}, postMessage(message) {
+  const port = { close() { this.closed = true; }, postMessage(message) {
     sent.push(message);
     if (message.type === "request" && message.method !== "openInvocation") queueMicrotask(() => {
       port.onmessage({ data: { type: "reply", id: message.id, result: message.method === "tabMentions" ? { candidates: f.candidates || [] } : { ok: true } } });
     });
   } };
   f.emitMessage({ source: f.window.parent, origin: relay.parentExtensionOrigin,
-    data: { type: "chatgpt-safari-provider:connect", token: relay.bridgeToken }, ports: [port] });
+    data: { type: "chatgpt-safari-provider:connect", token: relay.bridgeToken, documentRecoverySequence: 0 }, ports: [port] });
   runtime.m.Kxt = () => {};
   const exports = {};
   runtime.m.Kxt({}, exports, runtime);
   let account = "account-a";
   const connection = new exports.BrowserSideChatConnection({ pageWindow: f.window, getAuthScope: () => account });
-  return { ...f, sent, connection, setAccount(value) { account = value; }, setCandidates(value) { f.candidates = value; },
+  return { ...f, sent, port, connection, setAccount(value) { account = value; }, setCandidates(value) { f.candidates = value; },
     respond(invocation) {
       const request = sent.filter(item => item.method === "openInvocation").at(-1);
       assert.ok(request);
       port.onmessage({ data: { type: "reply", id: request.id, result: { invocation } } });
     },
-    cleanup() { connection.dispose(); f.window.dispatchEvent(new MockEvent("pagehide")); } };
+    cleanup() { connection.dispose(); f.window.dispatchEvent(new MockEvent("pagehide", { isTrusted: true })); } };
 }
 
 test("the original invocation callback receives one signed-in prefill without submitting or overwriting drafts", async () => {
@@ -194,8 +201,12 @@ test("isolated provider uses its real parent/origin and a capability-bound chann
   const sent = [];
   const port = { postMessage: value => sent.push(value), close() {} };
   const connect = { source: f.window.parent, origin: relay.parentExtensionOrigin,
-    data: { type: "chatgpt-safari-provider:connect", token: relay.bridgeToken }, ports: [port] };
+    data: { type: "chatgpt-safari-provider:connect", token: relay.bridgeToken, documentRecoverySequence: 0 }, ports: [port] };
   f.emitMessage({ ...connect, origin: "https://unrelated.example" });
+  assert.equal(port.onmessage, undefined);
+  f.emitMessage({ ...connect, isTrusted: false });
+  assert.equal(port.onmessage, undefined, "Synthetic MessageEvents cannot establish an authenticated navigation channel");
+  f.emitMessage({ ...connect, data: { ...connect.data, documentRecoverySequence: -1 } });
   assert.equal(port.onmessage, undefined);
   f.emitMessage({ ...connect, origin: "safari-web-extension://ACTUAL-OWNER" });
   assert.equal(typeof port.onmessage, "function");
@@ -343,4 +354,84 @@ test("the version-bound native host boundary drives the original context and sub
   await flush();
   connection.dispose();
   await assert.rejects(connection.getContext(), /not available/);
+});
+
+
+test("provider reload arms only on trusted pagehide and uses its authenticated pre-navigation checkpoint", async () => {
+  for (const receiptBeforePagehide of [false, true]) {
+    const f = await invocationFixture();
+    f.port.onmessage({ data: { type: "document_recovery_checkpoint", sequence: 2 } });
+    assert.equal(f.messages.some(message => message.data?.type === "document_recovery_checkpoint"), false,
+      "Native recovery checkpoints are private host transport, never published to the website");
+    f.window.dispatchEvent(new MockEvent("beforeunload", { isTrusted: false }));
+    f.window.dispatchEvent(new MockEvent("pagehide", { isTrusted: false }));
+    assert.equal(f.sent.some(item => item.type === "provider_document_unloaded"), false);
+    f.window.dispatchEvent(new MockEvent("beforeunload", { isTrusted: true }));
+    assert.equal(f.sent.some(item => item.type === "provider_document_unloaded"), false,
+      "A cancelled beforeunload cannot itself trigger a remount");
+    if (receiptBeforePagehide) f.port.onmessage({ data: { type: "document_recovery_checkpoint", sequence: 3 } });
+    f.window.dispatchEvent(new MockEvent("pagehide", { isTrusted: true }));
+    const unloads = f.sent.filter(item => item.type === "provider_document_unloaded");
+    assert.equal(unloads.length, 1); assert.equal(unloads[0].recoverySequence, 2);
+    assert.equal(f.port.closed, true);
+    f.cleanup();
+  }
+});
+
+test("untrusted or regressing checkpoint data cannot authorize a provider reload", async () => {
+  const f = await invocationFixture();
+  f.port.onmessage({ data: { type: "document_recovery_checkpoint", sequence: 2 } });
+  for (const sequence of [1, -1, "5", 2.5, 1_000_000_001]) f.port.onmessage({ data: { type: "document_recovery_checkpoint", sequence } });
+  f.window.dispatchEvent(new MockEvent("beforeunload", { isTrusted: true }));
+  f.window.dispatchEvent(new MockEvent("pagehide", { isTrusted: true }));
+  assert.equal(f.sent.find(item => item.type === "provider_document_unloaded").recoverySequence, 2);
+  f.cleanup();
+  const withoutBeforeUnload = await invocationFixture();
+  withoutBeforeUnload.window.dispatchEvent(new MockEvent("pagehide", { isTrusted: true }));
+  assert.equal(withoutBeforeUnload.sent.some(item => item.type === "provider_document_unloaded"), false);
+  withoutBeforeUnload.cleanup();
+});
+
+test("provider reports reveal only composer health and trusted native input counts, never draft or event contents", async t => {
+  const f = await invocationFixture({ manualIntervals: true });
+  t.after(() => f.cleanup());
+  const nested = {}, unrelated = {}, send = { disabled: true, isConnected: true };
+  f.composer.textContent = "Synthetic private draft never reported";
+  f.composer.isContentEditable = true;
+  f.composer.contains = value => value === nested;
+  f.document.activeElement = nested;
+  const query = f.document.querySelector;
+  f.document.querySelector = selector => selector.startsWith("button[") ? send : query(selector);
+  const input = (target, isTrusted) => Object.defineProperty(new MockEvent("input", { target, isTrusted }), "data", {
+    get() { throw new Error("Diagnostic code must never read input contents"); },
+  });
+  f.emitInput(input(f.composer, false));
+  f.emitInput(input(unrelated, true));
+  f.tickReport();
+  assert.equal(f.reports.at(-1).trustedInputCounter, 0);
+  f.emitInput(input(nested, true));
+  f.tickReport();
+  const observed = f.reports.at(-1);
+  assert.equal(observed.trustedInputCounter, 1);
+  assert.equal(observed.composerHasText, true);
+  assert.equal(observed.composerFocused, true);
+  assert.equal(observed.composerEditable, true);
+  assert.equal(observed.sendDisabled, true);
+  assert.equal(JSON.stringify(observed).includes("Synthetic private draft"), false);
+  assert.equal(Object.hasOwn(observed, "draft"), false);
+  f.composer.textContent = "   "; f.composer.isContentEditable = false;
+  f.document.activeElement = unrelated; send.disabled = false;
+  f.tickReport();
+  assert.equal(f.reports.at(-1).composerHasText, false);
+  assert.equal(f.reports.at(-1).composerFocused, false);
+  assert.equal(f.reports.at(-1).composerEditable, false);
+  assert.equal(f.reports.at(-1).sendDisabled, false);
+  f.composer.isConnected = false;
+  f.emitInput({ target: f.composer, isTrusted: true }); f.tickReport();
+  const disconnected = f.reports.at(-1);
+  assert.equal(disconnected.trustedInputCounter, 1);
+  for (const key of ["composerHasText", "composerFocused", "composerEditable", "sendDisabled"]) assert.equal(Object.hasOwn(disconnected, key), false);
+  const count = f.reports.length;
+  f.window.dispatchEvent(new MockEvent("pagehide", { isTrusted: true })); f.tickReport();
+  assert.equal(f.reports.length, count, "Unloaded documents stop their diagnostic observer");
 });

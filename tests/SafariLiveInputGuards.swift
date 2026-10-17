@@ -19,6 +19,50 @@ struct SafariLiveInputGuards {
         }
 
         _ = try request()
+        let modalScope = ["profileId": "profile", "tabId": "12", "documentId": "document", "node": "node", "ownerId": "owner",
+                          "accountScope": "account", "sessionId": "original-session", "turnId": "original-turn"]
+        let modalPolicy: [String: Any] = ["kind": "dialog", "timeout_ms": 10000, "type": "prompt", "message": "Exact prompt?", "accept": true, "promptText": "Native answer"]
+        let planned: [String: Any] = ["policy": modalPolicy, "scope": modalScope]
+        let plan = try SafariLiveInput.ModalPlan(planned, request: request())
+        precondition(plan.timeout == 10 && plan.matches(type: "prompt", message: "Exact prompt?"))
+        precondition(!plan.matches(type: "confirm", message: "Exact prompt?") && !plan.matches(type: "prompt", message: "Exact prompt? extra"))
+        precondition(SafariLiveInput.dialogHeaderMatchesOrigin("來自「https://example.com」：", expectedURL: "https://example.com/path"))
+        precondition(SafariLiveInput.dialogHeaderMatchesOrigin("The page at \"http://127.0.0.1:62356\" says:", expectedURL: "http://127.0.0.1:62356/"))
+        precondition(!SafariLiveInput.dialogHeaderMatchesOrigin("來自「https://example.com.evil.test」：", expectedURL: "https://example.com/"))
+        precondition(!SafariLiveInput.dialogHeaderMatchesOrigin("來自「http://127.0.0.1:62357」：", expectedURL: "http://127.0.0.1:62356/"))
+        func responseButton(_ operation: String = "accept", type: String = "prompt", count: Int = 2,
+                            primary: [Int] = [1, 1], cancel: [Int] = [0, 0], enabled: Set<Int> = [0, 1], pressable: Set<Int> = [0, 1]) throws -> Int {
+            try SafariLiveInput.dialogResponseButtonIndex(operation: operation, type: type, buttonCount: count,
+                defaultIndices: primary, cancelIndices: cancel, enabled: enabled, pressable: pressable)
+        }
+        let responseIndices = try [responseButton(), responseButton("dismiss"), responseButton(primary: [0], cancel: [1]),
+            responseButton("dismiss", primary: [0], cancel: [1]), responseButton("dismiss", type: "alert", count: 1, primary: [], cancel: [])]
+        precondition(responseIndices == [1, 0, 0, 1, 0], "Native semantics, not label, position or array order, identify OK/Cancel")
+        for primary in [[], [-1], [0, 1], [2]] {
+            rejects("DIALOG_RESPONSE_UNVERIFIABLE") { _ = try responseButton(primary: primary) }
+        }
+        rejects("DIALOG_RESPONSE_UNVERIFIABLE") { _ = try responseButton(cancel: [1]) }
+        rejects("DIALOG_RESPONSE_UNVERIFIABLE") { _ = try responseButton(type: "prompt", count: 1) }
+        rejects("DIALOG_RESPONSE_UNAVAILABLE") { _ = try responseButton(enabled: [0]) }
+        rejects("DIALOG_RESPONSE_UNAVAILABLE") { _ = try responseButton(pressable: [0]) }
+        for update: [String: Any] in [["accept": NSNumber(value: 1)], ["type": "alert", "accept": false], ["timeout_ms": 10001],
+                                     ["timeout_ms": 0], ["type": "confirm"], ["message": String(repeating: "x", count: 8001)], ["unknown": true]] {
+            rejects("INVALID_NATIVE_MODAL") { _ = try SafariLiveInput.ModalPlan(["policy": modalPolicy.merging(update) { _, n in n }, "scope": modalScope], request: request()) }
+        }
+        for scope in [modalScope.filter { $0.key != "accountScope" }, modalScope.merging(["tabId": "012"]) { _, n in n }] {
+            rejects("INVALID_NATIVE_MODAL") { _ = try SafariLiveInput.ModalPlan(["policy": modalPolicy, "scope": scope], request: request()) }
+        }
+        for update: [String: Any] in [["action": "key", "key": "Enter"], ["clickCount": 2], ["button": "right"], ["modifiers": ["Shift"]]] {
+            rejects("INVALID_NATIVE_MODAL") { _ = try SafariLiveInput.ModalPlan(planned, request: request(update)) }
+        }
+        let uploadFixture = FileManager.default.temporaryDirectory.appendingPathComponent("native-upload-plan-" + UUID().uuidString + ".txt")
+        try Data("Owned upload plan".utf8).write(to: uploadFixture, options: .withoutOverwriting)
+        defer { try? FileManager.default.removeItem(at: uploadFixture) }
+        let uploadPolicy: [String: Any] = ["kind": "upload", "timeout_ms": 10000, "files": [uploadFixture.path]]
+        let upload = try SafariLiveInput.ModalPlan(["policy": uploadPolicy, "scope": modalScope, "isMultiple": false], request: request())
+        precondition(upload.kind == "upload" && upload.files.count == 1 && upload.files[0].path == uploadFixture.path)
+        rejects("INVALID_NATIVE_MODAL") { _ = try SafariLiveInput.ModalPlan(["policy": uploadPolicy, "scope": modalScope, "isMultiple": NSNumber(value: 1)], request: request()) }
+        rejects("INVALID_FILES") { _ = try SafariLiveInput.ModalPlan(["policy": uploadPolicy.merging(["files": ["relative.txt"]]) { _, n in n }, "scope": modalScope, "isMultiple": false], request: request()) }
         let focusTarget: [String: Any] = ["action": "focus", "expectedUrl": "https://example.com/current?mode=live#field",
                                           "windowBounds": ["left": 0, "top": 25, "width": 1200, "height": 900]]
         let target = try SafariLiveInput.Target(focusTarget)

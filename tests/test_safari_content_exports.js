@@ -5,10 +5,12 @@ const { contentExportPageOperation, youtubeTranscriptPageOperation, formatYouTub
 
 function fixture(url = "https://docs.google.com/document/d/document-id/edit?tab=t.1#heading") {
   const requests = [], events = [];
+  let now = Date.now();
+  class Clock extends Date { static now() { return now; } }
   const location = { href: url };
   let response = { bytes: Buffer.from("%PDF-1.7\nReal document bytes\n"), mime: "application/pdf", url: "https://docs.google.com/document/d/document-id/export?format=pdf", status: 200 };
   const context = vm.createContext({ location, document: { title: "Example - Google Docs" }, crypto: require("node:crypto").webcrypto,
-    TextEncoder, TextDecoder, Uint8Array, URL, AbortController, setTimeout, clearTimeout, btoa, addEventListener(type, callback) { events.push({ type, callback }); },
+    Date: Clock, TextEncoder, TextDecoder, Uint8Array, URL, AbortController, setTimeout, clearTimeout, btoa, addEventListener(type, callback) { events.push({ type, callback }); },
     async fetch(href, options) {
       requests.push({ href, options });
       const value = new Response(response.bytes, { status: response.status, headers: { "content-type": response.mime } });
@@ -16,7 +18,7 @@ function fixture(url = "https://docs.google.com/document/d/document-id/edit?tab=
     } });
   const operation = vm.runInContext(`(${contentExportPageOperation.toString()})`, context);
   const inspect = (kind = "gsuite", format = "pdf") => operation("inspect", { scope: "real-account-owner-session-turn", kind, format });
-  return { operation, inspect, location, requests, events, setResponse(value) { response = { ...response, ...value }; } };
+  return { operation, inspect, location, requests, events, advance(ms) { now += ms; }, setResponse(value) { response = { ...response, ...value }; } };
 }
 
 test("Google exports derive official current-document URLs and require the exact document/account scope", async () => {
@@ -30,6 +32,19 @@ test("Google exports derive official current-document URLs and require the exact
   for (const url of ["https://untrusted.test/document/d/id/edit", "http://docs.google.com/document/d/id/edit", "https://docs.google.com/document/d/id/pub", "https://docs.google.com/spreadsheets/d/id/edit"]) {
     assert.equal((await fixture(url).inspect("gsuite", "docx")).ok, false);
   }
+});
+
+test("approval time does not consume the 30-second export transfer deadline", async () => {
+  const f = fixture(), selected = (await f.inspect()).result;
+  const args = { scope: "real-account-owner-session-turn", exportId: selected.exportId };
+  f.advance(70000); // A real installed original approval took over one minute.
+  assert.equal(f.requests.length, 0);
+  assert.equal((await f.operation("check", args)).ok, true);
+  assert.equal((await f.operation("start", args)).ok, true);
+  assert.equal(f.requests.length, 1);
+  f.advance(30001);
+  assert.equal((await f.operation("read", args)).ok, false);
+  await f.operation("cancel", args);
 });
 
 test("Google exports return actual bounded bytes and reject login HTML or a mismatched file format", async () => {

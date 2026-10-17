@@ -70,7 +70,9 @@ The app's own ChatGPT session authenticates only the agent tunnel; page logins
 remain in ordinary Safari and are never copied out. No separate MCP client or
 API key is needed for this path.
 
-The executor supports visible DOM, Playwright locators, open shadow roots,
+### Implemented control routes
+
+The source adapter covers visible DOM, Playwright locators, open shadow roots,
 same-origin and cross-origin iframe targeting, new tabs, navigation/history,
 double-clicks, pointer movement/dragging, focused Unicode typing, page-editing
 keys, native option selection, and real viewport/cropped/full-page screenshots.
@@ -79,24 +81,93 @@ ChatGPT sidebar. Native application/system shortcuts are not page input.
 Stale targets and uncertain input outcomes require a fresh read; delivered input
 is never automatically replayed.
 
-JavaScript alerts, confirms, prompts, and file choosers use actual Safari native
-dialogs. File uploads retain the original approval and require explicit existing
-local files. Multiple files must share one directory. Custom `showPicker()`-only
-controls without a verifiable input click are rejected. A modal retains only its
-exact source selection until a response or cancellation; manual focus changes
-abort rather than stealing focus back.
+The clipboard API retains **session-local multi-MIME items**. Native copy, cut,
+and paste use a transient Mac pasteboard bridge for plain text, HTML, RTF, PNG,
+TIFF, JPEG, and PDF. The prior pasteboard is held only in memory and restored
+after an exact trusted page-event receipt, while its observed generation is
+still owned. Newer observed changes are preserved; public pasteboard APIs do not
+provide cross-process atomic writer identity. Unsupported types fail explicitly.
+If `live_status.clipboard.pending` is true, do not repeat the shortcut or restart
+the containing app: its memory-only recovery must finish first.
 
-The original clipboard is a **session-local virtual clipboard**, not the Mac's
-clipboard. Console logs are captured from the first claim, bounded to the current
-turn and five minutes; earlier logs cannot be recovered. The `pageAssets`
+Console capture starts at
+the first claim or navigation, retains up to 500 messages, and ends with the turn
+or after five minutes; earlier logs cannot be recovered. The `pageAssets`
 capability inventories observed page assets and saves selected assets with a
 manifest in a private Downloads subdirectory, retaining the original download
 and cross-origin fallback approval checks.
 
-Right-click **Ask ChatGPT** and website side-panel invocations can prefill the
-original composer without submitting or replacing an existing draft. Open tab
-mentions refresh when their real tabs change. Expired sessions have an explicit
-sign-in/Continue path using only this app's existing official WebKit profile.
+Right-click **Ask ChatGPT** attaches the selected text to the original
+conversation; it does not insert that text into the composer. Website prompt
+invocations can prefill the original composer. Neither path submits
+automatically or replaces an existing draft. Open tab mentions refresh when
+their real tabs change. Expired sessions have an explicit sign-in/Continue path
+using only this app's existing official WebKit profile.
+
+Current installed acceptance is still open for dialog responses, uploads,
+bookmark CRUD, YouTube transcript export, the blank-tab lifecycle, and the
+updated website prompt prefill/provider-reload lifecycle. Completed installed checks are listed
+under [Installed acceptance](#installed-acceptance).
+
+### Complete known native dialogs and uploads in one operation
+
+Safari suspends extension callbacks while a native modal is open. For a control
+with a known JavaScript dialog, register its exact response before the opening
+click through the original tab's `nativeDialogs` capability:
+
+```js
+const dialogs = await tab.capabilities.get("nativeDialogs");
+await dialogs.run({
+  selector: "#confirm-action", type: "confirm",
+  message: "Apply changes?", accept: true
+});
+```
+
+The actual window, source origin, dialog type, and full message must match.
+Alerts require `accept: true`; `promptText` is allowed only when accepting a
+prompt. A mismatch or manual focus change leaves the modal unanswered, without
+replaying its click. Manual dismissal may be needed before chat receives the
+error. The default and maximum timeout are **10 seconds**. Cross-origin iframe
+modals are unsupported.
+
+For uploads, approve explicit local files before the native opening click:
+
+```js
+const uploads = await tab.capabilities.get("nativeUploads");
+await uploads.run({
+  selector: "input[type=file]", files: ["/absolute/path/report.txt"]
+});
+```
+
+The selector must identify one visible, enabled file input in the top-level or
+same-origin document. Hidden inputs and JavaScript-only upload buttons are
+unsupported. Files must be regular files; multiple files require the input's
+actual `multiple` attribute and one directory. The original upload approval runs
+before clicking, followed by document/input and local file-identity rechecks.
+The native app selects the approved files and verifies panel closure within the
+same **10-second** maximum. Read the page afterwards to verify its result.
+
+The ordinary click/`getJsDialog()` and `waitForEvent("filechooser")` contracts
+remain available, but an unarmed modal can stall their extension round trip.
+Never repeat an opening click that was already delivered.
+
+### Set an exact CSS viewport by resizing the real window
+
+The `viewport` capability measures `window.innerWidth` and `innerHeight` in the
+current turn's claimed, logical-active tab. That tab must share the owning
+sidebar's native Safari window. `set({width, height})` resizes that real window,
+including its other tabs, and succeeds only after exact CSS dimensions are read
+back. It makes at most three measured native adjustments. Fullscreen, minimized
+windows, Safari minimum sizes, browser UI, and available screen space can prevent
+a requested size. It does not emulate a device, force DPR, or change page zoom.
+
+`reset()` restores the original native bounds and checks the original CSS
+viewport. Turn, owner, and account teardown also request restoration. A return
+to the sidebar owner authorizes rollback only after the exact terminal owner
+page, native window, and last applied bounds are verified. Restoration never
+switches tabs, reclaims focus, or overwrites a user's later move/resize. An
+unconfirmed restoration remains visible in `live_status.viewport`; do not replay
+an uncertain resize. Reset before navigating or changing native tab collections.
 
 ### Download files using the page's existing login
 
@@ -107,10 +178,21 @@ The companion saves the completed file to **~/Downloads**, preserving existing
 files with collision-safe names and applying macOS quarantine. It never opens
 the file automatically. Incomplete transfers are discarded.
 
-This route supports visible, same-origin HTTP/HTTPS file links up to **32 MiB**
-within **30 seconds**. Redirects, cross-origin links, blob URLs, and JavaScript
-download buttons are rejected explicitly. Normal native clicks remain available
-for website interactions; they do not provide this verified-download result.
+This route supports visible HTTP/HTTPS file links up to **32 MiB** within
+**30 seconds**. Cross-origin links require Safari's actual credentialed CORS
+access as well as the original download approval. Redirects are rejected before
+following an unapproved destination. Blob links and JavaScript download buttons
+do not have a verified completed-download event route. Normal native clicks
+remain available, but a click alone is not a verified-download result.
+
+`Tab.content.exportGsuite(format)` derives the official export URL from the
+current Google Workspace page: documents support pdf/md/docx, spreadsheets
+pdf/xlsx/csv, and presentations pdf/pptx. It uses the page's existing login and
+the same **32 MiB / 30-second** bounded writer. `exportYouTubeTranscript()` saves
+the current official YouTube watch video's available captions as UTF-8 text;
+its fixed player helper restores the previous captions state. Both retain the
+original download approval and return a path only after real file writing.
+Missing captions or an invalid document response fail explicitly.
 
 ### Organize tabs into real Safari Tab Groups
 
@@ -167,17 +249,25 @@ diagnostics → App notifications → Enable notifications** to request the Mac'
 permission. A successful request returns a real scheduling ID, not proof that a
 banner was displayed.
 
-### Remaining platform differences
+### Remaining implementation gaps and platform boundaries
 
 The original read-only `evaluate`/`evaluateAll` sandbox freezes JavaScript realm
 intrinsics and requires Chrome's isolated world. Safari's public AppleEvents
 JavaScript command has no isolated-world option; running that sandbox in the
 page's main world would damage the page. Use the supported DOM read methods.
 
-Raw desktop CDP control, browser viewport overrides, WebMCP, Chrome group
-color/collapse/reordering, Top Sites, and the recently closed session inventory
-remain unavailable. Top Sites and recently closed sessions return explicit
-errors rather than unrelated history data or fabricated restore handles.
+Raw desktop CDP and Chrome's device-metrics/DPR overrides have no equivalent
+ordinary-profile transport here; use the high-level Safari controls and real
+window viewport sizing above. Chrome inline group color/collapse and group
+reordering remain unsupported; Safari's native collections have different
+semantics.
+
+An installed ordinary-page probe exposed no native `document.modelContext`
+`getTools` or `executeTool` methods. WebMCP remains unadvertised until a real
+provider is available. Top Sites and recently closed sessions also have no
+verified profile-bound provider and return explicit errors, not history rankings
+or fabricated restore handles. Generic `Tabs.content()` and `ContentAPI.export()`
+remain disabled, as in the original Chrome extension.
 
 Safari lacks Chrome's manifest sandbox pages. The packaged original JavaScript
 worker therefore runs at a dedicated local origin with no extension APIs,
@@ -186,12 +276,6 @@ security-gated host. Host-to-background browser RPC uses a real MessageChannel
 bound to the nested host frame and scope, since Safari's same-background-frame
 runtime messaging does not reach its own listener. This computation sandbox
 does not create website tabs or another login session.
-
-The installed original Work agent completed text entry, an Apply button click,
-and a Next page link click in an ordinary Safari tab. It read back the applied
-value and `Session established: true` after same-tab navigation. The inline
-sidebar retained the same conversation and finished its response after remount;
-no separate MCP client or isolated browser session performed those actions.
 
 ## Optional desktop control of existing tabs
 
@@ -246,10 +330,17 @@ adapter and `safari_live` target existing tabs; `safari_native` is for isolated 
 
 ## Installed acceptance
 
+Completed installed checks:
+
 - In the original **Chat** mode, attaching two ordinary Safari tabs with **@**
   returned both exact session-only DOM markers. Neither marker was included in
   the prompt. The original Safari consent prompt was retained and the response
   finished normally.
+
+- Native **Ask ChatGPT** attached the owning page's selected text to the same
+  original conversation. With an empty composer, exactly one selected-text
+  attachment appeared, Send stayed disabled, and nothing was submitted. A second
+  selection preserved the exact existing composer draft alongside its attachment.
 
 - In the original **Work** sidebar, a policy-approved download used an ordinary
   Safari page's HTTP-only session and saved the exact 204-byte UTF-8 response to
@@ -259,6 +350,50 @@ adapter and `safari_live` target existing tabs; `safari_native` is for isolated 
 - In the original **Work** sidebar, the management capability claimed two
   scratch tabs, reversed their adjacent order, and read the real final order
   back. The original conversation finished normally and other tabs were retained.
+
+- The original **Work** agent read open shadow-root content and both same-origin
+  and cross-origin iframe content, entered text, clicked Apply, and finished
+  normally in the same cloud conversation.
+
+- The original **Work** agent selected Blue through the native select control
+  with trusted input, round-tripped session-local clipboard text, read the
+  full-page bottom, and saved an observed SVG plus its asset manifest without
+  failures. The saved files were mode 0600 with quarantine, inside a private
+  mode-0700 directory; the original response finished normally.
+
+- The original **Work** agent pasted real HTML into an ordinary Safari rich
+  editor, copied and cut its synthetic rich text with native shortcuts, and
+  pasted it back with bold markup intact. A separate native PNG paste produced
+  one image and a trusted `Files` receipt for **68 bytes**. Each requested shortcut
+  ran once; native status confirmed pasteboard restoration with no pending
+  memory-only recovery. The original replies finished normally.
+
+- The original **Work** agent set the real CSS viewport to **1200 × 650**, then
+  reset it successfully and finished normally. A fresh read of the same page
+  confirmed the original **1473 × 836** viewport; native status reported
+  `leaseActive: false` and `restoration: restored`.
+
+- The original **Work** agent captured a new console event after claiming the
+  page and applying a note through trusted input. It then completed a credentialed
+  cross-origin download after separate one-time source/destination approvals.
+  The saved file matched the exact **53-byte UTF-8** response, including Chinese
+  text, with mode 0600 and quarantine; the original response finished normally.
+
+- The original **Work** agent exported the official public Google Sheets
+  sample to a real **1,408-byte CSV**, containing the six expected columns and
+  30 data rows, after its normal download approval. The file had mode 0600 and
+  quarantine; the original reply finished normally. Approval waiting time no
+  longer consumes the 30-second transfer deadline.
+
+- The original **Work** management capability moved one explicitly claimed,
+  unpinned scratch tab into a new normal window with a single `windows.create`
+  call. It read back the same native tab ID and URL in the new window. This is
+  separate from the pending new-blank-tab lifecycle check.
+
+- The original **Work** agent completed text entry, an Apply button click, and
+  a Next page link click in an ordinary Safari tab, read back the applied value
+  and `Session established: true`, and finished after an inline remount. No
+  separate MCP client or isolated session performed those actions.
 
 - The original **Work** sidebar completed one two-tab batch into a real native
   Safari Tab Group and restored its source sidebar and conversation after

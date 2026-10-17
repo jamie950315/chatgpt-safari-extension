@@ -15,6 +15,55 @@ test("Safari high-level commands retain the original RPC session transport rathe
   await assert.rejects(dispatch(context, { type: "playwright_evaluate" }, async () => "bad"), /does not support/);
   await assert.rejects(dispatch(context, { ...command, tab_id: "12-other" }, async () => "bad"), /claimed tab IDs/);
 });
+test("original creation and claiming of a blank tab do not require console capture before navigating that same tab", async () => {
+  const { createAgent } = require("../safari/ChatGPT for Safari/ChatGPT for Safari Extension/Resources/safari/agent-background.js");
+  let url = "about:blank"; const calls = [], owner = { instanceId: "owner", profileId: "profile", accountScope: "account" };
+  const metadata = { session_id: "session", turn_id: "turn" }, session = { currentTurnId: "turn", async requireOwnedTab(id) { assert.equal(id, 12); } };
+  const agent = createAgent({ tabs: { async get() { return { id: 12, url }; } } }, { async agentOwner() { return owner; }, async runAgentCommand(command) {
+    calls.push(command); if (command.action === "navigate") { assert.equal(command.arguments.expectedUrl, "about:blank"); url = command.arguments.url; }
+    return {};
+  } });
+  const context = { clientInfo: { family: "safari" }, api: { async executeUnhandledCommand(request) {
+    if (request.type === "browser_safari_context") return agent.authorize(session, metadata);
+    return agent.execute(request.command, session, metadata);
+  } } };
+  for (const type of ["create_tab", "browser_user_claim_tab"]) {
+    assert.deepEqual(await dispatch(context, { type, browser_id: "0", tab_id: "12" }, async () => ({ id: "12" })), { id: "12" });
+  }
+  assert.equal(calls.length, 0, "blank original inventory/claim must not require website scripting or console capture");
+  await agent.execute({ type: "navigate_tab_url", browser_id: "0", tab_id: "12", url: "https://example.test/owned" }, session, metadata);
+  assert.deepEqual(calls.map(command => command.action), ["navigate", "dom_query"]);
+  assert.equal(calls[1].arguments.command.type, "safari_logs_start");
+});
+test("new-tab URL omissions retain original create/claim and use actual native blank-frame proof before same-tab goto", async () => {
+  const { createAgent } = require("../safari/ChatGPT for Safari/ChatGPT for Safari Extension/Resources/safari/agent-background.js");
+  const { createLive } = require("../safari/ChatGPT for Safari/ChatGPT for Safari Extension/Resources/safari/live-background.js");
+  const previous = globalThis.ChatGPTSafariLive;
+  try {
+    for (const missing of [undefined, ""]) {
+      let url = missing, claims = 0, frameProofs = 0; const calls = [];
+      const owner = { instanceId: "owner", profileId: "profile", accountScope: "account" };
+      const metadata = { session_id: "session", turn_id: "turn" }, session = { currentTurnId: "turn", async requireOwnedTab(id) { assert.equal(id, 12); } };
+      const api = { runtime: { onMessage: { addListener() {} } }, tabs: { async get(id) { return { id, windowId: 8, url }; } },
+        webNavigation: { async getAllFrames({ tabId }) { assert.equal(tabId, 12); frameProofs++; return [{ frameId: 0, parentFrameId: -1, url: "about:blank", errorOccurred: false }]; } } };
+      globalThis.ChatGPTSafariLive = createLive(api, { crypto: require("node:crypto") });
+      const agent = createAgent(api, { async agentOwner() { return owner; }, async runAgentCommand(command) {
+        calls.push(command); if (command.action === "navigate") { assert.equal(command.arguments.expectedUrl, "about:blank"); url = command.arguments.url; }
+        return {};
+      } });
+      const context = { clientInfo: { family: "safari" }, api: { async executeUnhandledCommand(request) {
+        if (request.type === "browser_safari_context") return agent.authorize(session, metadata);
+        return agent.execute(request.command, session, metadata);
+      } } };
+      for (const type of ["create_tab", "browser_user_claim_tab"]) {
+        await dispatch(context, { type, browser_id: "0", tab_id: "12" }, async () => { claims++; return { id: "12" }; });
+      }
+      assert.equal(claims, 2); assert.equal(calls.length, 0); assert.equal(frameProofs, 0, "original claim does not invent website/blank metadata");
+      await agent.execute({ type: "navigate_tab_url", browser_id: "0", tab_id: "12", url: "https://example.test/new" }, session, metadata);
+      assert.equal(frameProofs, 1); assert.equal(calls[0].action, "navigate"); assert.equal(calls[0].arguments.handle, "live:profile:12");
+    }
+  } finally { globalThis.ChatGPTSafariLive = previous; }
+});
 test("non-Safari clients retain their existing executor", async () => {
   assert.equal(await dispatch({ clientInfo: { family: "chrome" } }, { type: "tab_cdp_call" }, async () => "original Chrome result"), "original Chrome result");
 });
@@ -78,6 +127,20 @@ test("the original upload policy runs once after chooser validation and before n
   context.security.ensureFileUploadAllowed = async () => { events.push("policy"); throw new Error("Original upload denied"); };
   await assert.rejects(dispatch(context, command, () => assert.fail("No CDP")), /Original upload denied/);
   assert.deepEqual(events, ["safari_file_chooser_inspect", "policy"]);
+});
+test("preregistered uploads approve the exact source before the single original click command", async () => {
+  const events = [], source = { url: "https://example.test/", documentId: "doc", snapshotId: "snapshot", node: "n1", isMultiple: false };
+  const command = { type: "playwright_locator_click", browser_id: "0", tab_id: "12", selector: "input[type=file]",
+    safari_native_modal: { kind: "upload", files: ["/owned/file.txt"], timeout_ms: 10000 } };
+  const context = { clientInfo: { family: "safari" }, security: { async ensureFileUploadAllowed(id) { assert.equal(id, 12); events.push("policy"); } },
+    api: { async executeUnhandledCommand(value) { events.push(value.command.type); return value.command.type === "safari_native_upload_inspect" ? source : value.command; } } };
+  const result = await dispatch(context, command, () => assert.fail("No Chrome/CDP upload handler"));
+  assert.deepEqual(events, ["safari_native_upload_inspect", "policy", "playwright_locator_click"]);
+  assert.equal(result.safari_upload_source, source); assert.equal(result.safari_native_modal, command.safari_native_modal);
+  events.length = 0; context.security.ensureFileUploadAllowed = async () => { events.push("denied"); throw new Error("Upload denied"); };
+  await assert.rejects(dispatch(context, command, () => assert.fail("No fallback")), /Upload denied/);
+  assert.deepEqual(events, ["safari_native_upload_inspect", "denied"]);
+  await assert.rejects(dispatch(context, { ...command, type: "dom_cua_click" }, () => assert.fail("No fallback")), /single native locator click/);
 });
 test("content exports approve only the derived official source before starting source fetch or native writing", async () => {
   for (const denied of [false, true]) {

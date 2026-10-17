@@ -12,7 +12,8 @@ import Foundation
         engine.policy.parentExtensionOrigin = "safari-web-extension://fixture-extension"
         func emit(_ extra: [String: Any] = [:]) {
             var result: [String: Any] = ["origin": engine.policy.localOrigin, "key": engine.policy.key,
-                "bridgeToken": engine.policy.bridgeToken, "accountScope": engine.accountScope]
+                "bridgeToken": engine.policy.bridgeToken, "accountScope": engine.accountScope,
+                "documentRecoverySequence": engine.documentRecoverySequence]
             for (key, value) in extra { result[key] = value }
             var data = try! JSONSerialization.data(withJSONObject: result); data.append(10)
             FileHandle(fileDescriptor: 3, closeOnDealloc: false).write(data)

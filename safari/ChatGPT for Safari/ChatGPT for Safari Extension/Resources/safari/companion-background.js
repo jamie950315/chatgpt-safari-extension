@@ -9,6 +9,7 @@
     let ownerContext;
     let invocation;
     let mentionObservation;
+    let documentRecoveryObservation;
     let invocationQueue = Promise.resolve();
     const invocationKey = tabId => `codexWorkSidePanelInvocation:${tabId}`;
     function validInvocation(value) {
@@ -105,6 +106,7 @@
     }
     const capabilities = { "browserSideChat.openInBrowser": true, "browserSideChat.tabContext.read": true, "browserTabMentions.search": true };
     const sessionChanged = () => {
+      documentRecoveryObservation = undefined;
       mentionObservation?.unsubscribe();
       mentionObservation = undefined;
       // Release passive developer capture with the original owner/session.
@@ -165,7 +167,17 @@
       try {
         const cloudTunnel = embedded ? environment.ChatGPTSafariGetCloudTunnelState?.() : undefined;
         const response = await send({ action: "poll", ownerToken: state.instanceId, ...(cloudTunnel ? { cloudTunnel } : {}) });
+        if (owner !== state) return;
         if (response.closed === true) { didClose(state); return; }
+        const sequence = response.documentRecoverySequence;
+        if (embedded && Number.isSafeInteger(sequence) && sequence > 0 && sequence <= 1_000_000_000
+          && (documentRecoveryObservation?.state !== state || documentRecoveryObservation.sequence !== sequence)) {
+          documentRecoveryObservation = { state, sequence };
+          // Only a native sequence receipt crosses this owner-bound channel.
+          // The wrapper must also observe its authenticated document unloading.
+          Promise.resolve(api.runtime.sendMessage({ type: "chatgpt-safari:provider-document-recovery",
+            instanceId: state.instanceId, tabId: state.tabId, windowId: state.windowId, sequence })).catch(() => {});
+        }
         for (const request of response.requests || []) {
           if (owner?.instanceId !== state.instanceId) return;
           let value;

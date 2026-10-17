@@ -119,6 +119,7 @@ test("provider relay uses real bounded HTTP, isolated capabilities, module gates
   const diagnostic = { state: "installed", usedOrigin: 2, usedConnection: 1, connections: 1, contexts: 1, failures: 0,
     scriptErrors: 1, unhandledRejections: 0, channelConnected: true, readyPosted: true,
     connectMessages: 1, parentSourceMatched: true, parentTokenMatched: true, parentOriginKind: "expected",
+    trustedInputCounter: 2, composerHasText: true, composerFocused: true, composerEditable: true, sendDisabled: true,
     errors: [{ kind: "TypeError", frames: ["/cdn/assets/async/637745.14f70978dc.js:12:34"] }] };
   const diagnosticPost = value => {
     const body = Buffer.from(JSON.stringify(value));
@@ -140,18 +141,29 @@ test("provider relay uses real bounded HTTP, isolated capabilities, module gates
   assert.equal(diagnosticStatus.requestRoutes.rejection_origin, 1);
   assert.equal(diagnosticStatus.requestRoutes.rejection_route, 1);
   const upstreamBeforeReload = received.length;
-  const reload = await call("/c/fixture?surface=browser_side_chat", { authorized: false, headers: { Accept: "text/html", "Sec-Fetch-Dest": "iframe" } });
-  assert.equal(reload.status, 401, "Document reload never bypasses capability authorization");
-  assert.equal(received.length, upstreamBeforeReload, "A capability-less reload must not reach an authenticated upstream");
-  assert.match(reload.body.toString(), /chatgpt-safari-provider:document-capability-missing/);
-  assert.match(reload.headers["content-security-policy"], /default-src 'none'.*script-src 'nonce-/);
-  for (const value of [entry.key, entry.bridgeToken, entry.accountScope]) assert.equal(reload.body.includes(value), false, "The inert recovery document must not expose credentials or channel readiness tokens");
+  child.stdin.write("status\n"); const beforeReloadStatus = await next();
+  assert.equal(beforeReloadStatus.documentRecoverySequence, 0);
+  for (const destination of ["iframe", "document"]) {
+    const reload = await call("/c/fixture?surface=browser_side_chat", { authorized: false, headers: { Accept: "text/html", "Sec-Fetch-Dest": destination } });
+    assert.equal(reload.status, 401, "Document reload never bypasses capability authorization");
+    assert.equal(received.length, upstreamBeforeReload, "A capability-less reload must not reach an authenticated upstream");
+    assert.equal(reload.body.toString().includes("<script"), false, "Recovery never relies on executing an HTTP error document");
+    assert.match(reload.headers["content-security-policy"], /^default-src 'none';/);
+    assert.equal(reload.headers["content-security-policy"].includes("script-src"), false);
+    for (const value of [entry.key, entry.bridgeToken, entry.accountScope]) assert.equal(reload.body.includes(value), false,
+      "The inert recovery document cannot expose credentials or channel readiness tokens");
+  }
+  child.stdin.write("status\n"); const reloadStatus = await next();
+  assert.equal(reloadStatus.documentRecoverySequence, 2);
   for (const [target, headers] of [["/backend-api/me", { Accept: "text/html" }], ["/?__chatgpt_key=wrong", { Accept: "text/html" }],
-    ["/", { Accept: "application/json" }], ["/", { Accept: "text/html", Origin: "https://attacker.invalid" }]]) {
+    ["/", { Accept: "application/json" }], ["/", { Accept: "text/html", Origin: "https://attacker.invalid" }],
+    ["/c/fixture?surface=browser_side_chat", { Accept: "text/html", "X-ChatGPT-Relay": "wrong" }]]) {
     const rejected = await call(target, { authorized: false, headers });
-    assert.equal(rejected.body.toString().includes("document-capability-missing"), false);
+    assert.equal(rejected.body.toString().includes("<script"), false);
     assert.equal(rejected.headers["content-security-policy"].includes("script-src"), false);
   }
+  child.stdin.write("status\n"); const unrelatedStatus = await next();
+  assert.equal(unrelatedStatus.documentRecoverySequence, 2, "API requests, invalid capabilities and foreign origins cannot produce reload receipts");
   await call("/backend-api/f/conversation?private=synthetic-private-query", { method: "POST" });
   await call("/backend-api/me?private=synthetic-private-account");
   child.stdin.write("status\n"); const accountStatus = await next();
@@ -228,7 +240,7 @@ test("provider relay uses real bounded HTTP, isolated capabilities, module gates
   child.stdin.write("browser-session\n"); const guestSession = await next();
   assert.equal(guestSession.browserSessionAvailable, false);
   child.stdin.write("verify\n"); entry = await next();
-  assert.equal(entry.verified, true); assert.notEqual(entry.key, old.key); assert.notEqual(entry.accountScope, old.accountScope);
+  assert.equal(entry.verified, true); assert.equal(entry.documentRecoverySequence, 0); assert.notEqual(entry.key, old.key); assert.notEqual(entry.accountScope, old.accountScope);
   child.stdin.write("browser-session\n"); const browserSession = await next();
   assert.deepEqual(browserSession.browserSession, { accessToken: "synthetic-only", account: { id: "synthetic-account", structure: "personal" }, user: { id: "synthetic-user" } });
   child.stdin.write("status\n"); const safeStatus = await next();
@@ -237,7 +249,11 @@ test("provider relay uses real bounded HTTP, isolated capabilities, module gates
   sessionValid = false;
   child.stdin.write("verify\n"); entry = await next();
   assert.equal(entry.verified, false); assert.equal((await call("/")).status, 503);
+  await call("/c/fixture?surface=browser_side_chat", { authorized: false, headers: { Accept: "text/html" } });
+  child.stdin.write("status\n"); const disabled = await next();
+  assert.equal(disabled.documentRecoverySequence, 0, "Disabled sessions cannot issue a recovery receipt");
   child.stdin.write("clear\n"); const cleared = await next();
   assert.notEqual(cleared.key, entry.key); assert.notEqual(cleared.bridgeToken, entry.bridgeToken);
+  assert.equal(cleared.documentRecoverySequence, 0);
   child.stdin.write("stop\n");
 });
