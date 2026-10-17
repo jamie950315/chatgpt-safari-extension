@@ -64,7 +64,7 @@ struct ProviderRelayRequest {
 
 enum ProviderRelayDiagnostics {
     static let maximumBytes = 8 * 1024
-    static let counters: Set<String> = ["usedOrigin", "usedConnection", "connections", "contexts", "failures", "scriptErrors", "unhandledRejections", "connectMessages"]
+    static let counters: Set<String> = ["usedOrigin", "usedConnection", "connections", "contexts", "streamCalls", "failures", "scriptErrors", "unhandledRejections", "connectMessages"]
     static let booleans: Set<String> = ["channelConnected", "readyPosted", "parentSourceMatched", "parentTokenMatched"]
     static let kinds: Set<String> = ["Error", "TypeError", "ReferenceError", "RangeError", "SyntaxError", "SecurityError", "DOMException", "UnhandledRejection", "ModuleLoadError", "UnknownError"]
 

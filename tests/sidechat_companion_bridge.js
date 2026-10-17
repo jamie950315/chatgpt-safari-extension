@@ -63,6 +63,38 @@ function fixture(options = {}) {
     gesture: trusted => emit(documentListeners, new MockEvent("pointerdown", { isTrusted: trusted })) };
 }
 const flush = () => new Promise(resolve => setImmediate(resolve));
+test("original stream adapters preserve parsing, arguments, iteration and cancellation without native for-await fast paths", async () => {
+  const runtime = { m: {}, c: {}, d(exports, getters) {
+    for (const [name, get] of Object.entries(getters)) Object.defineProperty(exports, name, { get, enumerable: true });
+  } };
+  const f = fixture({ runtime });
+  await f.ready;
+  const scope = {}, signal = new AbortController().signal;
+  let cleanup = 0, input, forwardedSignal, receiver;
+  runtime.m.tI = (module, exports, require) => require.d(exports, {
+    untouched: () => signal,
+    uj: () => async function*(body, abort) { receiver = this; forwardedSignal = abort; try { yield { data: body }; yield { data: "second" }; } finally { cleanup++; } },
+    sj: () => async function*() { throw new Error("Original parse failure"); },
+  });
+  runtime.m.sY = (module, exports, require) => require.d(exports, { i: () => async function*(events) {
+    input = events; for await (const event of events) yield event;
+  } });
+  const streams = {}, delta = {};
+  runtime.m.tI({}, streams, runtime); runtime.m.sY({}, delta, runtime);
+  const parsed = streams.uj.call(scope, "original body", signal);
+  assert.equal(parsed[Symbol.asyncIterator](), parsed);
+  assert.notEqual(Object.prototype.toString.call(parsed), "[object AsyncGenerator]");
+  const decoded = delta.i(parsed);
+  assert.deepEqual(await decoded.next(), { value: { data: "original body" }, done: false });
+  assert.notEqual(input, parsed, "The nested original for-await loop also receives an ordinary iterator");
+  assert.equal(receiver, scope); assert.equal(forwardedSignal, signal); assert.equal(streams.untouched, signal);
+  await decoded.return(); assert.equal(cleanup, 1, "Cancellation reaches both original generators");
+  await assert.rejects(streams.sj().next(), /Original parse failure/);
+  const failed = streams.uj("body", signal); await failed.next();
+  await assert.rejects(failed.throw(new Error("Original consumer failure")), /Original consumer failure/);
+  assert.equal(cleanup, 2);
+  assert.equal(f.window.__CHATGPT_SAFARI_SIDECAR__.diagnostics().siteAdapter.streamCalls, 4);
+});
 test("top-level side chat routes original context and capability messages without a self-message loop", async () => {
   const f = fixture();
   assert.equal(f.window.__CODEX_BROWSER_SIDE_CHAT__, true);

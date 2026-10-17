@@ -88,7 +88,7 @@ globalThis.__CHATGPT_SAFARI_ADAPTER_READY__ = (async () => {
   const diagnostics = { outbound: {}, received: {}, failures: 0, scriptErrors: 0, unhandledRejections: 0 };
   window.addEventListener("error", () => { diagnostics.scriptErrors++; });
   window.addEventListener("unhandledrejection", () => { diagnostics.unhandledRejections++; });
-  const siteAdapter = { state: "loading", modules: [], usedFactories: {}, connections: 0 };
+  const siteAdapter = { state: "loading", modules: [], usedFactories: {}, connections: 0, streamCalls: 0 };
   const caughtErrors = [];
   function captureError(error) {
     if (!error || typeof error.name !== "string" || caughtErrors.length >= 4) return;
@@ -111,6 +111,7 @@ globalThis.__CHATGPT_SAFARI_ADAPTER_READY__ = (async () => {
       void relay.report({ state: siteAdapter.state,
         usedOrigin: siteAdapter.usedFactories.aH || 0, usedConnection: siteAdapter.usedFactories.Kxt || 0,
         connections: siteAdapter.connections, contexts: diagnostics.outbound.context || 0,
+        streamCalls: siteAdapter.streamCalls,
         failures: diagnostics.failures, scriptErrors: diagnostics.scriptErrors,
         unhandledRejections: diagnostics.unhandledRejections, channelConnected: relayPort != null, ...handshake,
         errors: caughtErrors.map(error => ({ kind: error.kind, frames: error.frames.slice(0, 4) })) }).catch(() => {});
@@ -314,6 +315,50 @@ globalThis.__CHATGPT_SAFARI_ADAPTER_READY__ = (async () => {
     install("Kxt", () => (module, exports, require) => {
       require.d(exports, { BrowserSideChatConnection: () => NativeBrowserSideChatConnection });
     });
+    // Safari 27.0.1 repeatedly crashed in asyncIteratorNextWithDriver while
+    // consuming these original response/delta generators. Keep the original
+    // parsers and stream, but cross for-await boundaries as ordinary iterators
+    // rather than triggering JSC's native async-generator fast path.
+    const plainIterator = iterator => {
+      const result = { [Symbol.asyncIterator]() { return this; }, next(...args) { return iterator.next(...args); } };
+      for (const method of ["return", "throw"]) {
+        if (typeof iterator[method] === "function") result[method] = (...args) => iterator[method](...args);
+      }
+      return result;
+    };
+    const streamFactory = (members, wrapInput = false) => original => (module, exports, require) => {
+      const found = new Set();
+      // Publish to the real exports immediately: tI has circular dependencies
+      // that must see its original live bindings during factory execution.
+      const loader = new Proxy(require, { get(target, property) {
+        if (property !== "d") return Reflect.get(target, property);
+        return (destination, getters, ...rest) => {
+          if (destination !== exports) return require.d(destination, getters, ...rest);
+          const adapted = { ...getters };
+          for (const key of members) {
+            if (!Object.hasOwn(getters, key)) continue;
+            found.add(key);
+            const originalGetter = getters[key];
+            const stream = function(...args) {
+              const originalStream = originalGetter();
+              if (typeof originalStream !== "function") throw new Error("The ChatGPT stream adapter no longer matches its public module");
+              siteAdapter.streamCalls++;
+              if (wrapInput && typeof args[0]?.[Symbol.asyncIterator] === "function") {
+                const input = args[0];
+                args[0] = { [Symbol.asyncIterator]() { return plainIterator(input[Symbol.asyncIterator]()); } };
+              }
+              return plainIterator(Reflect.apply(originalStream, this, args));
+            };
+            adapted[key] = () => stream;
+          }
+          return require.d(destination, adapted, ...rest);
+        };
+      } });
+      original(module, exports, loader);
+      if (members.some(key => !found.has(key))) throw new Error("The ChatGPT stream adapter no longer matches its public module");
+    };
+    install("sY", streamFactory(["i"], true));
+    install("tI", streamFactory(["sj", "uj"]));
     siteAdapter.state = "installed";
   }
   const adapterReady = installSiteAdapter().catch(error => {
