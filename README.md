@@ -53,6 +53,11 @@ provider frame policy.
 
 ## Direct side-chat agent control
 
+In **Chat**, type **@**, choose **Add browser tabs**, and attach the open Safari
+tabs you want compared or summarized. Chat reads their current, signed-in page
+content through the original browser-consent flow; it does not fetch a logged-out
+copy of their URLs. Page context is bounded to 80,000 characters per read.
+
 In the original inline sidebar, select **Work** and describe an action on an
 existing Safari tab, for example: "In this page, enter the project note and click
 Apply." Approve the Browser confirmation when prompted. Supported actions are
@@ -65,11 +70,40 @@ The app's own ChatGPT session authenticates only the agent tunnel; page logins
 remain in ordinary Safari and are never copied out. No separate MCP client or
 API key is needed for this path.
 
-The current executor supports top-level visible DOM, click, focused typing,
-page keys, scrolling, existing-tab navigation/history/reload, and tab closing.
-Unimplemented screenshot, Playwright, clipboard, and browser-management APIs are
-disabled rather than simulated. Stale targets and uncertain input outcomes
+The executor supports top-level visible DOM, click, focused typing, page keys,
+scrolling, existing-tab navigation/history/reload, and tab closing. This includes
+filling forms and sending a message through the page's own controls, subject to
+the original agent's consent and confirmation checks. Unimplemented screenshot,
+Playwright, and clipboard APIs stay disabled. Stale targets and uncertain input outcomes
 require a fresh page read; delivered input is never automatically replayed.
+
+### Download files using the page's existing login
+
+Ask Work to download a file linked in the current page. The original agent's
+download policy and approval run before transfer. Safari fetches the file in
+that page's ordinary-profile session; credentials never leave the browser.
+The companion saves the completed file to **~/Downloads**, preserving existing
+files with collision-safe names and applying macOS quarantine. It never opens
+the file automatically. Incomplete transfers are discarded.
+
+This route supports visible, same-origin HTTP/HTTPS file links up to **32 MiB**
+within **30 seconds**. Redirects, cross-origin links, blob URLs, and JavaScript
+download buttons are rejected explicitly. Normal native clicks remain available
+for website interactions; they do not provide this verified-download result.
+
+### Organize tabs into real Safari Tab Groups
+
+Ask Work to organize explicitly selected tabs. Its `management` capability can
+query, reorder, pin, close, group, ungroup, and rename native groups using real
+Safari APIs and macOS Accessibility. Tabs must be claimed before changes;
+unrequested tabs and existing logins are retained.
+
+Safari groups are separate named tab collections, not Chrome's colored inline
+groups. Moving a tab can remove it from the currently displayed collection.
+Group handles are session-local and resolve to an observed native title/window;
+duplicate names and shared or unverifiable groups cannot be changed. Chrome
+group colors/collapse state and bookmark management are not emulated. Read the
+capability's Safari-specific documentation before invoking its methods.
 
 Safari lacks Chrome's manifest sandbox pages. The packaged original JavaScript
 worker therefore runs at a dedicated local origin with no extension APIs,
@@ -137,6 +171,20 @@ backend; Safari does not expose `chrome.debugger`. The sidebar's high-level
 adapter and `safari_live` target existing tabs; `safari_native` is for isolated tests.
 
 ## Installed acceptance
+
+- In the original **Chat** mode, attaching two ordinary Safari tabs with **@**
+  returned both exact session-only DOM markers. Neither marker was included in
+  the prompt. The original Safari consent prompt was retained and the response
+  finished normally.
+
+- In the original **Work** sidebar, a policy-approved download used an ordinary
+  Safari page's HTTP-only session and saved the exact 204-byte UTF-8 response to
+  Downloads. A same-name file was preserved; the new file had mode 0600 and
+  macOS quarantine. The original agent's response finished normally.
+
+- In the original **Work** sidebar, the management capability claimed two
+  scratch tabs, reversed their adjacent order, and read the real final order
+  back. The original conversation finished normally and other tabs were retained.
 
 - `safari_live` listed the ordinary Safari profile's existing tabs and read an
   already signed-in Gemini page without changing its login or input. A fresh

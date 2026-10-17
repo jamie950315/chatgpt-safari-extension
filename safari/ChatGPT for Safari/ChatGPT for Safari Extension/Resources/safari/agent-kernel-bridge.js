@@ -3,8 +3,9 @@
   "use strict";
   const nativeCommands = new Set([
     "dom_cua_get_visible_dom", "dom_cua_click", "dom_cua_type",
-    "dom_cua_keypress", "dom_cua_scroll", "navigate_tab_url",
+    "dom_cua_keypress", "dom_cua_scroll", "dom_cua_download_media", "navigate_tab_url",
     "navigate_tab_back", "navigate_tab_forward", "navigate_tab_reload", "close_tab",
+    "browser_management_call", "browser_management_get_audit_trail",
   ]);
   const originalCommands = new Set([
     "browser_user_open_tabs", "browser_user_claim_tab", "browser_user_get_tab_context",
@@ -25,8 +26,18 @@
       return original();
     }
     if (!nativeCommands.has(command.type)) throw new Error(`Safari does not support agent command "${command.type}".`);
-    if (typeof command.browser_id !== "string" || !/^[1-9]\d*$/u.test(command.tab_id || "")
-      || !Number.isSafeInteger(Number(command.tab_id))) throw new Error("A Safari agent command requires its browser and claimed tab IDs.");
+    if (typeof command.browser_id !== "string" || (!command.type.startsWith("browser_management_")
+      && (!/^[1-9]\d*$/u.test(command.tab_id || "") || !Number.isSafeInteger(Number(command.tab_id))))) {
+      throw new Error("A Safari agent command requires its browser and claimed tab IDs.");
+    }
+    if (command.type === "dom_cua_download_media") {
+      const link = await context.api.executeUnhandledCommand({ type: "browser_safari_command",
+        command: { ...command, type: "safari_download_inspect" } });
+      // Keep original source/destination download consent and policy. Only the
+      // inspected href, never a model-supplied override, reaches the transfer.
+      await context.security.ensureDownloadAllowed(Number(command.tab_id), link.href);
+      return context.api.executeUnhandledCommand({ type: "browser_safari_command", command: { ...command, href: link.href } });
+    }
     return context.api.executeUnhandledCommand({ type: "browser_safari_command", command });
   }
 

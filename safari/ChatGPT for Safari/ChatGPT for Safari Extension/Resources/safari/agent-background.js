@@ -3,10 +3,12 @@
 (function (root) {
   "use strict";
   const supported = new Set(["dom_cua_get_visible_dom", "dom_cua_click", "dom_cua_type", "dom_cua_keypress", "dom_cua_scroll",
-    "navigate_tab_url", "navigate_tab_back", "navigate_tab_forward", "navigate_tab_reload", "close_tab"]);
+    "navigate_tab_url", "navigate_tab_back", "navigate_tab_forward", "navigate_tab_reload", "close_tab",
+    "browser_management_call", "browser_management_get_audit_trail", "safari_download_inspect", "dom_cua_download_media"]);
   function createAgent(api, companion) {
     const snapshots = new Map();
     const turnOwners = new Map();
+    const management = root.ChatGPTSafariManagement?.createManagement(api, companion);
     let generation = 0;
     const scopeKey = (metadata, tabId) => JSON.stringify([metadata.session_id, metadata.turn_id, tabId]);
     const turnKey = metadata => JSON.stringify([metadata.session_id, metadata.turn_id]);
@@ -40,6 +42,10 @@
     async function execute(command, session, metadata) {
       if (!command || !supported.has(command.type)) throw new Error("This agent command is not implemented by the Safari native backend");
       const owner = await authorize(session, metadata);
+      if (command.type.startsWith("browser_management_")) {
+        if (!management) throw new Error("Safari browser management is unavailable");
+        return management.execute(command, session, metadata, owner, () => authorize(session, metadata));
+      }
       const tabId = Number(command.tab_id);
       if (!Number.isSafeInteger(tabId) || tabId <= 0 || String(tabId) !== command.tab_id) throw new Error("A real Safari tab ID is required");
       await session.requireOwnedTab(tabId);
@@ -75,6 +81,15 @@
       const snapshot = snapshots.get(key);
       if (!snapshot || snapshot.owner !== owner.instanceId) throw new Error("Read the current visible DOM before interacting with this Safari tab");
       const { page } = snapshot;
+      if (command.type === "safari_download_inspect" || command.type === "dom_cua_download_media") {
+        const node = snapshot.nodes.get(command.node_id);
+        if (!node) throw new Error("Read the current visible DOM before choosing a download link");
+        const result = await run(command.type === "safari_download_inspect" ? "download_link_inspect" : "download_link", {
+          expectedUrl: page.url, documentId: page.documentId, snapshotId: page.snapshotId, node,
+          ...(command.type === "dom_cua_download_media" ? { href: command.href } : {}),
+        });
+        return command.type === "safari_download_inspect" ? result : {};
+      }
       let interaction;
       if (command.type === "dom_cua_click" || (command.type === "dom_cua_scroll" && command.node_id != null)) {
         const node = snapshot.nodes.get(command.node_id);
@@ -94,6 +109,7 @@
       return {};
     }
     function release(sessionId, turnId) {
+      if (turnId == null) management?.release(sessionId);
       for (const key of snapshots.keys()) {
         const [session, turn] = JSON.parse(key);
         if (session === sessionId && (turnId == null || turn === turnId)) snapshots.delete(key);

@@ -18,6 +18,40 @@ test("Safari high-level commands retain the original RPC session transport rathe
 test("non-Safari clients retain their existing executor", async () => {
   assert.equal(await dispatch({ clientInfo: { family: "chrome" } }, { type: "tab_cdp_call" }, async () => "original Chrome result"), "original Chrome result");
 });
+test("Safari downloads inspect the real node before original consent, then transfer only the approved href", async () => {
+  const events = [], actualHref = "https://example.com/authenticated-report.txt";
+  const command = { type: "dom_cua_download_media", browser_id: "0", tab_id: "12", node_id: "d1_n3",
+    href: "https://untrusted.example/model-supplied-override" };
+  const context = { clientInfo: { family: "safari" },
+    security: { async ensureDownloadAllowed(tabId, href) { events.push({ type: "policy", tabId, href }); } },
+    api: { async executeUnhandledCommand(value) {
+      events.push(value);
+      if (value.command.type === "safari_download_inspect") return { href: actualHref };
+      return { saved: true };
+    } } };
+  assert.deepEqual(await dispatch(context, command, () => assert.fail("Downloads must not enter the Chrome/CDP handler")), { saved: true });
+  assert.deepEqual(events.map(event => event.type === "policy" ? event.type : event.command.type),
+    ["safari_download_inspect", "policy", "dom_cua_download_media"]);
+  assert.deepEqual(events[1], { type: "policy", tabId: 12, href: actualHref });
+  assert.equal(events[2].command.href, actualHref);
+  assert.equal(events[2].command.node_id, command.node_id);
+});
+test("a rejected download policy or failed preflight cannot start a transfer", async () => {
+  for (const failure of ["preflight", "policy"]) {
+    const events = [];
+    const context = { clientInfo: { family: "safari" },
+      security: { async ensureDownloadAllowed() { events.push("policy"); throw new Error("Download denied by original policy"); } },
+      api: { async executeUnhandledCommand(value) {
+        events.push(value.command.type);
+        if (failure === "preflight") throw new Error("The download document changed");
+        if (value.command.type === "safari_download_inspect") return { href: "https://example.com/file.txt" };
+        assert.fail("A rejected download must not transfer bytes");
+      } } };
+    await assert.rejects(dispatch(context, { type: "dom_cua_download_media", browser_id: "0", tab_id: "12", node_id: "d1_n3" },
+      () => assert.fail("Must not enter the original executor")), /document changed|denied by original policy/);
+    assert.deepEqual(events, failure === "preflight" ? ["safari_download_inspect"] : ["safari_download_inspect", "policy"]);
+  }
+});
 test("the original worker accepts only its dedicated capability-bound local sandbox URL", () => {
   const previous = globalThis.location;
   try {

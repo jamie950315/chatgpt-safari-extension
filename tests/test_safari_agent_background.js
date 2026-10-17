@@ -4,13 +4,16 @@ const { createAgent } = require("../safari/ChatGPT for Safari/ChatGPT for Safari
 function fixture() {
   const calls = [], metadata = { session_id: "thread-a", turn_id: "turn-a" };
   const page = { documentId: "document-a", snapshotId: "snapshot-a", url: "https://example.com/", title: "Existing signed-in page",
-    text: "Page-only verification text", focusedNode: null, nodes: [{ node: "n1", tag: "input", label: "Project note" }, { node: "n2", tag: "button", label: "Apply" }] };
+    text: "Page-only verification text", focusedNode: null, nodes: [{ node: "n1", tag: "input", label: "Project note" }, { node: "n2", tag: "button", label: "Apply" },
+      { node: "n3", tag: "a", label: "Download report", href: "https://example.com/report.txt" }] };
   let owner = { instanceId: "sidebar-a", profileId: "55555555-5555-4555-8555-555555555555" }, error;
   const session = { currentTurnId: metadata.turn_id, async requireOwnedTab(id) { if (id !== 12) throw new Error("Tab is not claimed by this session"); } };
   const companion = { async agentOwner() { return owner; }, async runAgentCommand(command, expected) {
     calls.push({ command, expected });
     if (error) throw error;
     if (command.action === "read_page") return { ...page };
+    if (command.action === "download_link_inspect") return { href: page.nodes[2].href, url: page.url };
+    if (command.action === "download_link") return { state: "complete", path: "/Downloads/report.txt", bytesWritten: 42 };
     if (command.action === "interact") { page.snapshotId += "-next"; page.focusedNode = "n1"; return { page: { ...page }, completed: [{ type: command.arguments.interactions[0].type }] }; }
     return { status: "complete" };
   } };
@@ -59,4 +62,36 @@ test("navigation keeps the ordinary profile and checks the current target URL", 
   assert.equal(f.calls[0].command.arguments.expectedUrl, "https://example.com/");
   await assert.rejects(f.execute("playwright_evaluate", { script: "document.cookie" }), /not implemented/);
   assert.equal(f.calls.length, 1);
+});
+test("download preflight and transfer retain the exact claimed document, snapshot, node, profile and owner", async () => {
+  const f = fixture();
+  await assert.rejects(f.execute("safari_download_inspect", { node_id: "d1_n3" }), /Read the current visible DOM/);
+  assert.equal(f.calls.length, 0);
+  await f.execute("dom_cua_get_visible_dom");
+  const inspected = await f.execute("safari_download_inspect", { node_id: "d1_n3", href: "https://other.example/override" });
+  assert.deepEqual(inspected, { href: "https://example.com/report.txt", url: "https://example.com/" });
+  assert.deepEqual(f.calls[1].command, { action: "download_link_inspect", arguments: {
+    handle: "live:55555555-5555-4555-8555-555555555555:12", expectedUrl: "https://example.com/",
+    documentId: "document-a", snapshotId: "snapshot-a", node: "n3",
+  } });
+  assert.deepEqual(await f.execute("dom_cua_download_media", { node_id: "d1_n3", href: inspected.href }), {});
+  assert.deepEqual(f.calls[2].command, { action: "download_link", arguments: { ...f.calls[1].command.arguments, href: inspected.href } });
+  assert.equal(f.calls[2].expected.instanceId, "sidebar-a");
+  assert.equal(f.calls[2].expected.profileId, "55555555-5555-4555-8555-555555555555");
+  await assert.rejects(f.execute("safari_download_inspect", { node_id: "d1_n999" }), /current visible DOM/);
+  assert.equal(f.calls.length, 3);
+});
+test("a download cannot reuse a preflight after the original turn, claim or sidebar owner changes", async () => {
+  for (const change of ["turn", "claim", "owner", "release"]) {
+    const f = fixture();
+    await f.execute("dom_cua_get_visible_dom");
+    const link = await f.execute("safari_download_inspect", { node_id: "d1_n3" });
+    if (change === "turn") f.session.currentTurnId = "next-turn";
+    if (change === "claim") f.session.requireOwnedTab = async () => { throw new Error("Tab is no longer claimed"); };
+    if (change === "owner") f.setOwner({ instanceId: "next-owner", profileId: "55555555-5555-4555-8555-555555555555" });
+    if (change === "release") f.agent.release(f.metadata.session_id, f.metadata.turn_id);
+    await assert.rejects(f.execute("dom_cua_download_media", { node_id: "d1_n3", href: link.href }),
+      /no longer active|no longer claimed|sidebar owner changed|current visible DOM/);
+    assert.equal(f.calls.length, 2, "Invalidated preflight must not reach the transfer backend");
+  }
 });

@@ -5,7 +5,25 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     private let companionServer = CompanionControlServer()
     private let automation = SafariAutomation()
     private let liveInput = SafariLiveInput()
-    private lazy var live = SafariLiveBroker { [weak self] command, reply in
+    private let downloads = SafariDownloadWriter()
+    private let downloadQueue = DispatchQueue(label: "dev.jamie.chatgpt-safari.download-io")
+    private let tabOrganization = SafariTabOrganization()
+    private lazy var live = SafariLiveBroker(download: { [weak self] input, operation, authorized, reply in
+        guard let self else { reply(["ok": false, "error": ["code": "APP_CLOSED", "message": "The Safari companion was closed."]]); return }
+        self.downloadQueue.async {
+            let result = self.downloads.handle(input, operationID: operation, isAuthorized: {
+                DispatchQueue.main.sync { authorized() }
+            })
+            DispatchQueue.main.async { reply(result) }
+        }
+    }, cancelDownload: { [weak self] operation in
+        guard let self else { return }
+        self.downloadQueue.async { self.downloads.cancel(operationID: operation) }
+    },
+    organize: { [weak self] input, authorized, reply in
+        guard let self else { reply(["ok": false, "error": ["code": "APP_CLOSED", "message": "The Safari companion was closed."]]); return }
+        self.tabOrganization.handle(input, isAuthorized: authorized) { result in DispatchQueue.main.async { reply(result) } }
+    }) { [weak self] command, reply in
         guard let self else { reply(["ok": false, "error": ["code": "APP_CLOSED", "message": "The Safari companion was closed."]]); return }
         self.liveInput.handle(command) { result in DispatchQueue.main.async { reply(result) } }
     }
@@ -39,7 +57,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                     reply(["ok": false, "error": "Invalid Safari automation command"]); return
                 }
                 self.automation.handle(action, reply: reply)
-            } else if ["live", "livePoll", "liveResolve", "liveInput"].contains(command["action"] as? String ?? ""), let self {
+            } else if ["live", "livePoll", "liveResolve", "liveInput", "liveDownload", "liveOrganize"].contains(command["action"] as? String ?? ""), let self {
                 self.live.handle(command, reply: reply)
             } else if (command["action"] as? String)?.hasPrefix("embedded") == true {
                 EmbeddedSideChatController.shared.handle(command: command, reply: reply)
@@ -79,6 +97,17 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
         return false
+    }
+
+    func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        live.close()
+        // Keep the main runloop available for cancellation predicates while
+        // the serial writer finishes and removes only its own partial files.
+        downloadQueue.async {
+            self.downloads.close()
+            DispatchQueue.main.async { sender.reply(toApplicationShouldTerminate: true) }
+        }
+        return .terminateLater
     }
 
     func applicationWillTerminate(_ notification: Notification) {

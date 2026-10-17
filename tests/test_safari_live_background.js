@@ -42,8 +42,54 @@ function fixture(fastLoadingObservation = false) {
     setTimeout: fastLoadingObservation ? (callback, ms) => ms === 100 ? queueMicrotask(callback) : setTimeout(callback, ms) : setTimeout };
   const binding = createLive(api, environment);
   const request = (action, arguments_ = {}) => ({ id: "operation", deadline: Date.now() + 10000, command: { action, arguments: arguments_ } });
-  return { profileId, tab, calls, scripts, binding, request, setNative(x) { nativeResponse = x; }, setPage(x) { pageResponse = x; }, setFocused(x) { focused = x; } };
+  return { profileId, tab, calls, scripts, binding, request, setNative(x) { nativeResponse = x; }, setPage(x) { pageResponse = x; }, setFocused(x) { focused = x; },
+    setSidebar(value) { environment.ChatGPTSafariSidebar = value; } };
 }
+test("only owner-bound original-agent input enters the operation-scoped sidebar selection transaction", async () => {
+  const f = fixture(); await f.binding.start();
+  const events = [];
+  f.setSidebar({ async withAgentSelection(owner, tab, operation) {
+    assert.equal(owner, "real-inline-owner"); assert.equal(tab.id, 12);
+    events.push("begin");
+    const result = await operation({ async select(value) { assert.equal(value.id, 12); events.push("select"); },
+      assertCurrent() { events.push("current"); } });
+    events.push("restore"); return result;
+  } });
+  f.setPage({ ok: true, result: { expectedUrl: f.tab.url, point: { x: 50, y: 50 }, viewport: { width: 1000, height: 700 } } });
+  f.setNative(() => ({ ok: true, result: { eventsPosted: 2 } }));
+  const request = { ...f.request("interact", { handle: `live:${f.profileId}:12`, documentId: "doc", snapshotId: "snap",
+    interactions: [{ type: "click", node: "n1" }] }), agentOwner: "real-inline-owner" };
+  await f.binding.execute(request);
+  assert.deepEqual(events, ["begin", "select", "current", "current", "restore"]);
+  assert.equal(f.calls.some(value => value.update), false, "the transaction owns the selection update");
+  events.length = 0;
+  await f.binding.execute({ ...request, agentOwner: undefined });
+  assert.deepEqual(events, [], "ordinary live/MCP callers retain their existing selection behavior");
+  assert.equal(f.calls.some(value => value.update), true);
+  f.setSidebar(undefined);
+  const before = f.calls.length;
+  await assert.rejects(f.binding.execute(request), { code: "INVALID_OWNER" });
+  assert.equal(f.calls.length, before, "a missing sidebar owner cannot fall back to unscoped input");
+});
+test("only native group moves connect their confirmed native result to the sidebar transition lease", async () => {
+  const f = fixture(); await f.binding.start();
+  const calls = [];
+  f.setSidebar({ async withAgentSelection(owner, tab, operation, scope) {
+    assert.equal(owner, "owner"); assert.equal(tab.id, 12); calls.push(scope.nativeGroupMove);
+    return operation({ async select() {}, assertCurrent() {}, async runNativeGroupMove(action, perform) {
+      calls.push(action); const result = await perform(); assert.equal(result.mutationApplied, true); return result;
+    } });
+  } });
+  f.setNative(command => ({ ok: true, result: command.action === "liveOrganize"
+    ? { action: command.input.action, mutationApplied: true, selectedTab: { index: 0, title: f.tab.title, url: f.tab.url } }
+    : { eventsPosted: 0 } }));
+  const request = operation => ({ ...f.request("organize", { handle: `live:${f.profileId}:12`, expectedUrl: f.tab.url, operation }), agentOwner: "owner" });
+  await f.binding.execute(request("createGroup"));
+  assert.deepEqual(calls, ["createGroup", "createGroup"]);
+  calls.length = 0;
+  await f.binding.execute(request("inspect"));
+  assert.deepEqual(calls, [undefined], "read-only native inventory cannot defer arbitrary user activation");
+});
 test("poll discovery never launches the companion; real handles bind the profile and tab", async () => {
   const f = fixture(); await f.binding.start();
   assert.deepEqual(f.calls.map(x => x.action), ["livePoll"]);

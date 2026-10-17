@@ -21,5 +21,7 @@
 	<string>Allow ChatGPT side chat to use your microphone when you start a voice conversation.</string>
 	<key>NSCameraUsageDescription</key>
 	<string>Allow ChatGPT side chat to use your camera when you choose a video feature.</string>
+	<key>NSDownloadsFolderUsageDescription</key>
+	<string>Save files you ask the Work agent to download in Downloads without replacing existing files.</string>
 </dict>
 </plist>

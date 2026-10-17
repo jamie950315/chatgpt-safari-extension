@@ -1,0 +1,185 @@
+/* User-requested organization of real Safari tabs. Native groups are named
+ * collections, not Chrome's colored inline groups. No browser API is replaced. */
+(function (root) {
+  "use strict";
+  const record = value => value != null && typeof value === "object" && !Array.isArray(value);
+  const id = value => {
+    if (!Number.isSafeInteger(value) || value <= 0) throw new Error("Use an explicit Safari tab or window ID from a current query");
+    return value;
+  };
+  function options(value, keys, empty = false) {
+    if (!record(value) || (!empty && Object.keys(value).length === 0) || Object.keys(value).some(key => !keys.includes(key))) {
+      throw new Error("This Safari organization option is unsupported; read the management capability documentation");
+    }
+    return value;
+  }
+  const tabIds = value => {
+    const result = [...new Set((Array.isArray(value) ? value : [value]).map(id))];
+    if (!result.length || result.length > 50) throw new Error("Organize between 1 and 50 explicitly selected tabs");
+    return result;
+  };
+  function createManagement(api, companion) {
+    const sessions = new Map();
+    let nextGroup = 1;
+    let busy = false;
+    async function execute(command, session, metadata, owner, assertCurrent) {
+      let state = sessions.get(metadata.session_id);
+      if (!state || state.owner !== owner.instanceId || state.profile !== owner.profileId) {
+        state = { owner: owner.instanceId, profile: owner.profileId, groups: new Map(), changes: [] };
+        sessions.set(metadata.session_id, state);
+      }
+      await assertCurrent();
+      if (command.type === "browser_management_get_audit_trail") return { changes: state.changes.slice().reverse() };
+      const { namespace, method, args } = command;
+      if (!Array.isArray(args) || args.length > 2) throw new Error("Safari management requires explicit method arguments");
+      const tab = async tabId => {
+        await assertCurrent();
+        const value = await api.tabs.get(id(tabId));
+        if (value.incognito || !/^https?:\/\//iu.test(value.url || "")) throw new Error("Only ordinary HTTP/HTTPS Safari tabs can be organized");
+        return value;
+      };
+      const owned = async tabId => { const value = await tab(tabId); await session.requireOwnedTab(value.id); return value; };
+      const window = async windowId => {
+        await assertCurrent();
+        const value = await api.windows.get(id(windowId));
+        if (value.incognito || value.type !== "normal") throw new Error("Use an ordinary Safari window");
+        return value;
+      };
+      const audit = async (before, operation) => {
+        await assertCurrent();
+        const value = await operation();
+        state.changes.push({ namespace, method, args, before, createdAt: Date.now(),
+          ...(typeof value === "number" ? { result: value } : {}) });
+        state.changes = state.changes.slice(-50);
+        return value;
+      };
+      // The upstream audit's tabLayout schema requires Chrome-only group/color
+      // and autoDiscardable values. Omit that snapshot rather than invent them.
+      const layout = () => ({});
+      const organize = async (target, action, extra = {}) => {
+        await assertCurrent();
+        return companion.runAgentCommand({ action: "organize", arguments: {
+          handle: `live:${owner.profileId}:${target.id}`, expectedUrl: target.url, operation: action, ...extra,
+        } }, owner);
+      };
+      const describeGroup = group => ({ id: group.id, title: group.title, windowId: group.windowId,
+        nativeIdentity: { kind: "safari-native-title", title: group.title, windowIdentifier: group.windowIdentifier } });
+      const observeGroups = async windowId => {
+        const target = await tab(owner.tabId);
+        if (windowId !== undefined && target.windowId !== id(windowId)) throw new Error("Inspect native groups in the sidebar's current Safari window");
+        const observed = await organize(target, "inspect");
+        const titles = observed.groupTitles;
+        if (!Array.isArray(titles) || typeof observed.windowIdentifier !== "string") throw new Error("Safari did not return a native tab-group inventory");
+        if (new Set(titles).size !== titles.length) throw new Error("Native Safari groups have duplicate names; rename them uniquely before organizing them");
+        for (const group of state.groups.values()) {
+          if (group.windowId === target.windowId && (group.windowIdentifier !== observed.windowIdentifier || !titles.includes(group.title))) state.groups.delete(group.id);
+        }
+        return titles.map(title => {
+          let group = [...state.groups.values()].find(item => item.title === title && item.windowIdentifier === observed.windowIdentifier);
+          if (!group) { group = { id: nextGroup++, title, windowId: target.windowId, windowIdentifier: observed.windowIdentifier, tabs: new Set() }; state.groups.set(group.id, group); }
+          if (observed.currentGroupTitle === title) group.tabs.add(target.id);
+          return describeGroup(group);
+        });
+      };
+      const findGroup = async groupId => {
+        await observeGroups();
+        const group = state.groups.get(id(groupId));
+        if (!group) throw new Error("The native Safari group changed. Query tabGroups again before acting");
+        return group;
+      };
+      const groupTarget = async group => {
+        for (const tabId of group.tabs) {
+          try { const value = await owned(tabId); if (value.windowId === group.windowId) return value; } catch { /* A user may have closed a formerly observed member. */ }
+        }
+        throw new Error("Claim a currently visible tab in this native group before renaming it");
+      };
+
+      let value;
+      if (namespace === "tabs" && method === "query") {
+        const query = options(args[0] ?? {}, ["windowId", "active", "pinned", "title", "url", "currentWindow", "lastFocusedWindow"], true);
+        value = (await api.tabs.query(query)).filter(item => !item.incognito && /^https?:\/\//iu.test(item.url || ""));
+      } else if (namespace === "tabs" && method === "get") value = await tab(args[0]);
+      else if (namespace === "tabs" && method === "update") {
+        const target = await owned(args[0]), changes = options(args[1], ["pinned"]);
+        if (typeof changes.pinned !== "boolean") throw new Error("pinned must be a boolean");
+        value = await audit(layout([target]), () => api.tabs.update(target.id, changes));
+      } else if (namespace === "tabs" && method === "remove") {
+        const targets = await Promise.all(tabIds(args[0]).map(owned));
+        value = await audit(layout(targets), () => api.tabs.remove(targets.map(item => item.id)));
+      } else if (namespace === "tabs" && method === "move") {
+        const targets = await Promise.all(tabIds(args[0]).map(owned)), move = options(args[1], ["windowId", "index"]);
+        if (!Number.isSafeInteger(move.index) || move.index < -1) throw new Error("tabs.move requires index >= -1");
+        if (move.windowId !== undefined) await window(move.windowId);
+        value = await audit(layout(targets), () => api.tabs.move(targets.map(item => item.id), move));
+      } else if (namespace === "tabs" && method === "group") {
+        const request = options(args[0], ["tabIds", "groupId", "createProperties"]);
+        const targets = await Promise.all(tabIds(request.tabIds).map(owned));
+        if (targets.some(item => item.pinned || item.windowId !== targets[0].windowId)) throw new Error("Group unpinned tabs in the same Safari window; move them only when the user requests a transfer");
+        const properties = options(request.createProperties ?? {}, ["windowId"], true);
+        if (properties.windowId !== undefined && properties.windowId !== targets[0].windowId) throw new Error("createProperties.windowId must match the selected tabs");
+        if (request.groupId !== undefined && request.createProperties !== undefined) throw new Error("Use either groupId or createProperties, not both");
+        let group = request.groupId === undefined ? undefined : await findGroup(request.groupId);
+        if (group && group.windowId !== targets[0].windowId) throw new Error("Select a native group in the same Safari window");
+        const title = group?.title || `ChatGPT ${new Date().toISOString().replace(/[:.]/gu, "-")}`;
+        const ordered = targets.slice().sort((a, b) => Number(a.id === owner.tabId) - Number(b.id === owner.tabId));
+        const completed = [];
+        try {
+          value = await audit(layout(targets), async () => {
+            for (const target of ordered) {
+              const result = await organize(await owned(target.id), group ? "moveToGroup" : "createGroup", {
+                groupTitle: title, ...(group ? { windowIdentifier: group.windowIdentifier } : { newTitle: title }),
+              });
+              if (!group) {
+                group = { id: nextGroup++, title, windowId: target.windowId, windowIdentifier: result.windowIdentifier, tabs: new Set() };
+                state.groups.set(group.id, group);
+              }
+              group.tabs.add(target.id); completed.push(target.id);
+            }
+            return group.id;
+          });
+        } catch (error) { throw new Error(`${error.message}. Grouped tab IDs: ${completed.join(", ") || "none confirmed"}. Native operations were not retried. Query current tabs before continuing.`); }
+      } else if (namespace === "tabs" && method === "ungroup") {
+        const targets = await Promise.all(tabIds(args[0]).map(owned));
+        value = await audit(layout(targets), async () => {
+          for (const target of targets) {
+            await organize(await owned(target.id), "moveToUngrouped");
+            for (const group of state.groups.values()) group.tabs.delete(target.id);
+          }
+        });
+      } else if (namespace === "tabGroups" && method === "query") {
+        const query = options(args[0] ?? {}, ["windowId", "title"], true);
+        value = (await observeGroups(query.windowId)).filter(item => query.title === undefined || item.title === query.title);
+      } else if (namespace === "tabGroups" && method === "get") value = describeGroup(await findGroup(args[0]));
+      else if (namespace === "tabGroups" && method === "update") {
+        const group = await findGroup(args[0]), changes = options(args[1], ["title"]);
+        if (typeof changes.title !== "string" || !changes.title.trim() || changes.title.length > 120) throw new Error("A native group needs a nonempty title of at most 120 characters");
+        const target = await groupTarget(group);
+        value = await audit({}, async () => {
+          await organize(target, "renameGroup", { groupTitle: group.title, newTitle: changes.title, windowIdentifier: group.windowIdentifier });
+          group.title = changes.title; return describeGroup(group);
+        });
+      } else if (namespace === "windows" && ["get", "getAll", "getCurrent", "getLastFocused"].includes(method)) {
+        if (method === "get") value = await window(args[0]);
+        else if (method === "getAll") {
+          options(args[0] ?? {}, ["populate", "windowTypes"], true);
+          value = (await api.windows.getAll(args[0] ?? {})).filter(item => !item.incognito && item.type === "normal");
+        } else value = await window((await tab(owner.tabId)).windowId);
+      } else if (namespace === "windows" && method === "update") {
+        const target = await window(args[0]), changes = options(args[1], ["focused", "left", "top", "width", "height", "state"]);
+        if (changes.state !== undefined && !["normal", "minimized", "maximized", "fullscreen"].includes(changes.state)) throw new Error("Unsupported Safari window state");
+        await Promise.all((await api.tabs.query({ windowId: target.id })).map(item => owned(item.id)));
+        value = await audit({ windows: [{ id: target.id, focused: target.focused, left: target.left, top: target.top,
+          width: target.width, height: target.height, state: target.state }] }, () => api.windows.update(target.id, changes));
+      } else throw new Error(`Safari does not support management.${namespace}.${method}. Read this capability's Safari documentation`);
+      await assertCurrent();
+      return { value: value === undefined ? null : value };
+    }
+    return { async execute(...args) {
+      if (busy) throw new Error("Another Safari organization command is running. This command was not queued or executed");
+      busy = true;
+      try { return await execute(...args); } finally { busy = false; }
+    }, release(sessionId) { sessions.delete(sessionId); } };
+  }
+  if (typeof module === "object" && module.exports) module.exports = { createManagement };
+  else Object.defineProperty(root, "ChatGPTSafariManagement", { value: { createManagement } });
+})(globalThis);

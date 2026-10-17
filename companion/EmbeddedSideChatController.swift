@@ -115,7 +115,7 @@ final class EmbeddedSideChatController {
                 guard let profile = liveProfileId, command["profileId"] as? String == profile,
                       let request = command["command"] as? [String: Any],
                       let action = request["action"] as? String,
-                      ["read_page", "interact", "navigate", "history", "select_tab", "close_tab"].contains(action),
+                      ["read_page", "interact", "navigate", "history", "select_tab", "close_tab", "organize", "download_link_inspect", "download_link"].contains(action),
                       let args = request["arguments"] as? [String: Any],
                       let handle = args["handle"] as? String, SafariLiveBroker.profile(from: handle) == profile,
                       let liveCommand else { throw SideChatError("The side-chat browser command has no matching Safari profile") }

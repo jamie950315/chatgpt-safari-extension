@@ -18,6 +18,9 @@ final class SafariLiveBroker {
         var delivered = false
     }
     private let input: ([String: Any], @escaping Reply) -> Void
+    private let download: ([String: Any], String, @escaping () -> Bool, @escaping Reply) -> Void
+    private let cancelDownload: (String) -> Void
+    private let organize: ([String: Any], @escaping () -> Bool, @escaping Reply) -> Void
     private var profiles: [String: Profile] = [:]
     private var operation: Operation?
     private var busy = false
@@ -25,7 +28,17 @@ final class SafariLiveBroker {
     private var activeAgentOwner: String?
     private var agentGeneration = 0
 
-    init(input: @escaping ([String: Any], @escaping Reply) -> Void) { self.input = input }
+    init(download: @escaping ([String: Any], String, @escaping () -> Bool, @escaping Reply) -> Void = { _, _, _, reply in
+            reply(SafariLiveBroker.failure("DOWNLOAD_UNAVAILABLE", "The native download writer is unavailable."))
+         }, cancelDownload: @escaping (String) -> Void = { _ in },
+         organize: @escaping ([String: Any], @escaping () -> Bool, @escaping Reply) -> Void = { _, _, reply in
+            reply(SafariLiveBroker.failure("ORGANIZATION_UNAVAILABLE", "Native Safari tab organization is unavailable."))
+         }, input: @escaping ([String: Any], @escaping Reply) -> Void) {
+        self.input = input
+        self.download = download
+        self.cancelDownload = cancelDownload
+        self.organize = organize
+    }
 
     func handle(_ command: [String: Any], reply: @escaping Reply) {
         precondition(Thread.isMainThread)
@@ -39,10 +52,29 @@ final class SafariLiveBroker {
                   current.session == command["sessionId"] as? String,
                   let native = command["input"] as? [String: Any],
                   ["click", "type", "key", "scroll", "focus"].contains(native["action"] as? String ?? ""),
-                  (native["action"] as? String != "focus" || current.command["action"] as? String == "interact") else {
+                  (native["action"] as? String != "focus" || ["interact", "organize"].contains(current.command["action"] as? String ?? "")) else {
                 reply(Self.failure("STALE_OPERATION", "The live Safari input no longer belongs to an active command.")); return
             }
             input(native, reply)
+        case "liveDownload", "liveOrganize":
+            let isDownload = command["action"] as? String == "liveDownload"
+            guard let current = operation, current.delivered,
+                  current.id == command["id"] as? String,
+                  current.profile == command["profileId"] as? String,
+                  current.session == command["sessionId"] as? String,
+                  current.command["action"] as? String == (isDownload ? "download_link" : "organize"),
+                  let native = command["input"] as? [String: Any] else {
+                reply(Self.failure("STALE_OPERATION", "This native operation no longer belongs to an active Safari command.")); return
+            }
+            if isDownload { download(native, current.id, { [weak self] in self?.operation?.id == current.id }, reply) }
+            else {
+                let expected = current.command["arguments"] as? [String: Any] ?? [:]
+                guard native["action"] as? String == expected["operation"] as? String,
+                      native["expectedUrl"] as? String == expected["expectedUrl"] as? String else {
+                    reply(Self.failure("INVALID_COMMAND", "The native tab organization differs from the authorized command.")); return
+                }
+                organize(native, { [weak self] in self?.operation?.id == current.id }, reply)
+            }
         case "live":
             guard let request = command["command"] as? [String: Any], let action = request["action"] as? String else {
                 reply(Self.failure("INVALID_COMMAND", "A live Safari command is required.")); return
@@ -85,6 +117,7 @@ final class SafariLiveBroker {
         if let previous = profiles[profile], previous.session != session,
            let old = operation, old.profile == profile {
             operation = nil
+            cancelDownload(old.id)
             old.reply(Self.failure("BACKGROUND_CHANGED", "The Safari background restarted; the command was not replayed."))
         }
         profiles[profile] = Profile(session: session, seen: Date())
@@ -94,6 +127,7 @@ final class SafariLiveBroker {
             operation = current
             requests = [["id": current.id, "command": current.command,
                          "deadline": Date().addingTimeInterval(35).timeIntervalSince1970 * 1000]]
+            if let owner = current.agentOwner { requests[0]["agentOwner"] = owner }
         }
         reply(["ok": true, "requests": requests])
     }
@@ -107,6 +141,7 @@ final class SafariLiveBroker {
             reply(Self.failure("STALE_OPERATION", "This live Safari response belongs to an expired command.")); return
         }
         operation = nil
+        cancelDownload(current.id)
         profiles[current.profile]?.seen = Date()
         reply(["ok": true])
         current.reply(result)
@@ -122,6 +157,7 @@ final class SafariLiveBroker {
         DispatchQueue.main.asyncAfter(deadline: .now() + 40) { [weak self] in
             guard let self, let pending = self.operation, pending.id == id else { return }
             self.operation = nil
+            self.cancelDownload(pending.id)
             pending.reply(Self.failure("LIVE_TIMEOUT", "Safari did not finish the live command. Its outcome is uncertain; it was not retried."))
         }
     }
@@ -133,7 +169,8 @@ final class SafariLiveBroker {
     }
 
     private func execute(_ action: String, args: [String: Any], agentOwner: String?, generation: Int, reply: @escaping Reply) {
-        guard ["list_tabs", "read_page", "interact", "navigate", "history", "select_tab", "create_tab", "close_tab"].contains(action) else {
+        guard ["list_tabs", "read_page", "interact", "navigate", "history", "select_tab", "create_tab", "close_tab",
+               "organize", "download_link_inspect", "download_link"].contains(action) else {
             reply(Self.failure("UNKNOWN_ACTION", "Unknown live Safari tool.")); return
         }
         discover(deadline: Date().addingTimeInterval(5)) { ids in
@@ -183,6 +220,7 @@ final class SafariLiveBroker {
         agentGeneration += 1
         guard let pending = operation, pending.agentOwner == owner else { return }
         operation = nil
+        cancelDownload(pending.id)
         pending.reply(Self.failure("AGENT_OWNER_CHANGED", pending.delivered
             ? "The sidebar closed or changed during a delivered command. Its outcome may be partial; read the page before continuing and do not repeat input."
             : "The sidebar closed or changed before command delivery. No input was executed."))
@@ -190,7 +228,7 @@ final class SafariLiveBroker {
 
     func close() {
         closed = true
-        if let pending = operation { operation = nil; pending.reply(Self.failure("APP_CLOSED", "The live Safari companion was closed.")) }
+        if let pending = operation { operation = nil; cancelDownload(pending.id); pending.reply(Self.failure("APP_CLOSED", "The live Safari companion was closed.")) }
         profiles.removeAll()
     }
 

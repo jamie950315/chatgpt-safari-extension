@@ -142,7 +142,7 @@
         await ownedTab(state);
         const profileId = (await api.storage.local.get("safariLiveProfileId")).safariLiveProfileId;
         if (typeof profileId !== "string" || !/^[0-9a-f-]{36}$/i.test(profileId)) throw new Error("The Safari browser profile is not ready");
-        return { instanceId: state.instanceId, profileId };
+        return { instanceId: state.instanceId, profileId, tabId: state.tabId, windowId: state.windowId };
       },
       async agentKernelURL() {
         if (!embedded || !owner) throw new Error("Open the ChatGPT sidebar before starting its agent kernel");

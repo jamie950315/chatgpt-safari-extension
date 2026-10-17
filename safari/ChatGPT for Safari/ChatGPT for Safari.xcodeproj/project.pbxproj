@@ -7,6 +7,8 @@
 	objects = {
 
 /* Begin PBXBuildFile section */
+		A03000700010001000100001 /* SafariDownloadWriter.swift in Sources */ = {isa = PBXBuildFile; fileRef = A03000700010001000100002 /* SafariDownloadWriter.swift */; };
+		A03000800010001000100001 /* SafariTabOrganization.swift in Sources */ = {isa = PBXBuildFile; fileRef = A03000800010001000100002 /* SafariTabOrganization.swift */; };
 		A03000600010001000100001 /* SafariLiveBroker.swift in Sources */ = {isa = PBXBuildFile; fileRef = A03000600010001000100002 /* SafariLiveBroker.swift */; };
 		A03000500010001000100001 /* SafariLiveInput.swift in Sources */ = {isa = PBXBuildFile; fileRef = A03000500010001000100002 /* SafariLiveInput.swift */; };
 		A03000400010001000100001 /* SideChatBridge.js in Resources */ = {isa = PBXBuildFile; fileRef = A03000400010001000100002 /* SideChatBridge.js */; };
@@ -71,6 +73,8 @@
 /* End PBXCopyFilesBuildPhase section */
 
 /* Begin PBXFileReference section */
+		A03000700010001000100002 /* SafariDownloadWriter.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "../../native/SafariDownloadWriter.swift"; sourceTree = SOURCE_ROOT; };
+		A03000800010001000100002 /* SafariTabOrganization.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "../../native/SafariTabOrganization.swift"; sourceTree = SOURCE_ROOT; };
 		A03000600010001000100002 /* SafariLiveBroker.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "../../companion/SafariLiveBroker.swift"; sourceTree = SOURCE_ROOT; };
 		A03000500010001000100002 /* SafariLiveInput.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "../../native/SafariLiveInput.swift"; sourceTree = SOURCE_ROOT; };
 		A03000400010001000100002 /* SideChatBridge.js */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.javascript; path = "../../companion/SideChatBridge.js"; sourceTree = SOURCE_ROOT; };
@@ -136,6 +140,8 @@
 				A03000400010001000100002 /* SideChatBridge.js */,
 				A03000500010001000100002 /* SafariLiveInput.swift */,
 				A03000600010001000100002 /* SafariLiveBroker.swift */,
+				A03000700010001000100002 /* SafariDownloadWriter.swift */,
+				A03000800010001000100002 /* SafariTabOrganization.swift */,
 				A03000300010001000100002 /* SafariAutomation.swift */,
 				A03000200010001000100002 /* CompanionControlServer.swift */,
 				A03000100010001000100002 /* SideChatCompanionController.swift */,
@@ -339,6 +345,8 @@
 				7D22E8053081CAC000CD05F6 /* ViewController.swift in Sources */,
 				A03000500010001000100001 /* SafariLiveInput.swift in Sources */,
 				A03000600010001000100001 /* SafariLiveBroker.swift in Sources */,
+				A03000700010001000100001 /* SafariDownloadWriter.swift in Sources */,
+				A03000800010001000100001 /* SafariTabOrganization.swift in Sources */,
 				A03000300010001000100001 /* SafariAutomation.swift in Sources */,
 				A03000200010001000100001 /* CompanionControlServer.swift in Sources */,
 				A03000100010001000100001 /* SideChatCompanionController.swift in Sources */,

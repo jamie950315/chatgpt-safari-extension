@@ -13,7 +13,7 @@ BRIDGE_END = "/* END GENERATED SAFARI AGENT BRIDGE */\n"
 API_SUPPORT_OVERRIDES = {
     "Browser.user": True,
     "BrowserUser.getTabContext": True,
-    "Browser.capabilities": False,
+    "Browser.capabilities": True,
     "Browser.history": False,
     "Tabs.new": False,
     "Tabs.content": False,
@@ -29,8 +29,62 @@ API_SUPPORT_OVERRIDES = {
     "Tab.getJsDialog": False,
     "Tab.requestManualHandoff": False,
     "DomCUAAPI.double_click": False,
-    "DomCUAAPI.downloadMedia": False,
+    "DomCUAAPI.downloadMedia": True,
 }
+
+MANAGEMENT_DOCUMENTATION = """# Safari Browser Capability: management
+Use only for browser organization the user requested. This capability controls
+ordinary Safari tabs and actual native Safari Tab Groups, retaining their logins.
+Do not move, close, pin, or rename unrelated tabs. Claim each tab with
+`browser.user.claimTab(...)` before changing it. Re-query after every mutation.
+
+## Supported methods
+- `tabs.query({windowId?, active?, pinned?, title?, url?})` and `tabs.get(tabId)`.
+- `tabs.move(tabIds, {index, windowId?})`, `tabs.update(tabId, {pinned})`,
+  and `tabs.remove(tabIds)`. Cross-window moves require an explicit user request.
+- `tabs.group({tabIds, createProperties?: {windowId}})` creates a real named
+  Safari group and returns its local group handle. All tabs must be unpinned and
+  in one window. Use `tabs.group({tabIds, groupId})` to join an observed group.
+- `tabs.ungroup(tabIds)` moves those tabs into Safari's ungrouped collection.
+- `tabGroups.query({windowId?, title?})`, `tabGroups.get(groupId)`, and
+  `tabGroups.update(groupId, {title})`. Query in the sidebar's current window.
+  Claim a visible member before renaming an existing group.
+- `windows.get(id)`, `windows.getAll({populate?})`, `windows.getCurrent()`,
+  `windows.getLastFocused()` (the owning sidebar window), and
+  `windows.update(id, {focused?, left?, top?, width?, height?, state?})`.
+  Claim all tabs in a window before changing its layout.
+
+## Safari group semantics
+Safari groups are separate tab collections, not Chrome's colored inline groups.
+Moving a tab into a group can remove it from the current collection. It does not
+create another login session. Query the current tabs after each operation;
+never replay an uncertain move. If grouping includes the sidebar's own tab,
+move it last. A group result contains `id`, `title`, `windowId`, and
+`nativeIdentity: {kind: 'safari-native-title', title, windowIdentifier}`.
+Handles are session-local; renaming or changing windows can invalidate them.
+Duplicate names, shared groups, unknown sharing state, Chrome color/collapse,
+group reordering, bookmark operations, and other methods are rejected.
+
+`getAuditTrail()` reports successful calls made by this adapter in this sidebar
+session. Chrome-only tab-layout snapshots are omitted, not fabricated. It is
+not a full browser history or an automatic undo mechanism. Tell the user what
+changed and how to reverse it using observed tabs/groups.
+"""
+
+
+def prepare_management_documentation(source: str) -> str:
+    start = source.index('"capabilities/browser/management":`') + len('"capabilities/browser/management":`')
+    end = source.index('`,"', start)
+    document = MANAGEMENT_DOCUMENTATION.replace('`', '\\`').replace('${', '\\${')
+    return source[:start] + document + source[end:]
+
+
+def prepare_download_documentation(source: str) -> str:
+    original = "downloadMedia(options: DomDownloadMediaOptions): Promise<void>; // Trigger a media download for a DOM node."
+    adapted = "downloadMedia(options: DomDownloadMediaOptions): Promise<void>; // Save a visible same-origin HTTP(S) file link to ~/Downloads using the page login after download approval (32 MiB, 30 seconds). Redirects, blob URLs and JavaScript buttons are unsupported."
+    if adapted not in source:
+        source = replace_once(source, original, adapted)
+    return source
 
 OFFSCREEN_START = 'async function Ud(){const e="js-kernel-offscreen.html",t=chrome.runtime.getURL(e);if(!((await chrome.runtime.getContexts({contextTypes:["OFFSCREEN_DOCUMENT"],documentUrls:[t]})).length>0)){Lr==null&&(Lr=chrome.offscreen.createDocument({justification:"Run isolated, persistent browser JavaScript kernels.",reasons:["IFRAME_SCRIPTING","WORKERS"],url:e}));try{await Lr}finally{Lr=null}}}'
 PORT_ORIGIN = 'a.origin!==s.origin||a.protocol!==s.protocol||a.host!==s.host'
@@ -78,6 +132,11 @@ def bridge_source() -> str:
 
 def prepare_background(source: str) -> str:
     """Run on the already guarded upstream background, before adapter prefixing."""
+    # Keep the original authenticated-tab extractor and security gate. Its
+    # caller disables both native bounds with null; Safari context reads need
+    # the extractor's existing traversal and output limits instead.
+    source = replace_once(source, 'case"page":return await r(Vu,[e,null,null],"ISOLATED")',
+                          'case"page":return await r(Vu,[e,8e4,8e4],"ISOLATED")')
     source = replace_once(source, OFFSCREEN_START,
                           'async function Ud(){await globalThis.ChatGPTSafariAgentKernel.ensureHostDocument()}')
     source = replace_once(source, PORT_ORIGIN,
@@ -98,6 +157,8 @@ def prepare_background(source: str) -> str:
                           'async executeUnhandledCommand(e){if(e.type==="browser_safari_context"){const t=await this.activateSession(e);await globalThis.ChatGPTSafariAgent.authorize(t,e);return{}}if(e.type==="browser_safari_command"){const t=await this.activateSession(e);return globalThis.ChatGPTSafariAgent.execute(e.command,t,e)}const t=')
     source = replace_once(source, 'apiSupportOverrides:{"BrowserUser.getTabContext":!0}',
                           'apiSupportOverrides:' + json.dumps(API_SUPPORT_OVERRIDES, separators=(",", ":")))
+    source = replace_once(source, 'browser:[Go.info,...await this.browserManagementEnabled?[Mo.info]:[]]',
+                          'browser:await this.browserManagementEnabled?[{...Mo.info,description:"Organize ordinary Safari tabs and native named tab groups. Read Safari-specific documentation first."}]:[]')
     source = replace_once(source, ',await n.endTurn(r)}async getInfo(e)',
                           ';try{await n.endTurn(r)}finally{globalThis.ChatGPTSafariAgent.release(t,r)}}async getInfo(e)')
     return bridge_source() + "\n" + source
@@ -114,6 +175,10 @@ def prepare_kernel_host(source: str) -> str:
             source = replace_once(source, new, old) if new in source else replace_once(source, old, old)
     for old, new in KERNEL_REPLACEMENTS.items():
         source = replace_once(source, old, new)
+    source = source.replace('unsupportedByDefaultIn:["iab","mcpapps"],documented:!1},get_visible_dom:',
+                            'unsupportedByDefaultIn:["iab","mcpapps"],documented:!0},get_visible_dom:')
+    source = prepare_management_documentation(source)
+    source = prepare_download_documentation(source)
     return BRIDGE_BEGIN + bridge_source() + "\n" + BRIDGE_END + source
 
 

@@ -135,15 +135,33 @@
       // Never turn a delivered navigation into an apparently failed mutation.
       return tab;
     }
-    async function focus(tab) {
-      await api.tabs.update(tab.id, { active: true });
-      await api.windows.update(tab.windowId, { focused: true });
+    async function focus(tab, selection) {
+      if (selection) await selection.select(tab);
+      else {
+        await api.tabs.update(tab.id, { active: true });
+        await api.windows.update(tab.windowId, { focused: true });
+      }
       const fresh = await target(describe(tab).handle, tab.url);
       const window = await api.windows.get(tab.windowId);
       if (!fresh.active) throw fail("FOCUS_CHANGED", "Safari did not select the requested tab.");
       return { left: window.left, top: window.top, width: window.width, height: window.height };
     }
     async function execute(request) {
+      const action = request.command.action;
+      if (request.agentOwner !== undefined && ["interact", "organize", "select_tab"].includes(action)) {
+        if (typeof request.agentOwner !== "string" || !request.agentOwner
+          || typeof environment.ChatGPTSafariSidebar?.withAgentSelection !== "function") {
+          throw fail("INVALID_OWNER", "The original Safari agent selection owner is unavailable.");
+        }
+        const tab = await target(request.command.arguments?.handle, request.command.arguments?.expectedUrl);
+        const nativeGroupMove = action === "organize" && ["createGroup", "moveToGroup", "moveToUngrouped"].includes(request.command.arguments?.operation)
+          ? request.command.arguments.operation : undefined;
+        return environment.ChatGPTSafariSidebar.withAgentSelection(request.agentOwner, tab,
+          selection => executeCommand(request, selection), { nativeGroupMove });
+      }
+      return executeCommand(request);
+    }
+    async function executeCommand(request, selection) {
       const action = request.command.action, args = request.command.arguments || {};
       const assertTime = () => { if (Date.now() > request.deadline) throw fail("LIVE_TIMEOUT", "The live command expired. It was not replayed."); };
       assertTime();
@@ -158,6 +176,25 @@
       }
       const tab = await target(args.handle, ["navigate", "history", "select_tab", "close_tab"].includes(action) ? args.expectedUrl : undefined);
       if (action === "read_page") return read(tab, args.maxLength);
+      if (action === "download_link_inspect" || action === "download_link") {
+        const downloads = environment.ChatGPTSafariDownloads.createDownloads({ api, target, send, profileId, sessionId, assertTime, unwrap });
+        return action === "download_link_inspect" ? downloads.inspect(tab, args) : downloads.execute(request, tab, args);
+      }
+      if (action === "organize") {
+        if (typeof args.expectedUrl !== "string" || !["inspect", "createGroup", "moveToGroup", "moveToUngrouped", "renameGroup"].includes(args.operation)) throw fail("INVALID_ARGUMENT", "A native Safari organization operation and expectedUrl are required.");
+        const selectedBounds = await focus(tab, selection);
+        assertTime();
+        unwrap(await send({ action: "liveInput", id: request.id, profileId, sessionId,
+          input: { action: "focus", expectedUrl: tab.url, windowBounds: selectedBounds } }));
+        const fresh = await target(args.handle, args.expectedUrl);
+        assertTime();
+        const organize = async () => unwrap(await send({ action: "liveOrganize", id: request.id, profileId, sessionId,
+          input: { action: args.operation, expectedUrl: fresh.url, windowBounds: selectedBounds,
+            tab: { index: fresh.index, title: fresh.title }, groupTitle: args.groupTitle, newTitle: args.newTitle,
+            windowIdentifier: args.windowIdentifier } }));
+        return selection && ["createGroup", "moveToGroup", "moveToUngrouped"].includes(args.operation)
+          ? selection.runNativeGroupMove(args.operation, organize) : organize();
+      }
       if (["navigate", "history", "select_tab", "close_tab"].includes(action) && typeof args.expectedUrl !== "string") throw fail("INVALID_ARGUMENT", "expectedUrl is required for this action.");
       if (action === "navigate") { await api.tabs.update(tab.id, { url: url(args.url) }); return describe(await ready(tab.id)); }
       if (action === "history") {
@@ -166,7 +203,7 @@
         await api.tabs[method](tab.id);
         return describe(await ready(tab.id));
       }
-      if (action === "select_tab") { await focus(tab); return describe(await target(args.handle, tab.url)); }
+      if (action === "select_tab") { await focus(tab, selection); return describe(await target(args.handle, tab.url)); }
       if (action === "close_tab") { await api.tabs.remove(tab.id); return { closed: true, handle: args.handle }; }
       if (action !== "interact") throw fail("UNKNOWN_ACTION", "Unknown live Safari action.");
       if (typeof args.documentId !== "string" || typeof args.snapshotId !== "string" ||
@@ -178,12 +215,13 @@
         // Safari's windows.update selects its window but does not activate a
         // background/fullscreen app. One explicit native activation precedes
         // the batch; later user focus changes abort instead of being undone.
-        const selectedBounds = await focus(tab);
+        const selectedBounds = await focus(tab, selection);
         assertTime();
         const activated = unwrap(await send({ action: "liveInput", id: request.id, profileId, sessionId,
           input: { action: "focus", expectedUrl: tab.url, windowBounds: selectedBounds } }));
         nativeSteps.push({ action: "focus", ...activated });
         for (const interaction of args.interactions) {
+          selection?.assertCurrent();
           assertTime();
           if (!["click", "type", "key", "scroll"].includes(interaction.type) ||
               (interaction.type !== "scroll" && typeof interaction.node !== "string")) throw fail("INVALID_ARGUMENT", "Each interaction requires a supported type and page node.");
@@ -195,6 +233,7 @@
           const windowBounds = { left: window.left, top: window.top, width: window.width, height: window.height };
           const geometry = await page(tab, "prepare", { ...args, ...interaction });
           const native = async (kind, extra = {}) => {
+            selection?.assertCurrent();
             assertTime(); await target(args.handle, tab.url); await page(tab, "check", args);
             await page(tab, "pointCheck", { ...args, node: interaction.node, point: geometry.point });
             const result = unwrap(await send({ action: "liveInput", id: request.id, profileId, sessionId,

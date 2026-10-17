@@ -45,6 +45,59 @@ assert.equal(calls,0);listener(event);
 setImmediate(()=>{assert.equal(calls,1);assert.equal(response.id,"fixture");assert.equal(response.ok,true);assert.equal(closed,true)});
 '''.replace("SOURCE", json.dumps(source)))
 
+    def test_original_tab_context_reads_open_authenticated_tabs_with_bounded_content(self):
+        background = module.prepare_safari_agent.prepare_background(module.prepare(module.SOURCE.read_text()))
+        # Execute only the preserved reader functions, never the application
+        # bootstrap. The browser mock runs the actual extractor in each tab's
+        # separate document, with no remote fetch or mutation API available.
+        source = "\n".join([
+            module.bounded_function(background, "function Vu(", 'var Hu="'),
+            module.bounded_function(background, "async function Zu(", "function Ju("),
+            module.bounded_function(background, "async function Bm(", "var Bi="),
+        ])
+        self.run_javascript(r'''
+const assert=require("node:assert/strict"),vm=require("node:vm");
+const calls=[],tabs=new Map(),text=value=>({nodeType:3,textContent:value});
+const element=(tag,children=[],attributes={})=>({nodeType:1,tagName:tag.toUpperCase(),
+  namespaceURI:"http://www.w3.org/1999/xhtml",childNodes:children,
+  getAttribute:name=>attributes[name]??null,...(tag==="input"?{type:attributes.type,value:attributes.value}: {})});
+const documentFor=(url,body,title="Private tab")=>({location:{href:url},baseURI:url,title,body});
+tabs.set(11,{id:11,url:"https://authenticated.example.invalid/one",document:documentFor(
+  "https://authenticated.example.invalid/one",element("body",[text("SESSION_ONLY_ONE"),
+    element("input",[],{type:"password",value:"DO_NOT_READ_PASSWORD"}),element("script",[text("DO_NOT_READ_SCRIPT")])]))});
+tabs.set(12,{id:12,url:"https://authenticated.example.invalid/two",document:documentFor(
+  "https://authenticated.example.invalid/two",element("body",[text("SESSION_ONLY_TWO")]))});
+let afterCapture;
+const sandbox={URL,Error,Ku:80000,it:"The selected tab changed while being read",chrome:{
+  tabs:{get:async id=>({...tabs.get(id)})},scripting:{executeScript:async request=>{
+    calls.push(request);assert.equal(request.world,"ISOLATED");
+    const tab=tabs.get(request.target.tabId),scope={document:tab.document,URL,Node:{TEXT_NODE:3,ELEMENT_NODE:1},
+      window:{getComputedStyle:()=>({display:"block",whiteSpace:"normal"})}};
+    vm.createContext(scope);scope.args=request.args;
+    const result=vm.runInContext("("+request.func.toString()+")(...args)",scope);
+    afterCapture?.();return[{documentId:"document-"+tab.id,result}];
+  }}}};
+vm.createContext(sandbox);vm.runInContext(SOURCE+";globalThis.read=Bm;",sandbox);
+const read=(id=11)=>sandbox.read({tabId:id,expectedUrl:tabs.get(id).url,read:{kind:"page"}});
+(async()=>{
+  const first=await read(),second=await read(12);
+  assert.match(first.text,/SESSION_ONLY_ONE/);assert.doesNotMatch(first.text,/SESSION_ONLY_TWO|DO_NOT_READ/);
+  assert.match(second.text,/SESSION_ONLY_TWO/);assert.doesNotMatch(second.text,/SESSION_ONLY_ONE/);
+  assert.equal(first.truncated,false);assert.equal(second.truncated,false);
+  assert.deepEqual(calls.map(call=>call.target.tabId),[11,12]);
+  assert.deepEqual(Array.from(calls[0].args),[tabs.get(11).url,80000,80000]);
+  tabs.get(12).document.body=element("body",[text("A".repeat(79999)+"😀TAIL"),text("SKIP_AFTER_LIMIT")]);
+  const bounded=await read(12);assert.equal(bounded.text.length,79999);assert.equal(bounded.truncated,true);
+  assert.doesNotMatch(bounded.text,/TAIL|SKIP_AFTER_LIMIT/);assert.equal(bounded.text.endsWith("\ud83d"),false);
+  tabs.get(11).incognito=true;
+  const before=calls.length;await assert.rejects(read(),/selected tab changed/);assert.equal(calls.length,before);
+  tabs.get(11).incognito=false;afterCapture=()=>{tabs.get(11).url+="?changed"};
+  await assert.rejects(read(),/selected tab changed/);
+  afterCapture=undefined;
+  await assert.rejects(sandbox.read({tabId:11,expectedUrl:"file:///private",read:{kind:"page"}}),/HTTP or HTTPS/);
+})().catch(error=>{console.error(error);process.exitCode=1});
+'''.replace("SOURCE", json.dumps(source)))
+
     def test_only_expected_capability_guards_are_applied(self):
         source = module.SOURCE.read_text()
         patched = module.prepare(source)

@@ -31,4 +31,9 @@ if [[ -e "$ROOT/dist/$APP" ]]; then
   mv "$ROOT/dist/$APP" "$BACKUP/$APP"
 fi
 ditto "$BUILT" "$ROOT/dist/$APP"
+# LaunchServices can discover Xcode's intermediate bundle as a second installed
+# copy. Two copies create different Safari extension origins/backgrounds and
+# can leave the visible toolbar bound to the stale one. Register only dist.
+/usr/bin/pluginkit -r "$BUILT/Contents/PlugIns/ChatGPT for Safari Extension.appex"
+/usr/bin/pluginkit -a "$ROOT/dist/$APP/Contents/PlugIns/ChatGPT for Safari Extension.appex"
 echo "Built: $ROOT/dist/$APP"

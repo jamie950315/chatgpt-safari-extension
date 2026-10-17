@@ -326,8 +326,18 @@ final class SafariLiveInput {
         guard inventory.complete else {
             throw Failure(code: "WINDOW_INVENTORY_UNAVAILABLE", message: "Safari did not expose a complete accessibility window inventory. No input was posted.")
         }
+        // Two ordinary Safari windows can have identical restored bounds.
+        // Resolve that observed ambiguity with the selected page's real AX
+        // identity, never with window order or whichever window is frontmost.
+        if inventory.matches.count > 1 {
+            let pageMatches = inventory.matches.filter { _, _, window in
+                topLevelWebAreas(window).filter { pageURL($0) == target.expectedURL }.count == 1
+            }
+            diagnostics["pageIdentifiedWindowCount"] = pageMatches.count
+            inventory = WindowInventory(matches: pageMatches, windowCount: inventory.windowCount, complete: inventory.complete)
+        }
         guard inventory.matches.count == 1, let (application, app, window) = inventory.matches.first else {
-            throw Failure(code: inventory.matches.isEmpty ? "WINDOW_NOT_FOUND" : "AMBIGUOUS_WINDOW", message: "The selected tab must identify exactly one Apple Safari window by its current bounds.")
+            throw Failure(code: inventory.matches.isEmpty ? "WINDOW_NOT_FOUND" : "AMBIGUOUS_WINDOW", message: "The selected tab must identify exactly one Apple Safari window by its current bounds and page identity.")
         }
         diagnostics["stage"] = "pre-activation-identity"
         // Safari can omit background/fullscreen WebAreas. Validate any exposed

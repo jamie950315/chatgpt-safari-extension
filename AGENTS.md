@@ -67,6 +67,23 @@ This is a development-signed conversion of Chrome extension 1.26.1005.11759.
   consent, claimed-tab leases, session/turn scope, and owner cancellation. The
   executor calls the same ordinary-profile live backend internally; it does not
   start safaridriver or fake CDP responses. Unsupported APIs stay disabled.
+- Chat tab mentions retain the original consent-gated `executeTabRead` extractor.
+  Use its existing 80,000-character traversal/output bounds; do not replace Chat
+  requests or turn the owner-only `tabContext` event into cross-tab page access.
+- Work's management capability uses actual Safari tab APIs and native named
+  Tab Groups through `SafariTabOrganization`. Require claimed tabs for changes,
+  exact native window/page/title identity, and operation-bound cancellation.
+  Safari groups are separate collections; their session-local handles map to
+  observed native names, not fabricated Chrome group IDs/color/collapse state.
+  Reject duplicate names and shared or unverifiable groups. Do not advertise
+  unsupported management methods or fabricate Chrome-only audit snapshots.
+- Work downloads inspect a current DOM link, then run the original download
+  consent/policy before same-origin Safari fetch. Bind each 48 KiB chunk and
+  native writer call to the live operation/profile/owner/document/link. Reject
+  redirects, cross-origin/blob/JavaScript-button downloads; cap at 32 MiB/30 s.
+  Save completed files privately in Downloads with collision-safe names and
+  quarantine; never open them automatically. Cancel partials on owner change,
+  background restart, failure, timeout, and shutdown. No cookies leave Safari.
 - Safari does not implement manifest `sandbox.pages`. The original packaged
   worker runs at a separate capability-bound `chatgpt-kernel-*.localhost` origin
   served by `CompanionControlServer`, without extension APIs, credentials, or
@@ -105,7 +122,9 @@ This is a development-signed conversion of Chrome extension 1.26.1005.11759.
 - Upstream calls `ChatGPTSafariConnectNative` directly. Assigning Safari's
   built-in `runtime.connectNative` did not replace that host method.
 - Session windows replace the upstream internal Chrome tab-group manager.
-  Preserve preferred windows and stable tab IDs; never move user tabs.
+  Preserve preferred windows and stable tab IDs; automatic session management
+  never moves user tabs. Explicit organization moves only requested claimed tabs
+  through the separate native management capability.
 
 ## Build and acceptance
 
@@ -113,6 +132,9 @@ Build with `./scripts/build-safari.sh`; output is
 `dist/ChatGPT for Safari.app`. Signing uses the local Apple Development identity
 and team `N3JN8G9YWK`. The app is Universal, not notarized. The containing app is
 unsandboxed for its native runtime; the Safari extension stays sandboxed.
+Register only the canonical dist extension with PlugInKit. Xcode's intermediate
+app must not remain registered/running alongside it: duplicate copies create
+different extension origins/backgrounds and can bind the toolbar to stale code.
 
 Native hello and desktop discovery/tab listing/creation passed. The installed
 embedded route passed official session validation, real settings requests,
@@ -144,3 +166,11 @@ HTTP-only session retained. The conversation survived inline remount and its
 response finished normally. This path used the original cloud agent and native
 backend, without a separate MCP client or isolated website session. Keep future
 acceptance distinct from tunnel-only and isolated-worker checks.
+
+The installed original Work sidebar also claimed two specified scratch tabs,
+reordered them through Safari tab APIs, and read back their exact final order.
+The original Work download path also passed the original one-time policy
+approval, ordinary-profile authenticated fetch, exact 204-byte UTF-8 file,
+collision preservation, 0600/quarantine, and normal final conversation response.
+Native grouping still needs installed end-to-end acceptance; do not infer it
+from tab reordering or native guard tests.
