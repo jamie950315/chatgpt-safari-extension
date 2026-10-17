@@ -6,6 +6,17 @@
   const chunkBytes = 48 * 1024;
   const realmTransfers = new Map();
   const causalChannels = new Map();
+  // Safari's host rejected the causal route's dense owner-check/writer bursts.
+  // Space their launches, not replies; a long outer command must not block
+  // the native messages that complete or cancel it. Cleanup bypasses pacing.
+  let nextNativeLaunch = 0;
+  async function admitNative(assertTime, callback) {
+    const launch = Math.max(Date.now(), nextNativeLaunch);
+    nextNativeLaunch = launch + 75;
+    if (launch > Date.now()) await new Promise(resolve => setTimeout(resolve, launch - Date.now()));
+    assertTime();
+    return callback();
+  }
   const destinationRealm = typeof module === "object" && module.exports ? require("./download-realm-background.js") : root.ChatGPTSafariDownloadRealm;
   const causalCapture = typeof module === "object" && module.exports ? require("./download-capture-main.js") : root.ChatGPTSafariDownloadCapture;
 
@@ -646,7 +657,7 @@
   function createDownloads({ api, target: resolveTarget, send, profileId, sessionId, assertTime, unwrap, authorizeIntent: authorizeSource, deadline }) {
     // Honor the existing command deadline even if Safari loses a scripting or
     // native callback. The operation is never reissued after this race ends.
-    async function observe(callback) {
+    async function observe(callback, stage) {
       let timer;
       try {
         assertTime();
@@ -655,11 +666,17 @@
         })]);
         assertTime();
         return result;
+      } catch (error) {
+        if (stage) error.message += ` Download stage: ${stage}.`;
+        throw error;
       } finally { clearInterval(timer); }
     }
     const delivery = args => ({ ...args, ...(Number.isFinite(deadline) ? { commandDeadline: deadline } : {}) });
-    const target = (...args) => observe(() => resolveTarget(...args));
-    const authorizeIntent = authorizeSource && (() => observe(authorizeSource));
+    const target = (...args) => observe(() => resolveTarget(...args), "source-tab-check");
+    const native = (callback, stage, beforeLaunch) => observe(() => authorizeSource ? admitNative(assertTime, async () => {
+      await beforeLaunch?.(); assertTime(); return callback();
+    }) : callback(), stage);
+    const authorizeIntent = authorizeSource && (() => native(authorizeSource, "source-owner-check"));
     // Dispatch every cleanup independently. An unresponsive page callback must
     // never prevent the operation-bound native writer from receiving abort.
     async function cleanup(steps, failure) {
@@ -690,26 +707,26 @@
       }
       const invoke = () => api.scripting.executeScript({ target: { tabId: tab.id, frameIds: [0] }, world: "MAIN", func: causalCapture.operation,
         args: [operation, delivery({ channelKey, freshChannel, intentId: args.intentId, expectedUrl: args.expectedUrl, wait_ms: args.wait_ms, href: args.href })] });
-      const [value] = await (operation === "cancel" ? invoke() : observe(invoke));
+      const [value] = await (operation === "cancel" ? invoke() : observe(invoke, "capture-" + operation));
       return unwrap(value?.result);
     };
-    const causalCheck = async (tab, args) => observe(async () => {
-      await authorizeIntent?.();
+    const causalCheck = async (tab, args, authorize = true) => observe(async () => {
+      if (authorize) await authorizeIntent?.();
       if (args.capture !== "causal") return;
       await target(args.handle, args.expectedUrl);
       await intent(tab, "causal_check", args);
       const state = await main(tab, "check", args);
       if (!state.ready || (args.capturedHref || args.href) && state.href !== (args.capturedHref || args.href)) throw new Error("The causal download changed or is no longer ready; no request was repeated.");
     });
-    async function page(tab, operation, args) {
-      if (operation !== "cancel") await causalCheck(tab, args);
+    async function page(tab, operation, args, authorize = true) {
+      if (operation !== "cancel") await causalCheck(tab, args, authorize);
       const invoke = () => api.scripting.executeScript({ target: { tabId: tab.id, frameIds: [0] }, func: downloadPageOperation, args: [operation, delivery(args)] });
-      const [value] = await (operation === "cancel" ? invoke() : observe(invoke));
+      const [value] = await (operation === "cancel" ? invoke() : observe(invoke, "response-" + operation));
       return unwrap(value?.result);
     }
     async function intent(tab, operation, args) {
       const invoke = () => api.scripting.executeScript({ target: { tabId: tab.id, frameIds: [0] }, world: "ISOLATED", func: downloadIntentPageOperation, args: [operation, delivery(args)] });
-      const [value] = await (operation === "cancel" ? invoke() : observe(invoke));
+      const [value] = await (operation === "cancel" ? invoke() : observe(invoke, "source-" + operation));
       return unwrap(value?.result);
     }
     async function realm(entry, operation, extra = {}) {
@@ -719,7 +736,7 @@
           func: destinationRealm.realmPageOperation, args: [operation, delivery({ ...entry.binding, ...extra })] });
         return unwrap(value?.result);
       };
-      return operation === "cancel" ? invoke() : observe(invoke);
+      return operation === "cancel" ? invoke() : observe(invoke, "destination-" + operation);
     }
     async function cancelRealm(args) {
       const entry = realmTransfers.get(args.intentId);
@@ -727,9 +744,9 @@
       realmTransfers.delete(args.intentId);
       await cleanup([() => realm(entry, "cancel")]);
     }
-    async function sourceCheck(tab, args) {
-      await authorizeIntent?.();
-      assertTime(); await target(args.handle, args.expectedUrl); await causalCheck(tab, args);
+    async function sourceCheck(tab, args, authorize = true) {
+      if (authorize) await authorizeIntent?.();
+      assertTime(); await target(args.handle, args.expectedUrl); await causalCheck(tab, args, authorize);
       await intent(tab, "lease_check", args);
     }
     async function realmRedirectStep(tab, args) {
@@ -779,7 +796,7 @@
       const assets = [], failures = [];
       const write = async input => {
         assertTime(); await target(args.handle, binding.expectedUrl); await inventory(tab, "inspect", args);
-        return unwrap(await observe(() => send({ action: "liveDownload", id: request.id, profileId, sessionId, input })));
+        return unwrap(await native(() => send({ action: "liveDownload", id: request.id, profileId, sessionId, input }), "native-writer-" + input.action));
       };
       const acceptedType = (asset, contentType) => {
         const type = contentType?.split(";", 1)[0].trim().toLowerCase();
@@ -870,8 +887,9 @@
       const write = async input => {
         assertTime();
         await target(args.handle, args.expectedUrl);
-        await page(tab, "inspect", args).then(result => { if (result.href !== args.href) throw new Error("The approved download link changed."); });
-        return unwrap(await observe(() => send({ action: "liveDownload", id: request.id, profileId, sessionId, input })));
+        const check = authorize => page(tab, "inspect", args, authorize).then(result => { if (result.href !== args.href) throw new Error("The approved download link changed."); });
+        await check(true);
+        return unwrap(await native(() => send({ action: "liveDownload", id: request.id, profileId, sessionId, input }), "native-writer-" + input.action, () => check(false)));
       };
       try {
         assertTime();
@@ -948,7 +966,7 @@
       let nativeID, sequence = 0, bytes = 0, failure;
       const write = async input => {
         assertTime(); await causalCheck(tab, args);
-        return unwrap(await observe(() => send({ action: "liveDownload", id: request.id, profileId, sessionId, input })));
+        return unwrap(await native(() => send({ action: "liveDownload", id: request.id, profileId, sessionId, input }), "native-writer-" + input.action, () => causalCheck(tab, args, false)));
       };
       try {
         await causalCheck(tab, args);
@@ -976,8 +994,8 @@
       const entry = realmTransfers.get(args.intentId);
       if (!entry || entry.binding.scope !== args.scope || entry.binding.href !== args.href) throw new Error("No exact approved destination-document response remains. It was not requested again.");
       let nativeID, sequence = 0, bytes = 0, failure;
-      const check = async () => { await sourceCheck(tab, args); await realm(entry, "check"); };
-      const write = async input => { await check(); return unwrap(await observe(() => send({ action: "liveDownload", id: request.id, profileId, sessionId, input }))); };
+      const check = async (authorize = true) => { await sourceCheck(tab, args, authorize); await realm(entry, "check"); };
+      const write = async input => { await check(); return unwrap(await native(() => send({ action: "liveDownload", id: request.id, profileId, sessionId, input }), "native-writer-" + input.action, () => check(false))); };
       try {
         await check(); const metadata = await realm(entry, "metadata");
         const opened = await write({ action: "begin", filename: metadata.filename }); nativeID = opened.transferId;

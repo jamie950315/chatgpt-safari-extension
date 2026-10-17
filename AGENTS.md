@@ -74,6 +74,14 @@ This is a development-signed conversion of Chrome extension 1.26.1005.11759.
   paths, file contents, operation IDs or credentials. Input receipts describe
   their own command, not subsequent transfer progress; use writer stages to
   distinguish a transfer timeout from a source-click failure.
+  Safari's host explicitly rejected dense causal download native calls with
+  "too many active native messages" (SFErrorDomain 3). New causal/tab-origin
+  transfers pace short owner-check/writer launches at 75 ms, not responses.
+  Cleanup bypasses admission; delayed writer calls re-prove the exact source
+  and destination documents before launch. Admission waits remain inside the
+  existing 30-second active-transfer budget. Legacy direct/default callers
+  retain their original path. Do not replace this with a global response mutex:
+  outer embeddedLive depends on later poll/writer calls.
   Downloads honor the existing command deadline even if a callback is lost.
   Pass that deadline into fixed page deliveries so a queued expired script
   cannot start a request. Cleanup is independently dispatched, native abort
@@ -427,6 +435,28 @@ failure. A captured correct URL and nonce-bound manual request were observed;
 nonce absence in the default route or `Completed steps: 0` on a later transfer
 error does not establish a native anchor bypass or an undelivered source click.
 Native await and other untracked continuations retain the limitations above.
+
+Installed causal download acceptance separately passed detached HTTP, explicit
+Promise/timer callbacks, server preparation and immediate-revoke Blob with exact
+files and normal original Work final replies. The existing-destination-document
+no-CORS route passed 46 exact bytes; destination requests were zero before the
+original full-URL approval and one afterward, with only that destination's own
+HTTP-only login. Multiple candidates failed without file requests. Preparation
+navigation cancelled without replay. Keep these conditional results separate
+from unsupported native-await attribution and arbitrary no-CORS origins.
+
+Installed original Work owner-close cancelled an active transfer with native
+`AGENT_OWNER_CHANGED` and removed its content-identified partial; it returned no
+completed path. The same slow fixture had already encountered the unresolved
+42-append / 1,835,008-byte interruption before close, so this is partial cleanup
+acceptance, not normal slow-transfer completion or proof that close caused the
+server disconnect. Temporary native request-count probes were removed. The subsequent
+scoped-admission signed build completed 3,145,728 exact bytes through original
+Work in 22.1 seconds, including native finish and a normal complete/path reply:
+`/Users/jamie/Downloads/Owned interrupted stream (1).parityfixture`. It retained
+HTTP-only login, used one nonce-bound request, preserved the prior collision,
+and set 0600/quarantine; the actual transfer window had no host admission drops.
+The broader generic download goal remains incomplete.
 
 Installed original Work bookmark tree/search/read, title/URL update, folder
 creation, URL creation, and native movement passed with exact synthetic-record

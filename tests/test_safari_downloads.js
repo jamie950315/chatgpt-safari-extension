@@ -53,6 +53,7 @@ function fixture(options = {}) {
     return { id: 12 };
   }, async send(command) {
     writes.push(command);
+    options.onNative?.("writer-" + command.input.action);
     assert.equal(command.id, "operation-a"); assert.equal(command.profileId, "profile-a"); assert.equal(command.sessionId, "session-a");
     const input = command.input;
     if (input.action === "bundleBegin") return { ok: true, result: { bundleId: "bundle-a", directoryPath: "/Downloads/Bundle" } };
@@ -69,7 +70,7 @@ function fixture(options = {}) {
     if (input.action === "finish") { assert.equal(input.expectedBytes, written); return { ok: true, result: { state: "complete", path: "/Downloads/report.txt", bytesWritten: written } }; }
     options.onAbort?.();
     return { ok: true, result: { aborted: true } };
-  }, profileId: "profile-a", sessionId: "session-a", deadline: options.commandDeadline, assertTime() { if (options.commandDeadline && Date.now() > options.commandDeadline) throw new Error("The original command deadline expired"); }, unwrap });
+  }, profileId: "profile-a", sessionId: "session-a", authorizeIntent: options.authorizeOwner, deadline: options.commandDeadline, assertTime() { if (options.commandDeadline && Date.now() > options.commandDeadline) throw new Error("The original command deadline expired"); }, unwrap });
   return { args, calls, writes, content, anchor, live, location, operation, page, downloads,
     execute: () => downloads.execute({ id: "operation-a" }, { id: 12 }, args) };
 }
@@ -178,7 +179,7 @@ test("MAIN and isolated cancellation dispatch independently and release a lost c
 
 test("a lost scripting read honors the existing command deadline and aborts its writer without replay", { timeout: 2000 }, async () => {
   const f = fixture({ hangPageRead: true, commandDeadline: Date.now() + 150 });
-  await assert.rejects(f.execute(), /original command deadline expired/);
+  await assert.rejects(f.execute(), /original command deadline expired.*Download stage: response-read/);
   assert.deepEqual(f.writes.map(item => item.input.action), ["begin", "abort"]);
   assert.equal(f.calls.length, 1);
 });
@@ -186,7 +187,7 @@ test("a lost scripting read honors the existing command deadline and aborts its 
 
 test("a lost native append callback honors the command deadline and aborts the exact writer", { timeout: 2000 }, async () => {
   const f = fixture({ hangNativeAppend: true, commandDeadline: Date.now() + 150 });
-  await assert.rejects(f.execute(), /original command deadline expired/);
+  await assert.rejects(f.execute(), /original command deadline expired.*Download stage: native-writer-append/);
   assert.deepEqual(f.writes.map(item => item.input.action), ["begin", "append", "abort"]);
   assert.equal(f.calls.length, 1);
 });
@@ -198,4 +199,36 @@ test("a delayed script cannot start its approved request after the original comm
   await new Promise(resolve => setTimeout(resolve, 350));
   assert.equal(f.calls.length, 0, "A late script callback must not issue an expired request");
   assert.equal(f.writes.length, 0);
+});
+
+
+test("causal native admission spaces owner and writer launches without refetching or pacing legacy callers", { timeout: 5000 }, async () => {
+  const launches = [];
+  const record = action => launches.push({ action, time: performance.now() });
+  const f = fixture({ content: Buffer.alloc(chunkBytes + 1, 0x41), authorizeOwner: async () => record("owner"), onNative: record });
+  const result = await f.execute();
+  assert.equal(result.state, "complete"); assert.equal(f.calls.length, 1);
+  for (let index = 1; index < launches.length; index++) {
+    assert.ok(launches[index].time - launches[index - 1].time >= 60, "Each short native call receives admission before launch");
+  }
+  assert.equal(f.writes.filter(x => x.input.action === "append").length, 2);
+  const legacy = fixture(); await legacy.execute();
+  assert.equal(legacy.calls.length, 1);
+});
+
+test("an expired admission cannot launch another owner check or writer and still dispatches cleanup", { timeout: 3000 }, async () => {
+  let checks = 0;
+  const f = fixture({ authorizeOwner: async () => { checks++; }, commandDeadline: Date.now() + 100 });
+  await assert.rejects(f.execute(), /original command deadline expired/);
+  const observed = checks; await new Promise(resolve => setTimeout(resolve, 100));
+  assert.equal(checks, observed); assert.equal(f.writes.some(x => x.input.action === "append"), false);
+});
+
+test("source changes during admission are rechecked before native writer begin", { timeout: 3000 }, async () => {
+  let checks = 0, f;
+  f = fixture({ authorizeOwner: async () => {
+    if (++checks === 3) setTimeout(() => { f.live.snapshotId = "changed-during-admission"; }, 10);
+  } });
+  await assert.rejects(f.execute(), /current visible DOM/);
+  assert.equal(f.calls.length, 1); assert.equal(f.writes.length, 0);
 });
