@@ -260,8 +260,20 @@ By default redirects are rejected. To allow policy-gated same-origin hops, set
 `redirects: 'same-origin-policy'` explicitly. Every request remains manual: a fresh
 nonsecret `X-ChatGPT-Safari-Transfer` header binds that exact fetch to Safari's
 real requestId/documentId/header events. The next full URL is approved before
-its request. At most five requests are allowed; cycles and cross-origin hops
-are rejected.
+its request. At most five GET hops are allowed; cycles and cross-origin hops
+are rejected by that option.
+
+For redirects that may leave the source origin, explicitly use
+`redirects: 'cross-origin-policy'`. The same full-URL approval and native request
+proof run before every next request. Each hop uses ordinary-page
+`credentials: 'include'` with `redirect: 'manual'`; Safari supplies only that
+host's applicable login cookies. Cookie and Authorization headers are never
+copied from the previous host. A cross-origin server must allow the page's exact
+origin, credentials, GET, and the `X-ChatGPT-Safari-Transfer` header in its CORS
+preflight. Without real credentialed CORS access the operation fails, returns no
+saved path, and does not retry through a different transport. A failed CORS
+check can still mean the approved destination received its one request.
+
 The same-origin server must accept this header; no alternate request or retry
 is attempted. The 30-second active network/body budget excludes approvals while
 no request is active. Missing or mismatched header observations fail closed.
@@ -278,7 +290,7 @@ def native_download_sdk(base: str, click: str, define: str) -> str:
     return f'''class SafariNativeDownloadsCapability extends {base}{{
 constructor({{browserId,documentation,info,tabId,transport}}){{super(transport,browserId,tabId,documentation,info)}}
 async run(options){{
-if(!options||typeof options!=="object"||Array.isArray(options)||Object.keys(options).some(key=>!["selector","timeout_ms","redirects"].includes(key))||typeof options.selector!=="string"||!options.selector||!Number.isInteger(options.timeout_ms??1000)||(options.timeout_ms??1000)<1||(options.timeout_ms??1000)>3000||options.redirects!==undefined&&options.redirects!=="same-origin-policy")throw new Error("Specify one known download-control selector, a 1–3000ms intent deadline, and optional same-origin-policy redirects");
+if(!options||typeof options!=="object"||Array.isArray(options)||Object.keys(options).some(key=>!["selector","timeout_ms","redirects"].includes(key))||typeof options.selector!=="string"||!options.selector||!Number.isInteger(options.timeout_ms??1000)||(options.timeout_ms??1000)<1||(options.timeout_ms??1000)>3000||options.redirects!==undefined&&!["same-origin-policy","cross-origin-policy"].includes(options.redirects))throw new Error("Specify one known download-control selector, a 1–3000ms intent deadline, and optional same-origin-policy or cross-origin-policy redirects");
 return this.transport.send({{command:{click}({{browser_id:this.browserId,tab_id:this.tabId,selector:options.selector,safari_download_intent:{{timeout_ms:options.timeout_ms??1000,...options.redirects===undefined?{{}}:{{redirects:options.redirects}}}}}}),timeoutMs:120000}})
 }}
 }}

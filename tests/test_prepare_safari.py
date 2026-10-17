@@ -105,8 +105,9 @@ const calls=[],actual={state:"complete",path:"/Downloads/actual",bytesWritten:45
 const capability=new scope.SafariNativeDownloadsDefinition.capability({browserId:"0",tabId:"12",transport:{async send(value){calls.push(value);return actual}}});
 (async()=>{assert.equal(await capability.run({selector:"#known-download"}),actual);assert.equal(calls[0].command.type,"playwright_locator_click");assert.equal(calls[0].command.safari_download_intent.timeout_ms,1000);assert.equal(calls[0].timeoutMs,120000);
 await capability.run({selector:"#known-download",redirects:"same-origin-policy"});assert.equal(calls[1].command.safari_download_intent.redirects,"same-origin-policy");
+await capability.run({selector:"#known-download",redirects:"cross-origin-policy"});assert.equal(calls[2].command.safari_download_intent.redirects,"cross-origin-policy");
 for(const options of [{selector:"x",href:"https://override.invalid"},{selector:"x",timeout_ms:3001},{selector:"x",force:true},{selector:"x",redirects:"follow"}])await assert.rejects(capability.run(options),/known download-control/);
-assert.equal(calls.length,2)})().catch(error=>{console.error(error);process.exitCode=1});
+assert.equal(calls.length,3)})().catch(error=>{console.error(error);process.exitCode=1});
 '''.replace("WORKER", json.dumps(worker)).replace("SDK", json.dumps(helper.native_download_sdk("Base", "click", "define"))))
 
     def test_original_tab_context_reads_open_authenticated_tabs_with_bounded_content(self):

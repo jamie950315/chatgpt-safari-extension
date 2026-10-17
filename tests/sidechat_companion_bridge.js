@@ -22,6 +22,7 @@ function fixture(options = {}) {
   const context = { instanceId: "safari-test", tabId: 10, windowId: 20, url: "https://example.com" };
   const capabilities = { "browserSideChat.tabContext.read": true, "browserTabMentions.search": true };
   const window = {
+    isSecureContext: options.isSecureContext ?? true,
     innerWidth: 1000, innerHeight: 800,
     getComputedStyle: element => ({ display: "block", visibility: "visible", opacity: "1", ...element.style }),
     addEventListener: (type, callback) => on(listeners, type, callback),
@@ -67,7 +68,8 @@ function fixture(options = {}) {
   let intervalID = 0;
   const sandbox = { window, document, location: { origin: actualOrigin, href: actualOrigin + "/?surface=browser_side_chat" },
     URL, Event: MockEvent, CustomEvent: MockCustomEvent, Date, console: { ...console }, setTimeout, clearTimeout, setInterval, clearInterval, queueMicrotask,
-    crypto: require("node:crypto").webcrypto, __testRuntime: options.runtime };
+    isSecureContext: window.isSecureContext,
+    crypto: options.crypto ?? require("node:crypto").webcrypto, __testRuntime: options.runtime };
   if (options.manualIntervals) {
     sandbox.setInterval = (callback, milliseconds) => { intervals.set(++intervalID, { callback, milliseconds }); return intervalID; };
     sandbox.clearInterval = id => intervals.delete(id);
@@ -259,6 +261,48 @@ test("isolated provider uses its real parent/origin and a capability-bound chann
   connection.dispose();
   f.window.dispatchEvent(new MockEvent("pagehide"));
 });
+
+test("an insecure provider without randomUUID handshakes and requests context using fresh CSPRNG UUIDv4 identifiers", async t => {
+  const entropy = [], webcrypto = require("node:crypto").webcrypto;
+  const crypto = { getRandomValues(bytes) {
+    assert.equal(bytes.length, 16);
+    webcrypto.getRandomValues(bytes); entropy.push(Array.from(bytes)); return bytes;
+  } };
+  const runtime = { m: {}, c: {}, d(exports, getters) {
+    for (const [name, get] of Object.entries(getters)) Object.defineProperty(exports, name, { get });
+  } };
+  const f = fixture({ relay: true, runtime, crypto, isSecureContext: false, manualIntervals: true });
+  t.after(() => f.window.dispatchEvent(new MockEvent("pagehide", { isTrusted: true })));
+  await f.ready;
+  assert.equal(f.window.isSecureContext, false); assert.equal(crypto.randomUUID, undefined);
+  assert.equal(entropy.length, 1, "Document readiness must use real CSPRNG bytes before connecting");
+  const ready = f.messages[0].data;
+  assert.equal(ready.type, "chatgpt-safari-provider:ready");
+  const relay = f.window.ChatGPTSafariProviderRelay, sent = [];
+  const port = { close() {}, postMessage(message) { sent.push(message); } };
+  f.emitMessage({ source: f.window.parent, origin: relay.parentExtensionOrigin,
+    data: { type: "chatgpt-safari-provider:connect", token: relay.bridgeToken, documentRecoverySequence: 0 }, ports: [port] });
+  assert.equal(sent[0].type, "ready");
+  runtime.m.Kxt = () => {};
+  const exports = {}; runtime.m.Kxt({}, exports, runtime);
+  const connection = new exports.BrowserSideChatConnection({ pageWindow: f.window, getAuthScope: () => "account-a" });
+  t.after(() => connection.dispose());
+  const waiting = connection.getContext(); await flush();
+  const request = sent.find(message => message.type === "request" && message.method === "context");
+  assert.ok(request); assert.equal(entropy.length, 3, "Document, context and relay request IDs each consume fresh secure entropy");
+  const identifiers = [ready.documentId, request.params.requestId, request.id];
+  for (const [index, id] of identifiers.entries()) {
+    assert.match(id, /^[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/);
+    const actual = Buffer.from(id.replaceAll("-", ""), "hex"), original = entropy[index];
+    for (let byte = 0; byte < 16; byte++) assert.equal(actual[byte], byte === 6 ? (original[byte] & 15) | 64 : byte === 8 ? (original[byte] & 63) | 128 : original[byte]);
+  }
+  assert.equal(new Set(identifiers).size, 3);
+  port.onmessage({ data: { type: "reply", id: request.id,
+    result: { context: { instanceId: "real-owner", tabId: 10, windowId: 20, url: "http://owned.example/" } } } });
+  assert.equal((await waiting).tabId, 10); assert.equal(connection.confirmed, true);
+  assert.deepEqual(Object.keys(crypto), ["getRandomValues"], "No global randomUUID polyfill is installed");
+});
+
 test("tab mentions require a recent trusted gesture and publish the upstream temporary DOM contract", async () => {
   const runtime = { m: {}, c: {}, d(exports, getters) {
     for (const [name, get] of Object.entries(getters)) Object.defineProperty(exports, name, { get });

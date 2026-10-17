@@ -1,6 +1,15 @@
 /* Original side-chat host boundary for the native profile and isolated provider frame. */
 globalThis.__CHATGPT_SAFARI_ADAPTER_READY__ = (async () => {
   "use strict";
+  function createUUID() {
+    // An HTTP ancestor can make this provider an insecure context. The public
+    // CSPRNG remains available there; randomUUID is secure-context-only.
+    const bytes = crypto.getRandomValues(new Uint8Array(16));
+    bytes[6] = (bytes[6] & 0x0f) | 0x40;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    const hex = Array.from(bytes, byte => byte.toString(16).padStart(2, "0")).join("");
+    return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
+  }
   const relay = window.ChatGPTSafariProviderRelay;
   const relayMode = relay != null;
   const actualOrigin = location.origin;
@@ -80,7 +89,7 @@ globalThis.__CHATGPT_SAFARI_ADAPTER_READY__ = (async () => {
     // Connect before original entry execution. Waiting for iframe.load can
     // deadlock the original context loader while other modules are compiling.
     window.parent.postMessage({ type: "chatgpt-safari-provider:ready", token: relay.bridgeToken,
-      documentId: crypto.randomUUID() }, "*");
+      documentId: createUUID() }, "*");
   }
   function disconnectRelay() {
     relayPort?.close();
@@ -91,7 +100,7 @@ globalThis.__CHATGPT_SAFARI_ADAPTER_READY__ = (async () => {
   async function sendRequest(method, params) {
     if (!relayMode) return nativeHandler.postMessage({ method, params });
     await relayReady;
-    const id = crypto.randomUUID();
+    const id = createUUID();
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => { relayPending.delete(id); reject(new Error("The Safari sidebar request timed out")); }, 15000);
       relayPending.set(id, { resolve, reject, timer });
@@ -304,7 +313,7 @@ globalThis.__CHATGPT_SAFARI_ADAPTER_READY__ = (async () => {
         const cancel = error => finish(error);
         const timer = setTimeout(() => finish(new Error("The Safari side-chat context request timed out")), Math.max(0, timeout));
         this.pending.add(cancel);
-        void request("context", { requestId: crypto.randomUUID(), includeSelection: true }).then(result => {
+        void request("context", { requestId: createUUID(), includeSelection: true }).then(result => {
           if (settled) return;
           if (generation !== this.generation || this.disposed) { finish(new ContextInvalidated("The side-chat context changed")); return; }
           const value = result?.context;

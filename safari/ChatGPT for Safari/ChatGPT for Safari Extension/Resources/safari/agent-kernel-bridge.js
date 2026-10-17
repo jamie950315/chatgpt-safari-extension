@@ -59,7 +59,7 @@
         // The actual anchor default is already cancelled. Original source and
         // destination policy runs before the first request or private file write.
         let href = captured.href;
-        if (command.safari_download_intent.redirects === "same-origin-policy") {
+        if (["same-origin-policy", "cross-origin-policy"].includes(command.safari_download_intent.redirects)) {
           let ready = false;
           for (let request = 0; request < 5; request++) {
             await context.security.ensureDownloadAllowed(Number(command.tab_id), href);

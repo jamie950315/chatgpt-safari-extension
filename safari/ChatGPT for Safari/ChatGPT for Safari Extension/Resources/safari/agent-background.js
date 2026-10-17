@@ -120,7 +120,7 @@
           const options = command.safari_download_intent;
           if (!options || typeof options !== "object" || Array.isArray(options) || Object.keys(options).some(name => !["timeout_ms", "redirects"].includes(name))
             || !Number.isInteger(options.timeout_ms) || options.timeout_ms < 1 || options.timeout_ms > 3000
-            || options.redirects !== undefined && options.redirects !== "same-origin-policy"
+            || options.redirects !== undefined && !["same-origin-policy", "cross-origin-policy"].includes(options.redirects)
             || typeof command.selector !== "string" || !command.selector || command.safari_native_modal !== undefined
             || command.force === true || command.button && command.button !== "left" || command.modifiers?.length) {
             throw new Error("A captured download requires one plain top-level locator click and a 1–3000ms intent observation deadline");
@@ -157,13 +157,14 @@
           await root.ChatGPTSafariLive?.releaseDownloadIntent?.(tabId, record.binding).catch(() => {}); return {};
         }
         if (command.type === "safari_download_redirect_step") {
-          if (record.binding.redirectPolicy !== "same-origin-policy" || !["captured", "redirect"].includes(record.phase) || command.href !== record.href) throw new Error("Approve the exact pending redirect URL before issuing its one same-origin request");
+          if (!["same-origin-policy", "cross-origin-policy"].includes(record.binding.redirectPolicy) || !["captured", "redirect"].includes(record.phase) || command.href !== record.href) throw new Error("Approve the exact pending redirect URL before issuing its one policy-gated request");
           record.phase = "requesting";
           try {
             const result = await run("download_intent_redirect", { ...record.binding, href: record.href });
             await authorize(session, metadata); await session.requireOwnedTab(tabId);
             if (downloadIntents.get(command.intentId) !== record || !["redirect", "ready"].includes(result.kind) || typeof result.href !== "string"
-              || new URL(result.href).origin !== new URL(record.binding.expectedUrl).origin) throw new Error("The exact same-origin redirect proof did not retain its original download lease");
+              || !["http:", "https:"].includes(new URL(result.href).protocol) || new URL(result.href).username || new URL(result.href).password
+              || record.binding.redirectPolicy === "same-origin-policy" && new URL(result.href).origin !== new URL(record.binding.expectedUrl).origin) throw new Error("The exact redirect proof did not retain its original download lease and policy");
             record.href = result.href; record.phase = result.kind;
             return result;
           } catch (error) {

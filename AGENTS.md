@@ -38,6 +38,9 @@ This is a development-signed conversion of Chrome extension 1.26.1005.11759.
   Forward the actual browser User-Agent. Keep exact real frame/parent identity,
   account scope, and owner invalidation. Do not fake Chrome ancestry, strip CSP,
   or replace the original conversation UI/request construction.
+  Its private document/request UUIDs use local `crypto.getRandomValues` UUIDv4
+  generation: an HTTP ancestor can remove secure-context-only `randomUUID`.
+  Do not patch global crypto or change the upstream website's security context.
 - The relay buffers public JavaScript modules and uses bundled Babel 7.28.5 in
   a separate JavaScriptCore compilation context to lower async generators and
   `for await` only inside the inspected `sY`, `tI`, and `dd` stream factories.
@@ -218,6 +221,20 @@ This is a development-signed conversion of Chrome extension 1.26.1005.11759.
   Existing direct-link/exports keep their original behavior. Detached anchors,
   location/form/later-task downloads and a generic native download waiter remain
   unsupported; never advertise those from the narrower connected-anchor proof.
+- The additive `redirects: "cross-origin-policy"` route keeps the same full-URL
+  approval before each manual GET, native nonce/request/document proof, five-GET
+  bound, and single final response. Ordinary-page `credentials: "include"` lets
+  Safari apply each destination's own applicable cookies; never copy Cookie or
+  Authorization between hosts. Cross-origin servers must permit credentialed
+  CORS and the correlation header's preflight. A CORS failure returns no path,
+  never retries through another transport, and may follow one approved request.
+  Installed prototype background fetch omitted the ordinary profile's HTTP-only
+  cookie and returned 401; it is not an authenticated non-CORS alternative.
+- Owned native detached/Promise-timer/Blob prototypes produced real Safari files,
+  but no download event or operation-bound source receipt. The same native
+  webRequest observers saw page fetches, not those native downloads; Safari's
+  downloads API was absent. Do not adopt completed files or metadata by URL,
+  filename, profile, or timing, or describe those prototypes as Work support.
 - `Tab.content.exportGsuite` derives official Google Workspace export URLs;
   `exportYouTubeTranscript` uses a fixed current-video player/timedtext helper
   and restores the prior captions state. Keep original download approval,
@@ -329,6 +346,21 @@ uncontacted before its approval; each endpoint was requested once. Native
 header nonce/request/document proof passed, and both files were mode 0600 with quarantine.
 Keep the default route's accepted evidence when adding opt-in behavior. Fixed
 metadata/header diagnostic entry points were removed from the deliverable.
+
+Installed original Work `cross-origin-policy` completed a different-host redirect
+with ordinary Safari source/destination HTTP-only logins. The next destination
+had zero requests before its original one-time approval, then one preflight and
+one authenticated GET. One source click and one source GET produced the exact
+61-byte file, mode 0600 with quarantine, and a normal completed conversation
+reply with the native writer's path. The final response was not fetched again.
+The sidebar was hosted in a separate trusted loopback tab; only owned synthetic
+pages were used. This acceptance does not cover non-CORS or native async capture.
+The same original Work conversation rejected an authenticated non-CORS response
+with no path or fallback. A distinct destination was explicitly denied in the
+original approval UI: zero destination requests (including preflight), no path,
+normal final response, and no retry. A concurrent other-tab native download was
+not adopted; that separate attempt failed exact header proof rather than proving
+an explicit denial. Keep these outcomes distinct.
 
 Installed original Work bookmark tree/search/read, title/URL update, folder
 creation, URL creation, and native movement passed with exact synthetic-record

@@ -6502,7 +6502,7 @@ SafariNativeUploadsDefinition=de({capability:SafariNativeUploadsCapability,info:
 class SafariNativeDownloadsCapability extends ce{
 constructor({browserId,documentation,info,tabId,transport}){super(transport,browserId,tabId,documentation,info)}
 async run(options){
-if(!options||typeof options!=="object"||Array.isArray(options)||Object.keys(options).some(key=>!["selector","timeout_ms","redirects"].includes(key))||typeof options.selector!=="string"||!options.selector||!Number.isInteger(options.timeout_ms??1000)||(options.timeout_ms??1000)<1||(options.timeout_ms??1000)>3000||options.redirects!==undefined&&options.redirects!=="same-origin-policy")throw new Error("Specify one known download-control selector, a 1–3000ms intent deadline, and optional same-origin-policy redirects");
+if(!options||typeof options!=="object"||Array.isArray(options)||Object.keys(options).some(key=>!["selector","timeout_ms","redirects"].includes(key))||typeof options.selector!=="string"||!options.selector||!Number.isInteger(options.timeout_ms??1000)||(options.timeout_ms??1000)<1||(options.timeout_ms??1000)>3000||options.redirects!==undefined&&!["same-origin-policy","cross-origin-policy"].includes(options.redirects))throw new Error("Specify one known download-control selector, a 1–3000ms intent deadline, and optional same-origin-policy or cross-origin-policy redirects");
 return this.transport.send({command:Xs({browser_id:this.browserId,tab_id:this.tabId,selector:options.selector,safari_download_intent:{timeout_ms:options.timeout_ms??1000,...options.redirects===undefined?{}:{redirects:options.redirects}}}),timeoutMs:120000})
 }
 }

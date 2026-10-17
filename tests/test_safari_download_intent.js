@@ -31,6 +31,7 @@ function pageFixture(configuration = {}) {
       webRequest.onBeforeRequest.emit(details);
       webRequest.onBeforeSendHeaders.emit({ ...details, requestHeaders: Object.entries(options.headers || {}).map(([name, value]) => ({ name, value })) });
       webRequest.onHeadersReceived.emit({ ...details, statusCode: route.status || 200, responseHeaders: route.location ? [{ name: "Location", value: route.location }] : [] });
+      if (route.corsDenied) throw new TypeError("Credentialed CORS access denied");
       if (route.location) return { ok: false, type: "opaqueredirect", url: "", status: 0, redirected: false };
       return { ok: true, type: "basic", url, status: 200, redirected: false,
         headers: new Headers({ "content-type": "text/plain", "content-disposition": "attachment; filename=observed.txt" }),
@@ -180,6 +181,28 @@ test("manual same-origin hops expose a real nonce-bound Location before any next
   assert.equal(Object.values(f.webRequest).every(event => event.size() === 0), true);
 });
 
+test("agent cross-origin receipts retain their original policy and exact pending URL across the claimed-tab lease", async () => {
+  const calls = [], metadata = { session_id: "session", turn_id: "turn" }, owner = { instanceId: "owner", profileId: "profile", accountScope: "account" };
+  const session = { currentTurnId: "turn", async requireOwnedTab(id) { assert.equal(id, 12); } };
+  const companion = { async agentOwner() { return owner; }, async runAgentCommand(command) {
+    calls.push(command); const args = command.arguments;
+    if (command.action === "dom_query") return { node: "source", documentId: "doc", snapshotId: "snap", url: "https://example.test/owned" };
+    if (command.action === "interact") return { downloadIntent: { intentId: args.downloadIntent.intentId, href: "https://example.test/initial" } };
+    assert.equal(args.redirectPolicy, "cross-origin-policy");
+    if (command.action === "download_intent_redirect") return args.href.endsWith("initial")
+      ? { kind: "redirect", href: "https://destination.test/final?exact=1" } : { kind: "ready", href: args.href };
+    assert.equal(command.action, "download_intent_transfer"); assert.equal(args.href, "https://destination.test/final?exact=1");
+    return { path: "/Downloads/actual", state: "complete", bytesWritten: 45 };
+  } };
+  const agent = createAgent({ webRequest: webRequestFixture() }, companion), command = { browser_id: "0", tab_id: "12", selector: "#known-download", safari_download_intent: { timeout_ms: 1000, redirects: "cross-origin-policy" } };
+  const captured = await agent.execute({ ...command, type: "safari_download_capture" }, session, metadata);
+  const next = await agent.execute({ ...command, type: "safari_download_redirect_step", ...captured }, session, metadata);
+  await assert.rejects(agent.execute({ ...command, type: "safari_download_redirect_step", intentId: captured.intentId, href: "https://destination.test/not-approved" }, session, metadata), /exact pending redirect URL/);
+  const ready = await agent.execute({ ...command, type: "safari_download_redirect_step", intentId: captured.intentId, href: next.href }, session, metadata);
+  assert.equal((await agent.execute({ ...command, type: "safari_download_complete", intentId: captured.intentId, href: ready.href }, session, metadata)).state, "complete");
+  assert.deepEqual(calls.map(call => call.action), ["dom_query", "interact", "download_intent_redirect", "download_intent_redirect", "download_intent_transfer"]);
+});
+
 test("cross-origin, cyclic and sixth-hop redirects stop before the next request without producing a file", async () => {
   for (const mode of ["cross-origin", "cycle", "limit"]) {
     const routes = mode === "cross-origin" ? { "https://example.test/synchronous.txt": { status: 302, location: "https://other.test/forbidden" } }
@@ -241,6 +264,78 @@ test("redirect source cancellation and an exhausted active budget cannot start a
     else { const next = await f.adapter.redirectStep({ id: 12 }, args); args.href = next.href; await f.cancel(); }
     await assert.rejects(f.adapter.redirectStep({ id: 12 }, args), /active transfer budget|no longer belongs/);
     assert.equal(f.requests.length, reason === "cancel" ? 1 : 0); assert.equal(f.writes.length, 0);
+    assert.equal(Object.values(f.webRequest).every(event => event.size() === 0), true);
+  }
+});
+
+test("opt-in cross-origin policy approves every full URL before one credentialed CORS request and adopts the final body once", async () => {
+  const initial = "https://example.test/synchronous.txt", final = "https://destination.test/private/export?report=exact";
+  const f = pageFixture({ routes: { [initial]: { status: 302, location: final } } }), approvals = [];
+  const command = { type: "playwright_locator_click", browser_id: "0", tab_id: "12", selector: "#known-download",
+    safari_download_intent: { timeout_ms: 1000, redirects: "cross-origin-policy" } };
+  const context = { clientInfo: { family: "safari" }, security: { async ensureDownloadAllowed(tab, href) {
+    assert.equal(tab, 12); assert.equal(f.requests.some(request => request.url === href), false);
+    approvals.push(href);
+  } }, api: { async executeUnhandledCommand({ command: operation }) {
+    if (operation.type === "safari_download_capture") { await f.arm(); f.gesture(() => f.emit(f.anchor())); return f.read(); }
+    const args = { ...f.args, href: operation.href, redirectPolicy: "cross-origin-policy" };
+    if (operation.type === "safari_download_redirect_step") return f.adapter.redirectStep({ id: 12 }, args);
+    if (operation.type === "safari_download_complete") return f.adapter.executeIntent({ id: "original-work" }, { id: 12 }, args);
+    await f.cancel(); return {};
+  } } };
+  const result = await dispatch(context, command, () => assert.fail("No alternate transport"));
+  assert.deepEqual(approvals, [initial, final]); assert.equal(result.state, "complete"); assert.equal(result.path, "/Downloads/observed.txt");
+  assert.equal(result.bytesWritten, f.body.length); assert.deepEqual(f.requests.map(request => request.url), approvals);
+  for (const request of f.requests) {
+    assert.equal(request.options.mode, "cors"); assert.equal(request.options.credentials, "include"); assert.equal(request.options.redirect, "manual");
+    assert.deepEqual(Object.keys(request.options.headers), ["X-ChatGPT-Safari-Transfer"], "never copy Cookie or Authorization between hosts");
+  }
+  assert.deepEqual(Buffer.concat(f.writes.filter(call => call.input.action === "append").map(call => Buffer.from(call.input.data, "base64"))), f.body);
+  assert.equal(f.writes.filter(call => call.input.action === "finish").length, 1);
+  assert.equal(f.live.downloadIntents.size, 0); assert.equal(Object.values(f.webRequest).every(event => event.size() === 0), true);
+});
+
+test("cross-origin approval denial leaves the destination uncontacted and cancels the captured source", async () => {
+  const f = pageFixture({ routes: { "https://example.test/synchronous.txt": { status: 302, location: "https://destination.test/private" } } });
+  const command = { type: "playwright_locator_click", browser_id: "0", tab_id: "12", safari_download_intent: { redirects: "cross-origin-policy" } };
+  const context = { clientInfo: { family: "safari" }, security: { async ensureDownloadAllowed(_tab, href) {
+    if (href.startsWith("https://destination.test/")) { assert.equal(f.requests.length, 1); throw new Error("Destination denied"); }
+  } }, api: { async executeUnhandledCommand({ command: operation }) {
+    if (operation.type === "safari_download_capture") { await f.arm(); f.gesture(() => f.emit(f.anchor())); return f.read(); }
+    if (operation.type === "safari_download_redirect_step") return f.adapter.redirectStep({ id: 12 }, { ...f.args, href: operation.href, redirectPolicy: "cross-origin-policy" });
+    assert.equal(operation.type, "safari_download_cancel"); await f.cancel(); return {};
+  } } };
+  await assert.rejects(dispatch(context, command, () => assert.fail("No alternate transport")), /Destination denied/);
+  assert.equal(f.requests.length, 1); assert.equal(f.writes.length, 0); assert.equal(f.live.downloadIntents.size, 0);
+});
+
+test("cross-origin CORS failure, cancellation and document change never retry or produce a completion path", async () => {
+  const final = "https://destination.test/private";
+  for (const reason of ["cors", "cancel", "document", "scope", "budget"]) {
+    const f = pageFixture({ routes: { "https://example.test/synchronous.txt": { status: 302, location: final }, [final]: { corsDenied: reason === "cors" } } });
+    await f.arm(); f.gesture(() => f.emit(f.anchor())); const captured = await f.read();
+    const args = { ...f.args, href: captured.href, redirectPolicy: "cross-origin-policy" };
+    const next = await f.adapter.redirectStep({ id: 12 }, args); assert.equal(next.href, final);
+    if (reason === "cancel") await f.cancel();
+    if (reason === "document") f.live.documentId = "different-document";
+    if (reason === "scope") args.scope = "different-owner";
+    if (reason === "budget") f.live.downloadIntents.get(f.args.intentId).activeMs = 30000;
+    await assert.rejects(f.adapter.redirectStep({ id: 12 }, { ...args, href: next.href }), /credentialed CORS|no longer belongs|active transfer budget/);
+    assert.equal(f.requests.length, reason === "cors" ? 2 : 1); assert.equal(f.writes.length, 0);
+    assert.equal(Object.values(f.webRequest).every(event => event.size() === 0), true);
+    // Cleanup uses only the original owner scope, including when the attempted
+    // command deliberately provided the wrong owner and could not cancel it.
+    await f.cancel(); assert.equal(f.live.downloadIntents.size, 0);
+  }
+});
+
+test("cross-origin policy retains cycle and five-request limits across hosts", async () => {
+  for (const mode of ["cycle", "limit"]) {
+    const urls = ["https://example.test/synchronous.txt", "https://destination.test/one", "https://third.test/two", "https://destination.test/three", "https://fourth.test/four", "https://fifth.test/five"];
+    const routes = Object.fromEntries(urls.slice(0, 5).map((url, index) => [url, { status: 302, location: mode === "cycle" && index === 1 ? urls[0] : urls[index + 1] }]));
+    const f = pageFixture({ routes }); await f.arm(); f.gesture(() => f.emit(f.anchor())); const captured = await f.read(); let href = captured.href;
+    await assert.rejects((async () => { for (let i = 0; i < 6; i++) { const next = await f.adapter.redirectStep({ id: 12 }, { ...f.args, href, redirectPolicy: "cross-origin-policy" }); href = next.href; } })(), /repeated a URL|five-request/);
+    assert.equal(f.requests.length, mode === "cycle" ? 2 : 5); assert.equal(f.writes.length, 0); assert.equal(f.live.downloadIntents.size, 0);
     assert.equal(Object.values(f.webRequest).every(event => event.size() === 0), true);
   }
 });

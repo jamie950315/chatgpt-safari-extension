@@ -1105,20 +1105,24 @@ function m(t,o,e){if(location.origin!==t||o!=null&&location.href!==o)return{sele
     if (!current(item)) { if (item?.scope === args.scope) discard(item); return fail("The download intent no longer belongs to its exact source document, snapshot, control and original sidebar scope."); }
     if (operation === "redirect_fetch") {
       const source = new URL(item.pageUrl), href = new URL(args.href);
-      if (!["captured", "redirect-pending"].includes(item.phase) || item.href !== href.href || href.origin !== source.origin
+      const crossOriginPolicy = args.redirectPolicy === "cross-origin-policy";
+      if (!["same-origin-policy", "cross-origin-policy"].includes(args.redirectPolicy)
+        || item.redirectPolicy && item.redirectPolicy !== args.redirectPolicy
+        || !["captured", "redirect-pending"].includes(item.phase) || item.href !== href.href || !crossOriginPolicy && href.origin !== source.origin
         || !["http:", "https:"].includes(href.protocol) || href.username || href.password
-        || !/^[a-f0-9-]{36}$/i.test(args.nonce || "")) return fail("Only the exact approved same-origin redirect hop may start once.");
+        || !/^[a-f0-9-]{36}$/i.test(args.nonce || "")) return fail("Only the exact approved redirect hop under its original policy may start once.");
       item.visited ||= new Set(); item.requestCount ||= 0; item.activeMs ||= 0;
       if (item.requestCount >= 5 || item.visited.has(href.href)) return fail("The captured download exceeded five requests or repeated a redirect URL. No request was repeated.");
       const remaining = 30000 - item.activeMs;
       if (remaining <= 0) return fail("The captured download exhausted its 30-second active transfer budget.");
+      item.redirectPolicy = args.redirectPolicy;
       item.requestCount++; item.visited.add(href.href); item.phase = "requesting"; item.nonce = args.nonce;
       const controller = new AbortController(), started = Date.now();
       item.controller = controller; item.abort = () => { controller.abort(); clearTimeout(item.networkTimer); };
       item.transferDeadline = started + remaining;
       item.networkTimer = setTimeout(() => controller.abort(), remaining); item.networkTimer?.unref?.();
       try {
-        const response = await fetch(href.href, { method: "GET", mode: "same-origin", credentials: "same-origin", redirect: "manual",
+        const response = await fetch(href.href, { method: "GET", mode: crossOriginPolicy ? "cors" : "same-origin", credentials: crossOriginPolicy ? "include" : "same-origin", redirect: "manual",
           cache: "no-store", signal: controller.signal, headers: { "X-ChatGPT-Safari-Transfer": args.nonce } });
         item.activeMs += Date.now() - started;
         if (!current(item) || item.phase !== "requesting") throw new Error("The source lease changed during its request.");
@@ -1130,14 +1134,14 @@ function m(t,o,e){if(location.origin!==t||o!=null&&location.href!==o)return{sele
         item.response = response; item.phase = "response-proof";
         return { ok: true, result: { kind: "response", status: response.status, url: response.url } };
       } catch {
-        discard(item); return fail("The exact same-origin request failed, expired, or lost its source lease. It was not repeated.");
+        discard(item); return fail("The exact approved request failed, expired, lost its source lease, or Safari denied credentialed CORS access. It was not repeated and no fallback was attempted.");
       }
     }
     if (operation === "redirect_bind") {
-      if (item.nonce !== args.nonce || item.href !== args.href) return fail("This header receipt belongs to a different exact hop.");
+      if (item.nonce !== args.nonce || item.href !== args.href || item.redirectPolicy !== args.redirectPolicy) return fail("This header receipt belongs to a different exact hop.");
       if (args.kind === "redirect" && item.phase === "redirect-proof") {
         const next = new URL(args.nextHref), source = new URL(item.pageUrl); next.hash = "";
-        if (next.origin !== source.origin || next.username || next.password || !["http:", "https:"].includes(next.protocol)) return fail("A cross-origin redirect was rejected before contacting its destination.");
+        if (args.redirectPolicy !== "cross-origin-policy" && next.origin !== source.origin || next.username || next.password || !["http:", "https:"].includes(next.protocol)) return fail("A cross-origin redirect was rejected before contacting its destination.");
         if (item.visited.has(next.href) || item.requestCount >= 5) return fail("The redirect repeated a URL or exceeded the five-request bound. No next request was sent.");
         item.href = next.href; item.phase = "redirect-pending"; item.nonce = null;
         return { ok: true, result: { kind: "redirect", href: next.href } };
@@ -1215,7 +1219,7 @@ function m(t,o,e){if(location.origin!==t||o!=null&&location.href!==o)return{sele
     if (operation === "inspect") return { ok: true, result: { href: source, url: location.href } };
     if (operation === "start") {
       if (typeof args.transferId !== "string" || state.has(args.transferId)) return failure("INVALID_DOWNLOAD", "A fresh download transfer is required.");
-      const prepared = args.redirectPolicy === "same-origin-policy";
+      const prepared = ["same-origin-policy", "cross-origin-policy"].includes(args.redirectPolicy);
       if (args.intentId && (!intentCurrent() || intent.phase !== (prepared ? "headers-ready" : "captured"))) return failure("DOWNLOAD_INTENT_USED", "This exact captured intent was already consumed or cancelled; no request was repeated.");
       if (prepared && (!intent?.response || intent.response.url !== source || intent.transferDeadline <= Date.now())) return failure("DOWNLOAD_HEADERS_EXPIRED", "The approved exact response expired before body transfer; it was not requested again.");
       if (intent) intent.phase = "transferring";
@@ -1499,7 +1503,7 @@ function m(t,o,e){if(location.origin!==t||o!=null&&location.href!==o)return{sele
     return { inspect, execute };
   }
 
-  function observeRedirectHeaders(api, tab, href, nonce) {
+  function observeRedirectHeaders(api, tab, href, nonce, redirectPolicy = "same-origin-policy") {
     const names = ["onBeforeRequest", "onBeforeSendHeaders", "onHeadersReceived"];
     if (names.some(name => typeof api.webRequest?.[name]?.addListener !== "function" || typeof api.webRequest?.[name]?.removeListener !== "function")) {
       throw new Error("Safari's request/header observation APIs are unavailable. The redirect hop was not requested.");
@@ -1534,7 +1538,7 @@ function m(t,o,e){if(location.origin!==t||o!=null&&location.href!==o)return{sele
         if (locations.length !== 1 || typeof locations[0].value !== "string" || !locations[0].value.trim()) { fail(); return; }
         let next; try { next = new URL(locations[0].value, href); } catch { fail(); return; }
         next.hash = "";
-        if (next.origin !== destination.origin || next.username || next.password || !["http:", "https:"].includes(next.protocol)) {
+        if (redirectPolicy !== "cross-origin-policy" && next.origin !== destination.origin || next.username || next.password || !["http:", "https:"].includes(next.protocol)) {
           failure = new Error("The observed redirect leaves its approved same origin. Its next destination was not contacted.");
           if (!settled) { settled = true; reject(failure); } return;
         }
@@ -1702,8 +1706,10 @@ function m(t,o,e){if(location.origin!==t||o!=null&&location.href!==o)return{sele
     async function redirectStep(tab, args) {
       assertTime(); await target(args.handle, args.expectedUrl);
       const source = new URL(args.expectedUrl), destination = new URL(args.href);
-      if (source.origin !== destination.origin || args.redirectPolicy !== "same-origin-policy") throw new Error("This explicit redirect route accepts only the source page's same-origin HTTP(S) requests.");
-      const nonce = root.crypto.randomUUID(), observer = observeRedirectHeaders(api, tab, destination.href, nonce);
+      if (!["same-origin-policy", "cross-origin-policy"].includes(args.redirectPolicy)
+        || !["http:", "https:"].includes(destination.protocol) || destination.username || destination.password
+        || args.redirectPolicy === "same-origin-policy" && source.origin !== destination.origin) throw new Error("This explicit redirect route requires an exact HTTP(S) URL allowed by its selected policy.");
+      const nonce = root.crypto.randomUUID(), observer = observeRedirectHeaders(api, tab, destination.href, nonce, args.redirectPolicy);
       try {
         const [response, receipt] = await Promise.all([intent(tab, "redirect_fetch", { ...args, nonce }), observer.promise]);
         observer.assertCurrent(); assertTime(); await target(args.handle, args.expectedUrl);
@@ -3672,7 +3678,7 @@ function m(t,o,e){if(location.origin!==t||o!=null&&location.href!==o)return{sele
           const options = command.safari_download_intent;
           if (!options || typeof options !== "object" || Array.isArray(options) || Object.keys(options).some(name => !["timeout_ms", "redirects"].includes(name))
             || !Number.isInteger(options.timeout_ms) || options.timeout_ms < 1 || options.timeout_ms > 3000
-            || options.redirects !== undefined && options.redirects !== "same-origin-policy"
+            || options.redirects !== undefined && !["same-origin-policy", "cross-origin-policy"].includes(options.redirects)
             || typeof command.selector !== "string" || !command.selector || command.safari_native_modal !== undefined
             || command.force === true || command.button && command.button !== "left" || command.modifiers?.length) {
             throw new Error("A captured download requires one plain top-level locator click and a 1–3000ms intent observation deadline");
@@ -3709,13 +3715,14 @@ function m(t,o,e){if(location.origin!==t||o!=null&&location.href!==o)return{sele
           await root.ChatGPTSafariLive?.releaseDownloadIntent?.(tabId, record.binding).catch(() => {}); return {};
         }
         if (command.type === "safari_download_redirect_step") {
-          if (record.binding.redirectPolicy !== "same-origin-policy" || !["captured", "redirect"].includes(record.phase) || command.href !== record.href) throw new Error("Approve the exact pending redirect URL before issuing its one same-origin request");
+          if (!["same-origin-policy", "cross-origin-policy"].includes(record.binding.redirectPolicy) || !["captured", "redirect"].includes(record.phase) || command.href !== record.href) throw new Error("Approve the exact pending redirect URL before issuing its one policy-gated request");
           record.phase = "requesting";
           try {
             const result = await run("download_intent_redirect", { ...record.binding, href: record.href });
             await authorize(session, metadata); await session.requireOwnedTab(tabId);
             if (downloadIntents.get(command.intentId) !== record || !["redirect", "ready"].includes(result.kind) || typeof result.href !== "string"
-              || new URL(result.href).origin !== new URL(record.binding.expectedUrl).origin) throw new Error("The exact same-origin redirect proof did not retain its original download lease");
+              || !["http:", "https:"].includes(new URL(result.href).protocol) || new URL(result.href).username || new URL(result.href).password
+              || record.binding.redirectPolicy === "same-origin-policy" && new URL(result.href).origin !== new URL(record.binding.expectedUrl).origin) throw new Error("The exact redirect proof did not retain its original download lease and policy");
             record.href = result.href; record.phase = result.kind;
             return result;
           } catch (error) {
@@ -5338,7 +5345,7 @@ function m(t,o,e){if(location.origin!==t||o!=null&&location.href!==o)return{sele
         // The actual anchor default is already cancelled. Original source and
         // destination policy runs before the first request or private file write.
         let href = captured.href;
-        if (command.safari_download_intent.redirects === "same-origin-policy") {
+        if (["same-origin-policy", "cross-origin-policy"].includes(command.safari_download_intent.redirects)) {
           let ready = false;
           for (let request = 0; request < 5; request++) {
             await context.security.ensureDownloadAllowed(Number(command.tab_id), href);

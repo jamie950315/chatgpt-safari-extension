@@ -208,8 +208,23 @@ and document IDs. The next full URL must pass the original policy before its
 request is sent. At most five requests are allowed; cycles and cross-origin hops
 stop before the next destination is contacted. The final response is consumed
 once by the existing writer, within the **32 MiB / 30-second active-transfer**
-bound. Existing direct-link and export behavior is unchanged. A generic native
-`waitForEvent("download")` remains unavailable.
+bound.
+
+For redirects to another origin, use `redirects: "cross-origin-policy"` instead.
+Each full URL still requires the original policy and approval before its request.
+Safari applies the destination's own cookies; the adapter never copies Cookie or
+Authorization headers between hosts. Cross-origin responses must allow the
+source page's exact origin, credentials, and the non-secret correlation header
+through CORS, including any preflight. Safari's cookie policies still apply.
+Without that access, the operation fails without a saved path or a transport
+retry; the approved server may already have received the request. The final body
+is read once, with the same five-GET-hop, size, active-transfer, and cancellation
+bounds. Approval time while no request is active is excluded from that budget.
+
+Existing direct-link and export behavior is unchanged. Detached anchors,
+asynchronous download triggers, and Blob downloads remain unsupported: Safari's
+public download interfaces do not establish their originating operation. A
+generic native `waitForEvent("download")` remains unavailable.
 
 `Tab.content.exportGsuite(format)` derives the official export URL from the
 current Google Workspace page: documents support pdf/md/docx, spreadsheets
@@ -394,6 +409,14 @@ Completed installed checks:
   connected-anchor button, retained its original download approval, and returned
   a real **46-byte** file. Exact content, mode 0600 and quarantine were verified;
   the same inline conversation finished normally without another button click.
+
+- The original **Work** agent completed a different-host `cross-origin-policy`
+  redirect with both ordinary Safari HTTP-only logins retained. Before the
+  original destination approval there were zero requests; afterward, one
+  preflight and one GET produced the exact **61-byte** file with mode 0600 and
+  quarantine. Work returned the writer's actual path and completed normally.
+  A non-CORS response failed without a path or fallback. Explicitly denying a
+  distinct destination sent no destination request and returned no path.
 
 - After the user enabled Full Disk Access for the containing app, the original
   **Work** agent searched only an exact owned fixture URL in today's Safari
