@@ -3874,7 +3874,7 @@
 		]).optional(),
 		force: k().optional(),
 		timeout_ms: u().int().positive().optional()
-	}).extend({safari_native_modal:Z().optional(),safari_upload_source:Z().optional()}), $u = n({}), Ys = "playwright_locator_click";
+	}).extend({safari_native_modal:Z().optional(),safari_upload_source:Z().optional(),safari_download_intent:Z().optional()}), $u = n({}), Ys = "playwright_locator_click";
 	function Xs(e) {
 		return new m(Ys, Ks, e);
 	}
@@ -6499,6 +6499,14 @@ return this.transport.send({command:Xs({browser_id:this.browserId,tab_id:this.ta
 }
 var SafariNativeDialogsDefinition=de({capability:SafariNativeDialogsCapability,info:{id:"nativeDialogs",description:"Respond to one exact expected native JavaScript dialog within its opening click, before Safari suspends extension callbacks."}}),
 SafariNativeUploadsDefinition=de({capability:SafariNativeUploadsCapability,info:{id:"nativeUploads",description:"Approve explicit local files before clicking one visible file input, then complete its actual native Safari chooser atomically."}});
+class SafariNativeDownloadsCapability extends ce{
+constructor({browserId,documentation,info,tabId,transport}){super(transport,browserId,tabId,documentation,info)}
+async run(options){
+if(!options||typeof options!=="object"||Array.isArray(options)||Object.keys(options).some(key=>!["selector","timeout_ms","redirects"].includes(key))||typeof options.selector!=="string"||!options.selector||!Number.isInteger(options.timeout_ms??1000)||(options.timeout_ms??1000)<1||(options.timeout_ms??1000)>3000||options.redirects!==undefined&&options.redirects!=="same-origin-policy")throw new Error("Specify one known download-control selector, a 1–3000ms intent deadline, and optional same-origin-policy redirects");
+return this.transport.send({command:Xs({browser_id:this.browserId,tab_id:this.tabId,selector:options.selector,safari_download_intent:{timeout_ms:options.timeout_ms??1000,...options.redirects===undefined?{}:{redirects:options.redirects}}}),timeoutMs:120000})
+}
+}
+var SafariNativeDownloadsDefinition=de({capability:SafariNativeDownloadsCapability,info:{id:"nativeDownloads",description:"Capture one synchronous connected HTTP(S) anchor intent from a known native-clicked download control; approve its actual destination before ordinary-profile transfer. Read documentation first."}});
 	const jo = de({
 		capability: Bo,
 		info: Mo
@@ -6509,6 +6517,7 @@ SafariNativeUploadsDefinition=de({capability:SafariNativeUploadsCapability,info:
 		Do,
 		SafariNativeDialogsDefinition,
 		SafariNativeUploadsDefinition,
+		SafariNativeDownloadsDefinition,
 		jo
 	], gm = vm(Lo), wm = ({ browserId: e, capabilities: t, documentation: a, tabId: r, transport: s }) => {
 		const c = {};

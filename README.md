@@ -47,9 +47,9 @@ headers stay on official nonstatic requests.
 
 The macOS package uses a **Manifest V2 persistent background page**, with the
 real `browserAction` toolbar API. Safari's MV3 worker stopped answering
-cold-start side-chat requests. Preparation retains the sandbox and original
-host permissions, adding only the embedded wrapper resource and scoped local
-provider frame policy.
+cold-start side-chat requests. Preparation retains the sandbox and original host permissions. It adds the
+embedded wrapper resource, scoped local provider frame policy, and `webRequest`
+permission for on-demand, exact-request download-header observation.
 
 ## Direct side-chat agent control
 
@@ -184,9 +184,32 @@ the file automatically. Incomplete transfers are discarded.
 This route supports visible HTTP/HTTPS file links up to **32 MiB** within
 **30 seconds**. Cross-origin links require Safari's actual credentialed CORS
 access as well as the original download approval. Redirects are rejected before
-following an unapproved destination. Blob links and JavaScript download buttons
-do not have a verified completed-download event route. Normal native clicks
-remain available, but a click alone is not a verified-download result.
+following an unapproved destination. Blob links and arbitrary JavaScript buttons
+are outside this direct-link route; supported buttons use the capability below.
+
+For a page button that synchronously clicks a connected `a[download]`, use the
+original tab's `nativeDownloads` capability. It performs the one native click;
+do not click the control separately:
+
+```js
+const downloads = await tab.capabilities.get("nativeDownloads");
+const saved = await downloads.run({ selector: "#download-report" });
+```
+
+The exact anchor's default action is cancelled before the original download
+approval and transfer. A successful result contains the real completed file's
+`state`, `path`, `bytesWritten` and `mime`. Detached anchors, location assignments,
+forms, later-task downloads, and blob/data links are unsupported by this route.
+
+For same-origin HTTP redirects, opt in with
+`redirects: "same-origin-policy"`. Each request stays manual: Safari's native
+request/header events bind a non-secret correlation header to its actual request
+and document IDs. The next full URL must pass the original policy before its
+request is sent. At most five requests are allowed; cycles and cross-origin hops
+stop before the next destination is contacted. The final response is consumed
+once by the existing writer, within the **32 MiB / 30-second active-transfer**
+bound. Existing direct-link and export behavior is unchanged. A generic native
+`waitForEvent("download")` remains unavailable.
 
 `Tab.content.exportGsuite(format)` derives the official export URL from the
 current Google Workspace page: documents support pdf/md/docx, spreadsheets
@@ -225,14 +248,13 @@ browser session, scoped to the current ChatGPT account and Safari profile
 
 History search reads a profile-bound Safari database read-only, using bounded
 parameterized queries. Native profile metadata must match; an unknown profile
-never falls back to another profile's history. This Mac currently denies the
-containing app access to Safari history and download metadata. Continuing that
-integration requires the user to enable **System Settings → Privacy & Security →
-Full Disk Access** for this checkout's `dist/ChatGPT for Safari.app`. That grant
-is broader than the two metadata sources; Downloads-folder and Accessibility
-permissions do not replace it. The app does not bypass a denial. History and
-native completed-download provenance remain unverified until that grant and
-subsequent validation.
+never falls back to another profile's history. On this Mac, Full Disk Access is
+enabled for this checkout's `dist/ChatGPT for Safari.app`; the installed original
+Work agent successfully searched an exact owned URL and returned its real visit
+timestamp. On another installation, the user may need to enable **System Settings
+→ Privacy & Security → Full Disk Access** for the containing app. This grant is
+broader than Safari metadata; Downloads-folder and Accessibility permissions do
+not replace it. Permission failures remain explicit.
 
 Bookmark tree/search/read, title/URL updates, and folder creation use Safari's
 own editor in a temporary ordinary-profile window, then restore the sidebar
@@ -359,6 +381,24 @@ adapter and `safari_live` target existing tabs; `safari_native` is for isolated 
 ## Installed acceptance
 
 Completed installed checks:
+
+- The original **Work** agent completed an explicit same-origin-policy button
+  download through a real HTTP redirect. Both session-protected endpoints were
+  requested once. While the second original approval was pending, the final
+  endpoint had not been contacted. Approval produced an exact **52-byte** file
+  with mode 0600 and quarantine, preserving the same-name original. Native
+  request/header nonce and document identity were observed; Work finished in the
+  same inline conversation.
+
+- The original **Work** agent ran `nativeDownloads` once on a synchronous
+  connected-anchor button, retained its original download approval, and returned
+  a real **46-byte** file. Exact content, mode 0600 and quarantine were verified;
+  the same inline conversation finished normally without another button click.
+
+- After the user enabled Full Disk Access for the containing app, the original
+  **Work** agent searched only an exact owned fixture URL in today's Safari
+  history. Its normal history consent was retained, the real visit timestamp
+  was returned, and the original response finished normally.
 
 - The official provider **Reload** button recovered automatically after the
   expected missing-capability document response, without closing the sidebar or

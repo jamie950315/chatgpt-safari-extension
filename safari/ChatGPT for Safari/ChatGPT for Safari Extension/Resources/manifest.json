@@ -31,7 +31,8 @@
     "webNavigation",
     "contextMenus",
     "sidePanel",
-    "<all_urls>"
+    "<all_urls>",
+    "webRequest"
   ],
   "commands": {
     "open-codex-side-panel": {

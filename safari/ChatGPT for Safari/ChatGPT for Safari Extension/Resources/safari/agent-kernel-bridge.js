@@ -51,6 +51,33 @@
       && (!/^[1-9]\d*$/u.test(command.tab_id || "") || !Number.isSafeInteger(Number(command.tab_id))))) {
       throw new Error("A Safari agent command requires its browser and claimed tab IDs.");
     }
+    if (command.safari_download_intent !== undefined) {
+      if (command.type !== "playwright_locator_click" || command.safari_native_modal !== undefined) throw new Error("A captured download requires its dedicated single locator-click capability.");
+      let captured;
+      try {
+        captured = await context.api.executeUnhandledCommand({ type: "browser_safari_command", command: { ...command, type: "safari_download_capture" } });
+        // The actual anchor default is already cancelled. Original source and
+        // destination policy runs before the first request or private file write.
+        let href = captured.href;
+        if (command.safari_download_intent.redirects === "same-origin-policy") {
+          let ready = false;
+          for (let request = 0; request < 5; request++) {
+            await context.security.ensureDownloadAllowed(Number(command.tab_id), href);
+            const step = await context.api.executeUnhandledCommand({ type: "browser_safari_command",
+              command: { ...command, type: "safari_download_redirect_step", intentId: captured.intentId, href } });
+            if (!["redirect", "ready"].includes(step.kind) || typeof step.href !== "string") throw new Error("Safari returned no verified exact redirect hop. No request was repeated.");
+            href = step.href;
+            if (step.kind === "ready") { ready = true; break; }
+          }
+          if (!ready) throw new Error("The captured download reached its five-request redirect bound. No next request was sent.");
+        } else await context.security.ensureDownloadAllowed(Number(command.tab_id), href);
+        return await context.api.executeUnhandledCommand({ type: "browser_safari_command",
+          command: { ...command, type: "safari_download_complete", intentId: captured.intentId, href } });
+      } finally {
+        if (captured) await context.api.executeUnhandledCommand({ type: "browser_safari_command",
+          command: { ...command, type: "safari_download_cancel", intentId: captured.intentId } }).catch(() => {});
+      }
+    }
     if (command.safari_native_modal !== undefined) {
       if (command.type !== "playwright_locator_click") throw new Error("Only a single native locator click may preregister a modal response.");
       if (command.safari_native_modal?.kind === "upload") {

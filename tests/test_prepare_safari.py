@@ -82,6 +82,33 @@ await assert.rejects(dialog.run({selector:"button",force:true}),/exact native di
 })().catch(error=>{console.error(error);process.exitCode=1});
 '''.replace("WORKER", json.dumps(worker)).replace("SDK", json.dumps(helper.native_modal_sdk("Base", "click", "define"))))
 
+    def test_native_download_capability_is_additive_and_generic_download_waiter_remains_hidden(self):
+        helper = module.prepare_safari_agent
+        host = helper.prepare_kernel_host((ROOT / "unpacked" / helper.KERNEL_HOST).read_text())
+        worker = helper.prepare_kernel_worker((ROOT / "unpacked" / helper.KERNEL_WORKER).read_text())
+        self.assertEqual(helper.prepare_kernel_host(host), host)
+        self.assertEqual(helper.prepare_kernel_worker(worker), worker)
+        self.assertEqual(helper.prepare_kernel_host(host.replace("same-origin-policy", "old-no-redirect")), host)
+        self.assertEqual(helper.prepare_kernel_worker(worker.replace("same-origin-policy", "old-no-redirect")), worker)
+        self.assertIn("safari_download_intent:Lt().optional()", host)
+        self.assertIn('"capabilities/tab/nativeDownloads":', host)
+        self.assertNotIn('waitForEvent(event: "download", options?: WaitForEventOptions): Promise<PlaywrightDownload>', host)
+        background = helper.prepare_background(module.prepare(module.SOURCE.read_text()))
+        self.assertIn('{id:"nativeDownloads",description:', background)
+        self.run_javascript(r'''
+const assert=require("node:assert/strict"),vm=require("node:vm");
+const bundle=WORKER,start=bundle.indexOf("var c=")+6,end=bundle.indexOf("`,o=typeof self",start)+1;
+const worker=vm.runInNewContext(bundle.slice(start,end));new vm.Script(worker);
+class Base{constructor(transport,browserId,tabId){Object.assign(this,{transport,browserId,tabId})}}
+const scope={Base,click:payload=>({type:"playwright_locator_click",...payload}),define:value=>value};vm.createContext(scope);vm.runInContext(SDK,scope);
+const calls=[],actual={state:"complete",path:"/Downloads/actual",bytesWritten:45};
+const capability=new scope.SafariNativeDownloadsDefinition.capability({browserId:"0",tabId:"12",transport:{async send(value){calls.push(value);return actual}}});
+(async()=>{assert.equal(await capability.run({selector:"#known-download"}),actual);assert.equal(calls[0].command.type,"playwright_locator_click");assert.equal(calls[0].command.safari_download_intent.timeout_ms,1000);assert.equal(calls[0].timeoutMs,120000);
+await capability.run({selector:"#known-download",redirects:"same-origin-policy"});assert.equal(calls[1].command.safari_download_intent.redirects,"same-origin-policy");
+for(const options of [{selector:"x",href:"https://override.invalid"},{selector:"x",timeout_ms:3001},{selector:"x",force:true},{selector:"x",redirects:"follow"}])await assert.rejects(capability.run(options),/known download-control/);
+assert.equal(calls.length,2)})().catch(error=>{console.error(error);process.exitCode=1});
+'''.replace("WORKER", json.dumps(worker)).replace("SDK", json.dumps(helper.native_download_sdk("Base", "click", "define"))))
+
     def test_original_tab_context_reads_open_authenticated_tabs_with_bounded_content(self):
         background = module.prepare_safari_agent.prepare_background(module.prepare(module.SOURCE.read_text()))
         # Execute only the preserved reader functions, never the application
@@ -149,7 +176,7 @@ const read=(id=11)=>sandbox.read({tabId:id,expectedUrl:tabs.get(id).url,read:{ki
         result = module.prepare_manifest(original)
         self.assertEqual(result["manifest_version"], 2)
         self.assertEqual(result["background"], {"scripts": ["background.js"], "persistent": True})
-        self.assertEqual(set(result["permissions"]), set(original["permissions"] + original["host_permissions"]))
+        self.assertEqual(set(result["permissions"]), set(original["permissions"] + original["host_permissions"] + ["webRequest"]))
         self.assertEqual(result["browser_action"], original["action"])
         self.assertEqual(result["commands"]["_execute_browser_action"], original["commands"]["_execute_action"])
         self.assertEqual(result["content_scripts"], original["content_scripts"])

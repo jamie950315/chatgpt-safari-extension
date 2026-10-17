@@ -155,7 +155,7 @@ final class EmbeddedSideChatController {
                 guard let profile = liveProfileId, command["profileId"] as? String == profile,
                       let request = command["command"] as? [String: Any],
                       let action = request["action"] as? String,
-                      ["read_page", "interact", "navigate", "history", "select_tab", "close_tab", "organize", "download_link_inspect", "download_link", "dom_query", "screenshot", "dialog", "asset_bundle", "content_export", "create_tab", "filechooser", "viewport"].contains(action),
+                      ["read_page", "interact", "navigate", "history", "select_tab", "close_tab", "organize", "download_link_inspect", "download_link", "download_intent_transfer", "download_intent_redirect", "dom_query", "screenshot", "dialog", "asset_bundle", "content_export", "create_tab", "filechooser", "viewport"].contains(action),
                       let args = request["arguments"] as? [String: Any],
                       (action == "create_tab" ? args["profileId"] as? String == profile
                         : (args["handle"] as? String).flatMap(SafariLiveBroker.profile(from:)) == profile),

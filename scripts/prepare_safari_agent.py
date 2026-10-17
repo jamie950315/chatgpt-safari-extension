@@ -233,6 +233,77 @@ resume extension JavaScript while Safari's native modal blocks its event loop.
 """
 
 
+
+NATIVE_DOWNLOAD_DOCUMENTATION = """# Safari Tab Capability: nativeDownloads
+Use `await (await tab.capabilities.get('nativeDownloads')).run({selector,
+timeout_ms?, redirects?})` for a known top-level control whose real click synchronously
+clicks a connected `a[download]` HTTP(S) anchor. A direct download anchor also
+qualifies. This is a bounded anchor-intent transfer, not a native request waiter.
+
+The original locator resolves one visible enabled control. The bridge arms its
+exact document/snapshot/source/owner/account/profile/session/turn observer, then
+posts one plain trusted native click. It cancels the observed anchor's default
+action while the original source click is still dispatching, retains its actual
+URL, and obtains original source/destination download approval before fetching
+or writing any file. It does not replay the click or submit a replacement event.
+The control's real JavaScript handler still runs; use it only for a known download
+control, not an arbitrary action whose other effects should be suppressed.
+
+The result contains `state: 'complete'`, `path`, `bytesWritten` and response MIME
+only after actual operation-bound writing finishes in Downloads. Existing page
+cookies remain in ordinary Safari. Cross-origin destinations require their real
+credentialed CORS support. Transfer limits remain 32 MiB and 30 seconds.
+`timeout_ms` bounds post-click intent observation (default 1000, maximum 3000),
+not consent time. Captured receipts expire after 90 seconds and are single-use.
+
+By default redirects are rejected. To allow policy-gated same-origin hops, set
+`redirects: 'same-origin-policy'` explicitly. Every request remains manual: a fresh
+nonsecret `X-ChatGPT-Safari-Transfer` header binds that exact fetch to Safari's
+real requestId/documentId/header events. The next full URL is approved before
+its request. At most five requests are allowed; cycles and cross-origin hops
+are rejected.
+The same-origin server must accept this header; no alternate request or retry
+is attempted. The 30-second active network/body budget excludes approvals while
+no request is active. Missing or mismatched header observations fail closed.
+
+Location assignment, forms, detached anchors, later-task downloads, cross-origin
+frames, blob/data URLs and unobservable/noncancelable responses are unsupported
+and do not produce a completion path. After any uncertain delivered
+click, inspect the page and never repeat that click automatically. The generic
+`waitForEvent('download')` is not advertised as supported in Safari.
+"""
+
+
+def native_download_sdk(base: str, click: str, define: str) -> str:
+    return f'''class SafariNativeDownloadsCapability extends {base}{{
+constructor({{browserId,documentation,info,tabId,transport}}){{super(transport,browserId,tabId,documentation,info)}}
+async run(options){{
+if(!options||typeof options!=="object"||Array.isArray(options)||Object.keys(options).some(key=>!["selector","timeout_ms","redirects"].includes(key))||typeof options.selector!=="string"||!options.selector||!Number.isInteger(options.timeout_ms??1000)||(options.timeout_ms??1000)<1||(options.timeout_ms??1000)>3000||options.redirects!==undefined&&options.redirects!=="same-origin-policy")throw new Error("Specify one known download-control selector, a 1–3000ms intent deadline, and optional same-origin-policy redirects");
+return this.transport.send({{command:{click}({{browser_id:this.browserId,tab_id:this.tabId,selector:options.selector,safari_download_intent:{{timeout_ms:options.timeout_ms??1000,...options.redirects===undefined?{{}}:{{redirects:options.redirects}}}}}}),timeoutMs:120000}})
+}}
+}}
+var SafariNativeDownloadsDefinition={define}({{capability:SafariNativeDownloadsCapability,info:{{id:"nativeDownloads",description:"Capture one synchronous connected HTTP(S) anchor intent from a known native-clicked download control; approve its actual destination before ordinary-profile transfer. Read documentation first."}}}});
+'''
+
+
+def prepare_native_download_host(source: str) -> str:
+    if "class SafariNativeDownloadsCapability" not in source:
+        source = replace_once(source, 'safari_upload_source:Lt().optional()', 'safari_upload_source:Lt().optional(),safari_download_intent:Lt().optional()')
+        source = replace_once(source, 'var Dp=ni({capability:Nk,info:Mk})', native_download_sdk("ri", "qT", "ni") + 'var Dp=ni({capability:Nk,info:Mk})')
+        source = replace_once(source, 'Rp=[dk,nk,Qo,Ok,Dp,SafariNativeDialogsDefinition,SafariNativeUploadsDefinition]', 'Rp=[dk,nk,Qo,Ok,Dp,SafariNativeDialogsDefinition,SafariNativeUploadsDefinition,SafariNativeDownloadsDefinition]')
+        source = replace_once(source, '"capabilities/tab/pageAssets":', '"capabilities/tab/nativeDownloads":' + json.dumps(NATIVE_DOWNLOAD_DOCUMENTATION) + ',"capabilities/tab/pageAssets":')
+        source = replace_once(source, '{mode:"model",name:"capabilities/tab/pageAssets"}', '{mode:"model",name:"capabilities/tab/nativeDownloads"},{mode:"model",name:"capabilities/tab/pageAssets"}')
+    else:
+        start = source.index("class SafariNativeDownloadsCapability")
+        end = source.index('var Dp=ni({capability:Nk,info:Mk})', start)
+        source = source[:start] + native_download_sdk("ri", "qT", "ni") + source[end:]
+    key = '"capabilities/tab/nativeDownloads":'
+    start = source.index(key) + len(key)
+    _, consumed = json.JSONDecoder().raw_decode(source[start:])
+    source = source[:start] + json.dumps(NATIVE_DOWNLOAD_DOCUMENTATION) + source[start + consumed:]
+    return source
+
+
 def native_modal_sdk(base: str, click: str, define: str) -> str:
     """Use the original locator-click transport and original security gate."""
     return f'''class SafariNativeDialogsCapability extends {base}{{
@@ -273,12 +344,19 @@ def prepare_native_modal_host(source: str) -> str:
 
 
 def prepare_kernel_worker(source: str) -> str:
-    if "class SafariNativeDialogsCapability" in source:
-        return source
-    source = replace_once(source, '}), $u = n({}), Ys = "playwright_locator_click";',
-                          '}).extend({safari_native_modal:Z().optional(),safari_upload_source:Z().optional()}), $u = n({}), Ys = "playwright_locator_click";')
-    source = replace_once(source, '\tconst jo = de({', native_modal_sdk("ce", "Xs", "de") + '\tconst jo = de({')
-    source = replace_once(source, '\t\tDo,\n\t\tjo\n', '\t\tDo,\n\t\tSafariNativeDialogsDefinition,\n\t\tSafariNativeUploadsDefinition,\n\t\tjo\n')
+    if "class SafariNativeDialogsCapability" not in source:
+        source = replace_once(source, '}), $u = n({}), Ys = "playwright_locator_click";',
+                              '}).extend({safari_native_modal:Z().optional(),safari_upload_source:Z().optional()}), $u = n({}), Ys = "playwright_locator_click";')
+        source = replace_once(source, '\tconst jo = de({', native_modal_sdk("ce", "Xs", "de") + '\tconst jo = de({')
+        source = replace_once(source, '\t\tDo,\n\t\tjo\n', '\t\tDo,\n\t\tSafariNativeDialogsDefinition,\n\t\tSafariNativeUploadsDefinition,\n\t\tjo\n')
+    if "class SafariNativeDownloadsCapability" not in source:
+        source = replace_once(source, 'safari_upload_source:Z().optional()', 'safari_upload_source:Z().optional(),safari_download_intent:Z().optional()')
+        source = replace_once(source, '\tconst jo = de({', native_download_sdk("ce", "Xs", "de") + '\tconst jo = de({')
+        source = replace_once(source, '\t\tSafariNativeUploadsDefinition,\n', '\t\tSafariNativeUploadsDefinition,\n\t\tSafariNativeDownloadsDefinition,\n')
+    else:
+        start = source.index("class SafariNativeDownloadsCapability")
+        end = source.index('\tconst jo = de({', start)
+        source = source[:start] + native_download_sdk("ce", "Xs", "de") + source[end:]
     return source
 
 
@@ -389,7 +467,7 @@ def prepare_background(source: str) -> str:
     source = replace_once(source, 'browser:[Go.info,...await this.browserManagementEnabled?[Mo.info]:[]]',
                           'browser:[{...Go.info,description:"Set exact measured CSS dimensions by resizing the real ordinary Safari window. Native focus, screen and minimum-size limits apply. Read Safari-specific documentation and reset before finishing."},...await this.browserManagementEnabled?[{...Mo.info,description:"Organize ordinary Safari tabs and native named tab groups. Read Safari-specific documentation first."}]:[]]')
     source = replace_once(source, 'tab:[y_,...await this.webMcpConfig?.enabled()?[Ao]:[]]',
-                          'tab:[y_,{id:"nativeDialogs",description:"Respond to one exact expected native JavaScript dialog within its opening click. Read documentation first."},{id:"nativeUploads",description:"Approve explicit files before clicking a visible file input, then complete its actual native Safari chooser. Read documentation first."}]')
+                          'tab:[y_,{id:"nativeDialogs",description:"Respond to one exact expected native JavaScript dialog within its opening click. Read documentation first."},{id:"nativeUploads",description:"Approve explicit files before clicking a visible file input, then complete its actual native Safari chooser. Read documentation first."},{id:"nativeDownloads",description:"Capture one synchronous connected HTTP(S) anchor intent from a known download control; approve before ordinary-profile transfer. Read documentation first."}]')
     source = replace_once(source, ',await n.endTurn(r)}async getInfo(e)',
                           ';try{await n.endTurn(r)}finally{await globalThis.ChatGPTSafariAgent.release(t,r)}}async getInfo(e)')
     return bridge_source() + "\n" + source
@@ -415,6 +493,7 @@ def prepare_kernel_host(source: str) -> str:
     source = prepare_content_export_documentation(source)
     source = prepare_assets_documentation(source)
     source = prepare_native_modal_host(source)
+    source = prepare_native_download_host(source)
     source = source.replace("// Read clipboard items, including text and binary payloads.",
                             "// Read this original session clipboard only; no OS clipboard read occurs. Supported native page copy/cut results retain their text/HTML/PNG/TIFF/JPEG/PDF/RTF MIME entries.")
     source = source.replace("// Write clipboard items.",

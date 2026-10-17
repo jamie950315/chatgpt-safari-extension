@@ -292,7 +292,7 @@ final class SafariLiveBroker {
                   current.id == command["id"] as? String,
                   current.profile == command["profileId"] as? String,
                   current.session == command["sessionId"] as? String,
-                  (isDownload ? ["download_link", "asset_bundle", "content_export"].contains(current.command["action"] as? String ?? "")
+                  (isDownload ? ["download_link", "asset_bundle", "content_export", "download_intent_transfer"].contains(current.command["action"] as? String ?? "")
                     : current.command["action"] as? String == "organize"),
                   let native = command["input"] as? [String: Any] else {
                 reply(Self.failure("STALE_OPERATION", "This native operation no longer belongs to an active Safari command.")); return
@@ -456,8 +456,11 @@ final class SafariLiveBroker {
 
     private func execute(_ action: String, args: [String: Any], agentOwner: String?, generation: Int, reply: @escaping Reply) {
         guard ["list_tabs", "read_page", "interact", "navigate", "history", "select_tab", "create_tab", "close_tab",
-               "organize", "download_link_inspect", "download_link", "dom_query", "screenshot", "dialog", "asset_bundle", "content_export", "filechooser", "viewport"].contains(action) else {
+               "organize", "download_link_inspect", "download_link", "download_intent_transfer", "download_intent_redirect", "dom_query", "screenshot", "dialog", "asset_bundle", "content_export", "filechooser", "viewport"].contains(action) else {
             reply(Self.failure("UNKNOWN_ACTION", "Unknown live Safari tool.")); return
+        }
+        if ["download_intent_transfer", "download_intent_redirect"].contains(action), agentOwner == nil {
+            reply(Self.failure("INVALID_COMMAND", "A captured download intent requires its original signed-in sidebar owner.")); return
         }
         discover(deadline: Date().addingTimeInterval(5)) { ids in
             if let agentOwner, self.activeAgentOwner != agentOwner || self.agentGeneration != generation {

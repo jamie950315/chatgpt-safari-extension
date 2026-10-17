@@ -6,6 +6,7 @@
     "navigate_tab_url", "navigate_tab_back", "navigate_tab_forward", "navigate_tab_reload", "close_tab",
     "browser_management_call", "browser_management_get_audit_trail", "safari_download_inspect", "dom_cua_download_media",
     "browser_viewport_set", "browser_viewport_reset",
+    "safari_download_capture", "safari_download_complete", "safari_download_cancel", "safari_download_redirect_step",
     "tab_screenshot", "tab_get_js_dialog", "tab_handle_js_dialog", "tab_clipboard_read", "tab_clipboard_read_text", "tab_clipboard_write", "tab_clipboard_write_text",
     "safari_logs_start", "safari_created_tab_bind", "tab_dev_logs",
     "tab_page_assets_list", "tab_page_assets_bundle", "safari_assets_inspect",
@@ -24,6 +25,7 @@
     const clipboards = new Map();
     const logLeases = new Map();
     const fileChooserWaiters = new Map(), fileChoosers = new Map();
+    const downloadIntents = new Map();
     const management = root.ChatGPTSafariManagement?.createManagement(api, companion);
     const viewport = root.ChatGPTSafariViewport?.createViewport(api, companion);
     let generation = 0;
@@ -111,6 +113,75 @@
         return run("content_export", { ...args, exportId: command.exportId });
       }
       const agentScope = { ownerId: owner.instanceId, sessionId: metadata.session_id, turnId: metadata.turn_id };
+      if (["safari_download_capture", "safari_download_complete", "safari_download_cancel", "safari_download_redirect_step"].includes(command.type)) {
+        const scope = JSON.stringify([metadata.session_id, metadata.turn_id, owner.instanceId, owner.profileId, owner.accountScope, String(tabId)]);
+        const fullScope = { ...agentScope, accountScope: owner.accountScope };
+        if (command.type === "safari_download_capture") {
+          const options = command.safari_download_intent;
+          if (!options || typeof options !== "object" || Array.isArray(options) || Object.keys(options).some(name => !["timeout_ms", "redirects"].includes(name))
+            || !Number.isInteger(options.timeout_ms) || options.timeout_ms < 1 || options.timeout_ms > 3000
+            || options.redirects !== undefined && options.redirects !== "same-origin-policy"
+            || typeof command.selector !== "string" || !command.selector || command.safari_native_modal !== undefined
+            || command.force === true || command.button && command.button !== "left" || command.modifiers?.length) {
+            throw new Error("A captured download requires one plain top-level locator click and a 1–3000ms intent observation deadline");
+          }
+          if (options.redirects && ["onBeforeRequest", "onBeforeSendHeaders", "onHeadersReceived"].some(name => typeof api.webRequest?.[name]?.addListener !== "function" || typeof api.webRequest?.[name]?.removeListener !== "function")) throw new Error("Safari's required native request/header observation APIs are unavailable. No source click was delivered");
+          if ([...downloadIntents.values()].some(item => item.key === key)) throw new Error("A captured download is already active for this tab and original turn");
+          const target = await query("safari_locator_prepare");
+          if (target.frameId || target.framePath?.length) throw new Error("Captured download controls must be in the top-level document, not an iframe");
+          const intentId = root.crypto.randomUUID(), binding = { documentId: target.documentId, snapshotId: target.snapshotId,
+            node: target.node, expectedUrl: target.url, intentId, scope, agentScope: fullScope,
+            ...(options.redirects ? { redirectPolicy: options.redirects } : {}) };
+          const record = { key, owner: owner.instanceId, tabId, binding, phase: "armed" };
+          downloadIntents.set(intentId, record);
+          try {
+            const result = await run("interact", { documentId: target.documentId, snapshotId: target.snapshotId,
+              interactions: [{ type: "click", node: target.node, button: "left", clickCount: 1, modifiers: [] }],
+              agentScope: fullScope, downloadIntent: { intentId, scope, timeout_ms: options.timeout_ms } });
+            await authorize(session, metadata); await session.requireOwnedTab(tabId);
+            const captured = result.downloadIntent;
+            if (downloadIntents.get(intentId) !== record || record.phase !== "armed" || captured?.intentId !== intentId
+              || typeof captured.href !== "string" || !/^https?:\/\//i.test(captured.href)) throw new Error("The delivered click has no current exact-source captured download intent. Do not replay it");
+            record.href = captured.href; record.phase = "captured";
+            return { intentId, href: captured.href };
+          } catch (error) {
+            downloadIntents.delete(intentId);
+            await root.ChatGPTSafariLive?.releaseDownloadIntent?.(tabId, binding).catch(() => {});
+            throw error;
+          }
+        }
+        const record = downloadIntents.get(command.intentId);
+        if (!record || record.key !== key || record.owner !== owner.instanceId || record.binding.scope !== scope) throw new Error("This captured download no longer belongs to its exact original owner/account/profile/session/turn/tab");
+        if (command.type === "safari_download_cancel") {
+          downloadIntents.delete(command.intentId);
+          await root.ChatGPTSafariLive?.releaseDownloadIntent?.(tabId, record.binding).catch(() => {}); return {};
+        }
+        if (command.type === "safari_download_redirect_step") {
+          if (record.binding.redirectPolicy !== "same-origin-policy" || !["captured", "redirect"].includes(record.phase) || command.href !== record.href) throw new Error("Approve the exact pending redirect URL before issuing its one same-origin request");
+          record.phase = "requesting";
+          try {
+            const result = await run("download_intent_redirect", { ...record.binding, href: record.href });
+            await authorize(session, metadata); await session.requireOwnedTab(tabId);
+            if (downloadIntents.get(command.intentId) !== record || !["redirect", "ready"].includes(result.kind) || typeof result.href !== "string"
+              || new URL(result.href).origin !== new URL(record.binding.expectedUrl).origin) throw new Error("The exact same-origin redirect proof did not retain its original download lease");
+            record.href = result.href; record.phase = result.kind;
+            return result;
+          } catch (error) {
+            downloadIntents.delete(command.intentId);
+            await root.ChatGPTSafariLive?.releaseDownloadIntent?.(tabId, record.binding).catch(() => {}); throw error;
+          }
+        }
+        if (record.phase !== (record.binding.redirectPolicy ? "ready" : "captured") || command.href !== record.href) throw new Error("Approve the exact captured download destination once before transferring; it cannot be replayed");
+        record.phase = "transferring";
+        try {
+          const result = await run("download_intent_transfer", { ...record.binding, href: record.href });
+          if (downloadIntents.get(command.intentId) !== record || session.currentTurnId !== metadata.turn_id) throw new Error("The captured download ended with its original turn; no completion path was returned");
+          return result;
+        } finally {
+          downloadIntents.delete(command.intentId);
+          await root.ChatGPTSafariLive?.releaseDownloadIntent?.(tabId, record.binding).catch(() => {});
+        }
+      }
       const interact = async (target, interactions, nativeModal) => {
         try {
           const result = await run("interact", { documentId: target.documentId, snapshotId: target.snapshotId, interactions, agentScope,
@@ -482,6 +553,13 @@
         if (!keepOwnerGuards && session === sessionId && (turnId == null || turn === turnId)) turnOwners.delete(key);
       }
       const cleanup = [];
+      for (const [id, intent] of downloadIntents) {
+        const [session, turn] = JSON.parse(intent.key);
+        if (session === sessionId && (turnId == null || turn === turnId)) {
+          downloadIntents.delete(id);
+          cleanup.push(root.ChatGPTSafariLive?.releaseDownloadIntent?.(intent.tabId, intent.binding).catch(() => {}));
+        }
+      }
       if (viewport) cleanup.push(viewport.release(sessionId, turnId));
       for (const [key, lease] of logLeases) if (lease.sessionId === sessionId && (turnId == null || lease.turnId === turnId)) {
         logLeases.delete(key);

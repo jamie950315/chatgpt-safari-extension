@@ -141,7 +141,7 @@ def bounded_function(source: str, start: str, end: str) -> str:
 
 
 def prepare_manifest(original: dict) -> dict:
-    """Use Safari's supported persistent background without changing authority."""
+    """Use Safari's persistent background and explicit request observation authority."""
     if original["manifest_version"] != 3:
         raise ValueError("The preserved Safari input manifest must use version 3")
     manifest = copy.deepcopy(original)
@@ -150,6 +150,7 @@ def prepare_manifest(original: dict) -> dict:
     manifest["browser_action"] = manifest.pop("action")
     manifest["commands"]["_execute_browser_action"] = manifest["commands"].pop("_execute_action")
     manifest["permissions"] += manifest.pop("host_permissions")
+    manifest["permissions"].append("webRequest")  # Exact owned-fetch redirect/header observation; never blocking.
     policy = manifest["content_security_policy"]
     if set(policy) != {"extension_pages", "sandbox"}:
         raise ValueError("Unexpected upstream content security policies")

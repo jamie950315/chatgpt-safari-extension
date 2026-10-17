@@ -70,6 +70,136 @@
       summary: { byKind, inlineSvgCount: inlineSvgs.length, totalCount: assets.length } } };
   }
 
+  // Only an observed cancelable anchor default is diverted. This never
+  // wraps page APIs, resumes a native request, or manufactures a page gesture.
+  async function downloadIntentPageOperation(operation, args) {
+    const fail = message => ({ ok: false, error: { code: "DOWNLOAD_INTENT_REJECTED", message } });
+    const live = globalThis.__chatGPTSafariLiveDocument;
+    if (!live) return fail("Read and resolve the current claimed page before capturing a download intent.");
+    live.downloadIntents ||= new Map();
+    const item = live.downloadIntents.get(args.intentId);
+    const current = value => value && value.scope === args.scope && value.documentId === live.documentId
+      && value.snapshotId === live.snapshotId && value.pageUrl === location.href && live.url === location.href
+      && value.source.isConnected && Date.now() <= value.expires;
+    const discard = value => {
+      value.stop(); value.close?.(); value.abort?.(); clearTimeout(value.expiry);
+      live.downloadIntents.delete(value.id);
+    };
+    if (operation === "cancel") {
+      if (item?.scope === args.scope) discard(item);
+      return { ok: true, result: { cancelled: true } };
+    }
+    if (operation === "arm") {
+      if (typeof args.intentId !== "string" || !/^[a-f0-9-]{36}$/i.test(args.intentId)
+        || typeof args.scope !== "string" || !args.scope || args.scope.length > 4096
+        || live.documentId !== args.documentId || live.snapshotId !== args.snapshotId || live.url !== location.href
+        || location.href !== args.expectedUrl || live.downloadIntents.has(args.intentId)) return fail("A fresh exact-document download-intent lease is required.");
+      for (const previous of live.downloadIntents.values()) {
+        if (previous.documentId !== live.documentId || previous.snapshotId !== live.snapshotId || previous.pageUrl !== location.href
+          || !previous.source.isConnected || Date.now() > previous.expires) discard(previous);
+        else return fail("A download intent is already active in this exact document.");
+      }
+      const source = live.nodes.get(args.node);
+      if (!source?.isConnected || source.ownerDocument !== document) return fail("Download intents require a connected top-level source control.");
+      const value = { id: args.intentId, scope: args.scope, source, documentId: live.documentId,
+        snapshotId: live.snapshotId, pageUrl: location.href, phase: "armed", expires: Date.now() + 90000 };
+      let timer, ended = false;
+      const stop = () => { clearTimeout(timer); document.removeEventListener("click", clicked, true); };
+      const closed = () => discard(value);
+      const clicked = event => {
+        if (!current(value) || ended) { stop(); return; }
+        const path = event.composedPath();
+        if (event.isTrusted && path.includes(source)) {
+          if (value.gesture) { value.error = "More than one trusted source gesture was observed; no intent was adopted."; return; }
+          value.gesture = event;
+          // Prevent the source's own default form/navigation while preserving
+          // its real handler, including a synchronous handler's anchor.click().
+          if (event.cancelable) event.preventDefault();
+          timer = setTimeout(() => {
+            ended = true; stop();
+            if (value.phase === "armed") value.error = "The delivered click produced no synchronous cancelable HTTP(S) download anchor. Location/form, detached-anchor and later-task downloads are unsupported; do not replay the click.";
+          }, 0);
+        }
+        const anchor = path.find(node => node?.tagName === "A" && node.hasAttribute("download"));
+        if (!anchor || !value.gesture || value.gesture.eventPhase === 0 || !navigator.userActivation?.isActive) return;
+        if (event.cancelable) event.preventDefault();
+        if (!event.cancelable || !event.defaultPrevented || !anchor.isConnected || anchor.ownerDocument !== document) {
+          value.error = "Safari could not cancel this exact connected anchor default; no verified transfer is available."; return;
+        }
+        let href;
+        try { href = new URL(anchor.href); } catch { value.error = "The observed download anchor has no valid URL."; return; }
+        if (!["http:", "https:"].includes(href.protocol) || href.username || href.password) {
+          value.error = "Only a synchronous HTTP(S) anchor intent is supported; blob/data and credential-bearing URLs are not transferred."; return;
+        }
+        href.hash = "";
+        if (value.phase !== "armed") { value.error = "The source gesture produced multiple download anchors; none was transferred."; return; }
+        value.href = href.href; value.filename = (anchor.getAttribute("download") || "").slice(0, 240); value.phase = "captured";
+      };
+      value.stop = stop; value.close = () => removeEventListener("pagehide", closed);
+      live.downloadIntents.set(value.id, value);
+      value.expiry = setTimeout(() => discard(value), 90000); value.expiry?.unref?.();
+      document.addEventListener("click", clicked, true); addEventListener("pagehide", closed, { once: true });
+      return { ok: true, result: { armed: true, intentId: value.id } };
+    }
+    if (!current(item)) { if (item?.scope === args.scope) discard(item); return fail("The download intent no longer belongs to its exact source document, snapshot, control and original sidebar scope."); }
+    if (operation === "redirect_fetch") {
+      const source = new URL(item.pageUrl), href = new URL(args.href);
+      if (!["captured", "redirect-pending"].includes(item.phase) || item.href !== href.href || href.origin !== source.origin
+        || !["http:", "https:"].includes(href.protocol) || href.username || href.password
+        || !/^[a-f0-9-]{36}$/i.test(args.nonce || "")) return fail("Only the exact approved same-origin redirect hop may start once.");
+      item.visited ||= new Set(); item.requestCount ||= 0; item.activeMs ||= 0;
+      if (item.requestCount >= 5 || item.visited.has(href.href)) return fail("The captured download exceeded five requests or repeated a redirect URL. No request was repeated.");
+      const remaining = 30000 - item.activeMs;
+      if (remaining <= 0) return fail("The captured download exhausted its 30-second active transfer budget.");
+      item.requestCount++; item.visited.add(href.href); item.phase = "requesting"; item.nonce = args.nonce;
+      const controller = new AbortController(), started = Date.now();
+      item.controller = controller; item.abort = () => { controller.abort(); clearTimeout(item.networkTimer); };
+      item.transferDeadline = started + remaining;
+      item.networkTimer = setTimeout(() => controller.abort(), remaining); item.networkTimer?.unref?.();
+      try {
+        const response = await fetch(href.href, { method: "GET", mode: "same-origin", credentials: "same-origin", redirect: "manual",
+          cache: "no-store", signal: controller.signal, headers: { "X-ChatGPT-Safari-Transfer": args.nonce } });
+        item.activeMs += Date.now() - started;
+        if (!current(item) || item.phase !== "requesting") throw new Error("The source lease changed during its request.");
+        if (response.type === "opaqueredirect") {
+          item.abort(); item.phase = "redirect-proof";
+          return { ok: true, result: { kind: "redirect" } };
+        }
+        if (!response.ok || response.redirected || response.type === "opaque" || response.url !== href.href || !response.body) throw new Error("The response did not retain its exact approved URL.");
+        item.response = response; item.phase = "response-proof";
+        return { ok: true, result: { kind: "response", status: response.status, url: response.url } };
+      } catch {
+        discard(item); return fail("The exact same-origin request failed, expired, or lost its source lease. It was not repeated.");
+      }
+    }
+    if (operation === "redirect_bind") {
+      if (item.nonce !== args.nonce || item.href !== args.href) return fail("This header receipt belongs to a different exact hop.");
+      if (args.kind === "redirect" && item.phase === "redirect-proof") {
+        const next = new URL(args.nextHref), source = new URL(item.pageUrl); next.hash = "";
+        if (next.origin !== source.origin || next.username || next.password || !["http:", "https:"].includes(next.protocol)) return fail("A cross-origin redirect was rejected before contacting its destination.");
+        if (item.visited.has(next.href) || item.requestCount >= 5) return fail("The redirect repeated a URL or exceeded the five-request bound. No next request was sent.");
+        item.href = next.href; item.phase = "redirect-pending"; item.nonce = null;
+        return { ok: true, result: { kind: "redirect", href: next.href } };
+      }
+      if (args.kind !== "response" || item.phase !== "response-proof" || item.response?.status !== args.status
+        || item.response.url !== item.href) return fail("The observed native headers did not match this exact page response.");
+      item.phase = "headers-ready"; item.nonce = null;
+      return { ok: true, result: { kind: "ready", href: item.href } };
+    }
+    if (operation !== "read") return fail("Unknown download-intent operation.");
+    const deadline = Date.now() + Math.min(args.timeout_ms ?? 1000, 3000);
+    while (item.phase === "armed" && !item.error && Date.now() < deadline) await new Promise(resolve => setTimeout(resolve, 20));
+    if (!current(item) || item.error || item.phase !== "captured") {
+      const message = item.error || "The delivered native click has no verified synchronous anchor intent. It was not replayed.";
+      discard(item); return fail(message);
+    }
+    // Wait until the original source dispatch has ended, so a second anchor
+    // from the same handler cannot be silently accepted after this read.
+    if (item.gesture?.eventPhase !== 0) { discard(item); return fail("The source event has not finished dispatching; no transfer was started."); }
+    item.stop(); item.gesture = null;
+    return { ok: true, result: { intentId: item.id, href: item.href, filename: item.filename } };
+  }
+
   // Self-contained because WebExtension scripting serializes this function.
   async function downloadPageOperation(operation, args) {
     const failure = (code, message) => ({ ok: false, error: { code, message } });
@@ -93,12 +223,17 @@
       if (transfer) stop(transfer);
       return { ok: true, result: { cancelled: true } };
     }
+    const intent = args.intentId ? live?.downloadIntents?.get(args.intentId) : null;
+    const intentCurrent = () => intent && intent.scope === args.scope && intent.id === args.intentId
+      && intent.documentId === live.documentId && intent.snapshotId === live.snapshotId && intent.pageUrl === location.href
+      && intent.source.isConnected && Date.now() <= intent.expires && !intent.error && ["captured", "headers-ready", "transferring"].includes(intent.phase);
     const inventory = args.assetId ? live?.assetInventories?.get(args.inventoryId) : null;
     const asset = inventory && inventory.scope === args.scope ? inventory.items.get(args.assetId) : null;
     const current = () => live && live.documentId === args.documentId && location.href === args.expectedUrl
       && (args.assetId ? inventory?.documentId === live.documentId && inventory.pageUrl === location.href : live.snapshotId === args.snapshotId && live.url === location.href);
     const anchor = live?.nodes.get(args.node);
     const href = () => {
+      if (args.intentId) return current() && intentCurrent() ? intent.href : null;
       if (args.assetId) return current() && asset ? asset.url : null;
       if (!current() || !anchor?.isConnected || !anchor.matches("a[href]")) return null;
       const rect = anchor.getBoundingClientRect(), style = getComputedStyle(anchor);
@@ -119,9 +254,14 @@
     if (operation === "inspect") return { ok: true, result: { href: source, url: location.href } };
     if (operation === "start") {
       if (typeof args.transferId !== "string" || state.has(args.transferId)) return failure("INVALID_DOWNLOAD", "A fresh download transfer is required.");
-      const controller = new AbortController();
+      const prepared = args.redirectPolicy === "same-origin-policy";
+      if (args.intentId && (!intentCurrent() || intent.phase !== (prepared ? "headers-ready" : "captured"))) return failure("DOWNLOAD_INTENT_USED", "This exact captured intent was already consumed or cancelled; no request was repeated.");
+      if (prepared && (!intent?.response || intent.response.url !== source || intent.transferDeadline <= Date.now())) return failure("DOWNLOAD_HEADERS_EXPIRED", "The approved exact response expired before body transfer; it was not requested again.");
+      if (intent) intent.phase = "transferring";
+      const controller = prepared ? intent.controller : new AbortController();
       const transfer = { controller, bytes: 0, pending: null, offset: 0 };
-      transfer.timer = setTimeout(() => { controller.abort(); state.delete(args.transferId); }, 30000);
+      if (intent) { clearTimeout(intent.networkTimer); intent.abort = () => stop(transfer); }
+      transfer.timer = setTimeout(() => { controller.abort(); state.delete(args.transferId); }, prepared ? intent.transferDeadline - Date.now() : 30000);
       state.set(args.transferId, transfer);
       try {
         if (asset?.inline) {
@@ -133,8 +273,9 @@
         // Ordinary-profile fetch preserves Safari's real credentialed CORS.
         // Manual redirects never contact an unapproved next destination.
         const crossOrigin = new URL(source).origin !== location.origin;
-        const response = await fetch(source, { method: "GET", mode: asset || crossOrigin ? "cors" : "same-origin", credentials: asset || crossOrigin ? "include" : "same-origin",
+        const response = prepared ? intent.response : await fetch(source, { method: "GET", mode: asset || crossOrigin ? "cors" : "same-origin", credentials: asset || crossOrigin ? "include" : "same-origin",
           redirect: "manual", cache: "no-store", signal: controller.signal });
+        if (prepared) intent.response = null;
         if (!current() || href() !== source) throw new Error("The download document changed during the request.");
         if (response.type === "opaqueredirect" || response.redirected || response.status >= 300 && response.status < 400) {
           stop(transfer);
@@ -149,7 +290,7 @@
         if (length && (!/^\d+$/u.test(length) || Number(length) > 32 * 1024 * 1024)) throw new Error("This download exceeds the 32 MiB limit.");
         if (!response.body) throw new Error("The download response has no readable body.");
         transfer.reader = response.body.getReader();
-        let filename = asset?.name || anchor.getAttribute("download") || "";
+        let filename = asset?.name || intent?.filename || anchor?.getAttribute("download") || "";
         const disposition = response.headers.get("content-disposition") || "";
         const utf8 = disposition.match(/(?:^|;)\s*filename\*=UTF-8''([^;]*)/iu);
         const quoted = disposition.match(/(?:^|;)\s*filename="((?:[^"\\]|\\.)*)"/iu);
@@ -397,9 +538,67 @@
     return { inspect, execute };
   }
 
+  function observeRedirectHeaders(api, tab, href, nonce) {
+    const names = ["onBeforeRequest", "onBeforeSendHeaders", "onHeadersReceived"];
+    if (names.some(name => typeof api.webRequest?.[name]?.addListener !== "function" || typeof api.webRequest?.[name]?.removeListener !== "function")) {
+      throw new Error("Safari's request/header observation APIs are unavailable. The redirect hop was not requested.");
+    }
+    const destination = new URL(href), filter = { urls: [destination.protocol + "//" + destination.hostname + "/*"] };
+    const requests = new Map(), installed = []; let selected, timer, settled = false, resolve, reject, failure;
+    const promise = new Promise((yes, no) => { resolve = yes; reject = no; }); promise.catch(() => {});
+    const fail = () => {
+      failure ||= new Error("Safari could not prove one exact nonce/request/document-bound header response. The hop was not repeated.");
+      if (!settled) { settled = true; reject(failure); }
+    };
+    const matches = details => details.tabId === tab.id && details.frameId === 0 && details.url === href;
+    const identity = details => typeof details.requestId === "string" && details.requestId && typeof details.documentId === "string" && details.documentId;
+    const before = details => {
+      if (!matches(details)) return;
+      if (!identity(details) || requests.size >= 16 && !requests.has(details.requestId)) { fail(); return; }
+      requests.set(details.requestId, details.documentId);
+    };
+    const sent = details => {
+      if (!matches(details)) return;
+      const values = details.requestHeaders?.filter(header => header.name?.toLowerCase() === "x-chatgpt-safari-transfer") || [];
+      if (!values.some(header => header.value === nonce)) return;
+      if (values.length !== 1 || !identity(details) || requests.get(details.requestId) !== details.documentId
+        || selected && selected.requestId !== details.requestId) { fail(); return; }
+      selected = { requestId: details.requestId, documentId: details.documentId };
+    };
+    const headers = details => {
+      if (!selected || details.requestId !== selected.requestId) return;
+      if (!matches(details) || !identity(details) || details.documentId !== selected.documentId || !Number.isInteger(details.statusCode)) { fail(); return; }
+      const locations = details.responseHeaders?.filter(header => header.name?.toLowerCase() === "location") || [];
+      if ([301, 302, 303, 307, 308].includes(details.statusCode)) {
+        if (locations.length !== 1 || typeof locations[0].value !== "string" || !locations[0].value.trim()) { fail(); return; }
+        let next; try { next = new URL(locations[0].value, href); } catch { fail(); return; }
+        next.hash = "";
+        if (next.origin !== destination.origin || next.username || next.password || !["http:", "https:"].includes(next.protocol)) {
+          failure = new Error("The observed redirect leaves its approved same origin. Its next destination was not contacted.");
+          if (!settled) { settled = true; reject(failure); } return;
+        }
+        if (!settled) { settled = true; resolve({ kind: "redirect", href: next.href, status: details.statusCode }); }
+      } else if (details.statusCode >= 200 && details.statusCode < 300 && locations.length === 0) {
+        if (!settled) { settled = true; resolve({ kind: "response", href, status: details.statusCode }); }
+      } else fail();
+    };
+    const cleanup = () => { clearTimeout(timer); for (const [event, listener] of installed) event.removeListener(listener); };
+    try {
+      for (const [name, callback, extra] of [[names[0], before, []], [names[1], sent, ["requestHeaders"]], [names[2], headers, ["responseHeaders"]]]) {
+        api.webRequest[name].addListener(callback, filter, extra); installed.push([api.webRequest[name], callback]);
+      }
+      timer = setTimeout(fail, 30000); timer?.unref?.();
+    } catch (error) { cleanup(); throw new Error("Safari denied the exact request/header observers. No redirect hop was requested."); }
+    return { promise, cleanup, assertCurrent() { if (failure) throw failure; } };
+  }
+
   function createDownloads({ api, target, send, profileId, sessionId, assertTime, unwrap }) {
     async function page(tab, operation, args) {
       const [value] = await api.scripting.executeScript({ target: { tabId: tab.id, frameIds: [0] }, func: downloadPageOperation, args: [operation, args] });
+      return unwrap(value?.result);
+    }
+    async function intent(tab, operation, args) {
+      const [value] = await api.scripting.executeScript({ target: { tabId: tab.id, frameIds: [0] }, world: "ISOLATED", func: downloadIntentPageOperation, args: [operation, args] });
       return unwrap(value?.result);
     }
     async function inventory(tab, operation, args) {
@@ -539,9 +738,29 @@
           input: { action: "abort", transferId: nativeID } }).catch(() => {});
       }
     }
-    return { inspect, execute, listAssets, inspectAssets, bundle };
+    async function redirectStep(tab, args) {
+      assertTime(); await target(args.handle, args.expectedUrl);
+      const source = new URL(args.expectedUrl), destination = new URL(args.href);
+      if (source.origin !== destination.origin || args.redirectPolicy !== "same-origin-policy") throw new Error("This explicit redirect route accepts only the source page's same-origin HTTP(S) requests.");
+      const nonce = root.crypto.randomUUID(), observer = observeRedirectHeaders(api, tab, destination.href, nonce);
+      try {
+        const [response, receipt] = await Promise.all([intent(tab, "redirect_fetch", { ...args, nonce }), observer.promise]);
+        observer.assertCurrent(); assertTime(); await target(args.handle, args.expectedUrl);
+        if (response.kind !== receipt.kind || response.kind === "response" && (response.status !== receipt.status || response.url !== destination.href)) throw new Error("The observed headers did not match this exact manual page fetch. It was not repeated.");
+        return await intent(tab, "redirect_bind", { ...args, nonce, kind: receipt.kind, nextHref: receipt.href, status: receipt.status });
+      } catch (error) { await intent(tab, "cancel", args).catch(() => {}); throw error; }
+      finally { observer.cleanup(); }
+    }
+    return { inspect, execute, listAssets, inspectAssets, bundle, redirectStep,
+      armIntent: (tab, args) => intent(tab, "arm", args),
+      readIntent: (tab, args) => intent(tab, "read", args),
+      cancelIntent: (tab, args) => intent(tab, "cancel", args),
+      async executeIntent(request, tab, args) {
+        try { return await execute(request, tab, args); }
+        finally { await intent(tab, "cancel", args).catch(() => {}); }
+      } };
   }
-  const bridge = Object.freeze({ createDownloads, createExports, downloadPageOperation, contentExportPageOperation, youtubeTranscriptPageOperation, formatYouTubeTranscript, assetInventoryPageOperation, maximumBytes, chunkBytes });
+  const bridge = Object.freeze({ createDownloads, createExports, downloadPageOperation, downloadIntentPageOperation, observeRedirectHeaders, contentExportPageOperation, youtubeTranscriptPageOperation, formatYouTubeTranscript, assetInventoryPageOperation, maximumBytes, chunkBytes });
   if (typeof module === "object" && module.exports) module.exports = bridge;
   else Object.defineProperty(root, "ChatGPTSafariDownloads", { value: bridge });
 })(globalThis);

@@ -110,10 +110,11 @@ This is a development-signed conversion of Chrome extension 1.26.1005.11759.
   its explicit `live_status.viewport` outcome rather than silently losing it.
 - History uses trusted SFExtensionProfileKey observations and exact read-only
   metadata/store binding. Unknown mappings never select a default store.
-  This Mac denied the containing app access to Safari history/download metadata.
-  Full Disk Access for the canonical dist app requires the user's own system
-  grant and subsequent validation. Do not bypass TCC through another process or
-  path, or infer native download provenance from files appearing in Downloads.
+  The user enabled Full Disk Access for the canonical dist app; installed
+  original Work history search returned the exact owned URL and real visit time.
+  The same app can read download metadata, but its records do not supply a tab
+  identity or full redirect chain. Do not bypass a later TCC denial through
+  another process/path or infer download provenance from filenames/timestamps.
   Bookmarks use a capability-addressed inert temporary page and native editor;
   preserve the owning sidebar and never write Safari's live plist. Row handles
   bind native identity, profile, and account epoch. Await the sole temporary
@@ -192,15 +193,31 @@ This is a development-signed conversion of Chrome extension 1.26.1005.11759.
   observed native names, not fabricated Chrome group IDs/color/collapse state.
   Reject duplicate names and shared or unverifiable groups. Do not advertise
   unsupported management methods or fabricate Chrome-only audit snapshots.
-- Work downloads inspect a current DOM link, then run the original download
+- Direct-link Work downloads inspect a current DOM link, then run the original download
   consent/policy before ordinary-profile Safari fetch. Cross-origin HTTP(S)
   links additionally require real credentialed CORS. Bind each 48 KiB chunk and
   native writer call to the live operation/profile/owner/document/link. Reject
-  unapproved redirects and blob/JavaScript-button verified downloads; cap at
+  unapproved redirects and blob/JavaScript-button adoption in that link route; cap at
   32 MiB/30 s. Never infer completion from a click or a new file in Downloads.
   Save completed files privately in Downloads with collision-safe names and
   quarantine; never open them automatically. Cancel partials on owner change,
   background restart, failure, timeout, and shutdown. No cookies leave Safari.
+- The original Tab `nativeDownloads.run` capability performs one exact native
+  click and captures only a synchronous cancelable connected HTTP(S) anchor
+  intent in the same top-level document. Cancel its default before original
+  source/destination download approval, then use the existing real writer.
+  Keep receipt, node/snapshot/document and owner/account/profile/session/turn
+  binding; never replay input or infer tab causality from native metadata.
+  Its explicit `redirects: "same-origin-policy"` option uses manual fetch per
+  hop and native `webRequest` onBeforeRequest/onBeforeSendHeaders/onHeadersReceived
+  evidence. A non-secret one-use header binds the actual request/document IDs;
+  return only the exact observed Location, never cookies or raw headers. Run
+  original full-URL policy before each next request. Reject missing/ambiguous
+  evidence, cycles, cross-origin hops and a sixth request. Preserve the 32 MiB /
+  30-second active-transfer bound and consume the final response only once.
+  Existing direct-link/exports keep their original behavior. Detached anchors,
+  location/form/later-task downloads and a generic native download waiter remain
+  unsupported; never advertise those from the narrower connected-anchor proof.
 - `Tab.content.exportGsuite` derives official Google Workspace export URLs;
   `exportYouTubeTranscript` uses a fixed current-video player/timedtext helper
   and restores the prior captions state. Keep original download approval,
@@ -304,6 +321,14 @@ Do not alter the installed OpenAI app/plugin or Chrome host registration.
 Build artifacts, private configuration backups, and probe reports stay ignored.
 Use only owned synthetic bookmarks for acceptance; do not send private bookmark
 inventories to the cloud agent.
+
+Installed original Work nativeDownloads completed one connected-anchor button
+with exact 46-byte output, then one explicit same-origin-policy redirect with
+exact 52-byte output. Both original approvals remained. The final endpoint was
+uncontacted before its approval; each endpoint was requested once. Native
+header nonce/request/document proof passed, and both files were mode 0600 with quarantine.
+Keep the default route's accepted evidence when adding opt-in behavior. Fixed
+metadata/header diagnostic entry points were removed from the deliverable.
 
 Installed original Work bookmark tree/search/read, title/URL update, folder
 creation, URL creation, and native movement passed with exact synthetic-record

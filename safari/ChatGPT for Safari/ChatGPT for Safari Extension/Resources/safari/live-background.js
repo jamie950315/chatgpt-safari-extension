@@ -825,6 +825,15 @@
         }
         return capture(tab, args, request, selectedBounds, selection, assertTime);
       }
+      if (["download_intent_transfer", "download_intent_redirect"].includes(action)) {
+        if (!request.agentOwner || args.agentScope?.ownerId !== request.agentOwner || !args.agentScope.accountScope
+          || args.scope !== JSON.stringify([args.agentScope.sessionId, args.agentScope.turnId, request.agentOwner, profileId, args.agentScope.accountScope, String(tab.id)])) {
+          throw fail("INVALID_DOWNLOAD_INTENT", "Captured downloads require their exact original owner/account/profile/session/turn/tab scope.");
+        }
+        await target(args.handle, args.expectedUrl);
+        const downloads = environment.ChatGPTSafariDownloads.createDownloads({ api, target, send, profileId, sessionId, assertTime, unwrap });
+        return action === "download_intent_redirect" ? downloads.redirectStep(tab, args) : downloads.executeIntent(request, tab, args);
+      }
       if (action === "download_link_inspect" || action === "download_link") {
         const downloads = environment.ChatGPTSafariDownloads.createDownloads({ api, target, send, profileId, sessionId, assertTime, unwrap });
         return action === "download_link_inspect" ? downloads.inspect(tab, args) : downloads.execute(request, tab, args);
@@ -867,6 +876,13 @@
         || args.interactions.length !== 1 || args.interactions[0].type !== "click" || typeof args.interactions[0].node !== "string"
         || args.interactions[0].button && args.interactions[0].button !== "left" || (args.interactions[0].clickCount ?? 1) !== 1
         || args.interactions[0].modifiers?.length || args.frameId)) throw fail("INVALID_NATIVE_MODAL", "Native modal plans require a single original-owner/account-bound plain top-level click.");
+      if (args.downloadIntent && (!request.agentOwner || args.agentScope?.ownerId !== request.agentOwner || !args.agentScope.accountScope
+        || args.nativeModal || args.interactions.length !== 1 || args.interactions[0].type !== "click" || typeof args.interactions[0].node !== "string"
+        || args.interactions[0].button && args.interactions[0].button !== "left" || (args.interactions[0].clickCount ?? 1) !== 1
+        || args.interactions[0].modifiers?.length || args.frameId || args.framePath?.length
+        || args.downloadIntent.scope !== JSON.stringify([args.agentScope.sessionId, args.agentScope.turnId, request.agentOwner, profileId, args.agentScope.accountScope, String(tab.id)]))) {
+        throw fail("INVALID_DOWNLOAD_INTENT", "A download-intent plan requires one original-scope plain top-level native click.");
+      }
       const frameId = args.frameId || 0;
       const framePath = args.framePath || [];
       if (!Number.isSafeInteger(frameId) || frameId < 0 || !Array.isArray(framePath) || framePath.length > 8
@@ -875,6 +891,7 @@
       const nativeSteps = [];
       let inputDelivered = false, readbackExpired = false, lastDelivered, lastWindowBounds, lastCurrent = tab, activeFileChooserOpened;
       const fileInputTokens = new Set();
+      let intentDownloads, intentBinding, retainDownloadIntent = false;
       const observe = async operation => {
         assertTime();
         if (readbackExpired) throw fail("POST_INPUT_READBACK_TIMEOUT", "The delivered input's page readback expired. No input was repeated.");
@@ -948,7 +965,7 @@
             }
             await scopedPage("pointCheck", { ...args, node: interaction.node, point: localGeometry.point });
             let token, observation;
-            if (["click", "key"].includes(kind) && request.agentOwner !== undefined && !args.nativeModal && interaction.type !== "clipboard") {
+            if (["click", "key"].includes(kind) && request.agentOwner !== undefined && !args.nativeModal && !args.downloadIntent && interaction.type !== "clipboard") {
               token = environment.crypto.randomUUID();
               observation = { tabId: tab.id, frameId, url: framePath.at(-1)?.childUrl || tab.url,
                 documentId: args.documentId, snapshotId: args.snapshotId };
@@ -969,6 +986,14 @@
               modalPlan = { policy: args.nativeModal, scope: { profileId, tabId: String(tab.id), documentId: args.documentId, node: interaction.node,
                 ownerId: request.agentOwner, accountScope: args.agentScope.accountScope, sessionId: args.agentScope.sessionId, turnId: args.agentScope.turnId },
                 ...(args.nativeModal.kind === "upload" ? { isMultiple: args.uploadSource.isMultiple } : {}) };
+            }
+            if (args.downloadIntent) {
+              if (kind !== "click" || intentDownloads) throw fail("INVALID_DOWNLOAD_INTENT", "A captured download may post only one native source click.");
+              intentDownloads = environment.ChatGPTSafariDownloads.createDownloads({ api, target, send, profileId, sessionId, assertTime, unwrap });
+              intentBinding = { handle: args.handle, expectedUrl: tab.url, documentId: args.documentId, snapshotId: args.snapshotId,
+                node: interaction.node, intentId: args.downloadIntent.intentId, scope: args.downloadIntent.scope, timeout_ms: args.downloadIntent.timeout_ms };
+              const armed = await intentDownloads.armIntent(tab, intentBinding);
+              if (armed.armed !== true || armed.intentId !== intentBinding.intentId) throw fail("DOWNLOAD_INTENT_UNAVAILABLE", "The exact source download observer did not acknowledge arming. No click was posted.");
             }
             result = unwrap(await send({ action: "liveInput", id: request.id, profileId, sessionId,
               input: { action: kind, ...geometry, windowBounds, ...extra, ...(modalPlan ? { modalPlan } : {}) } }));
@@ -1037,6 +1062,14 @@
           }
           await delay(80);
         }
+        if (intentDownloads) {
+          selection?.assertCurrent(); assertTime();
+          if (completed.length !== 1 || !(completed[0].result?.eventsPosted > 0)) throw fail("DOWNLOAD_INPUT_UNCONFIRMED", "No single native source click was confirmed; no download intent was adopted.");
+          await target(args.handle, tab.url); await scopedPage("check", args);
+          const captured = await intentDownloads.readIntent(tab, intentBinding);
+          retainDownloadIntent = true;
+          return { completed, downloadIntent: captured };
+        }
         const after = await ready(tab.id, observe);
         if (after.status !== "complete") return { completed, tab: describe(after), pagePending: true,
           nextAction: "Read this handle with live_read_page to inspect the loading document. Do not repeat the interaction." };
@@ -1068,6 +1101,7 @@
         throw error;
       } finally {
         for (const token of fileInputTokens) fileInputObservations.delete(token);
+        if (intentDownloads && !retainDownloadIntent) await intentDownloads.cancelIntent(tab, intentBinding).catch(() => {});
       }
     }
     async function poll() {
@@ -1121,7 +1155,14 @@
     function releaseFileChoosers({ sessionId: originalSession, turnId }) {
       for (const [id, chooser] of fileChoosers) if (chooser.sessionId === originalSession && (turnId == null || chooser.turnId === turnId)) fileChoosers.delete(id);
     }
-    return { start, poll, execute, releaseLogs, releaseFileChoosers, navigationSourceUrl,
+    async function releaseDownloadIntent(tabId, binding) {
+      const tab = await api.tabs.get(tabId).catch(() => null);
+      if (!tab || tab.incognito || tab.url !== binding.expectedUrl) return;
+      const [value] = await api.scripting.executeScript({ target: { tabId, frameIds: [0] }, world: "ISOLATED",
+        func: environment.ChatGPTSafariDownloads.downloadIntentPageOperation, args: ["cancel", binding] });
+      unwrap(value?.result);
+    }
+    return { start, poll, execute, releaseLogs, releaseFileChoosers, navigationSourceUrl, releaseDownloadIntent,
       stop() { stopped = true; environment.clearInterval(timer); fileChoosers.clear(); fileInputObservations.clear(); } };
   }
   if (typeof module === "object" && module.exports) module.exports = { createLive, pageOperation, consoleCapture };

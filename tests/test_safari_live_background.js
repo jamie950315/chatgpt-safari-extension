@@ -673,3 +673,33 @@ test("original agent typing requires existing focus and never posts an implicit 
   assert.ok(f.scripts.some(x => x.args[0] === "focused"));
   assert.equal(f.calls.at(-1).response.ok, true);
 });
+
+test("a scoped captured download arms before its single native click and preserves its exact receipt without a new snapshot", async () => {
+  const f = fixture(), events = [], intentId = "11111111-1111-4111-8111-111111111111";
+  f.environment.ChatGPTSafariDownloads = require("../safari/ChatGPT for Safari/ChatGPT for Safari Extension/Resources/safari/downloads-background.js");
+  await f.binding.start();
+  f.setSidebar({ async withAgentSelection(_owner, _tab, operation) { return operation({ async select() {}, assertCurrent() {} }); } });
+  f.setPage(script => {
+    const [operation, args] = script.args;
+    if (script.func === f.environment.ChatGPTSafariDownloads.downloadIntentPageOperation) {
+      events.push(operation);
+      if (operation === "arm") { assert.equal(args.node, "n1"); assert.equal(args.documentId, "doc"); return { ok: true, result: { armed: true, intentId } }; }
+      if (operation === "read") return { ok: true, result: { intentId, href: "https://example.com/observed.txt" } };
+      return { ok: true, result: { cancelled: true } };
+    }
+    assert.notEqual(operation, "read", "captured receipts must retain the original snapshot until approved transfer");
+    assert.notEqual(operation, "filechooser_arm", "a dedicated download plan does not register unrelated chooser observations");
+    return { ok: true, result: { expectedUrl: f.tab.url, point: { x: 50, y: 50 }, viewport: { width: 1000, height: 700 } } };
+  });
+  f.setNative(command => { if (command.input?.action === "click") { events.push("native-click"); return { ok: true, result: { eventsPosted: 4 } }; } return { ok: true, result: { eventsPosted: 0 } }; });
+  const agentScope = { ownerId: "owner", accountScope: "account", sessionId: "work-session", turnId: "work-turn" };
+  const args = { handle: `live:${f.profileId}:12`, documentId: "doc", snapshotId: "snap", agentScope,
+    interactions: [{ type: "click", node: "n1", clickCount: 1, button: "left", modifiers: [] }],
+    downloadIntent: { intentId, timeout_ms: 1000, scope: JSON.stringify(["work-session", "work-turn", "owner", f.profileId, "account", "12"]) } };
+  const result = await f.binding.execute({ ...f.request("interact", args), agentOwner: "owner" });
+  assert.equal(result.downloadIntent.intentId, intentId); assert.deepEqual(events, ["arm", "native-click", "read"]);
+  await f.binding.releaseDownloadIntent(12, { ...args, expectedUrl: f.tab.url, intentId, scope: args.downloadIntent.scope });
+  assert.equal(events.at(-1), "cancel");
+  await assert.rejects(f.binding.execute({ ...f.request("interact", { ...args, agentScope: { ...agentScope, accountScope: "other-account" } }), agentOwner: "owner" }), { code: "INVALID_DOWNLOAD_INTENT" });
+  assert.equal(events.filter(event => event === "native-click").length, 1);
+});

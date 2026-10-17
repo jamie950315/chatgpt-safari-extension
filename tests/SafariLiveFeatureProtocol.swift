@@ -85,6 +85,30 @@ import Foundation
         native("liveDownload", input: ["action": "append"], expectOK: false)
         precondition(writes == 1, "Cancelled downloads cannot append another chunk")
 
+        run("download_intent_transfer", [:])
+        native("liveDownload", input: ["action": "begin", "filename": "intent.txt"], expectOK: true)
+        precondition(writes == 2)
+        broker.cancelAgent(owner: "owner")
+        native("liveDownload", input: ["action": "append"], expectOK: false)
+        precondition(writes == 2, "A captured-intent transfer cannot write after original owner cancellation")
+        var ownerlessIntentRejected = false
+        broker.handle(["action": "live", "command": ["action": "download_intent_transfer",
+            "arguments": ["handle": "live:\(profile):12"]]]) {
+            ownerlessIntentRejected = $0["ok"] as? Bool == false
+        }
+        precondition(ownerlessIntentRejected, "A captured intent is not a public desktop download writer")
+
+        run("download_intent_redirect", [:])
+        native("liveDownload", input: ["action": "begin", "filename": "forbidden-redirect.txt"], expectOK: false)
+        precondition(writes == 2, "Redirect header inspection is not private-writer authority")
+        broker.cancelAgent(owner: "owner")
+        var ownerlessRedirectRejected = false
+        broker.handle(["action": "live", "command": ["action": "download_intent_redirect",
+            "arguments": ["handle": "live:\(profile):12"]]]) {
+            ownerlessRedirectRejected = $0["ok"] as? Bool == false
+        }
+        precondition(ownerlessRedirectRejected)
+
         run("organize", ["operation": "inspect", "expectedUrl": "https://example.com/"])
         native("liveOrganize", input: ["action": "createGroup", "expectedUrl": "https://example.com/"], expectOK: false)
         native("liveOrganize", input: ["action": "inspect", "expectedUrl": "https://different.example/"], expectOK: false)
