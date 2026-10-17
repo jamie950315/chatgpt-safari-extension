@@ -43,12 +43,15 @@ let origin;try{origin=new URL(event.origin)}catch{return}
 const expected=new URL(chrome.runtime.getURL(""));
 if(origin.protocol!==expected.protocol||origin.host.toLowerCase()!==expected.host.toLowerCase())return;
 const port=event.ports[0],request=event.data;
+port.postMessage({type:"chatgpt-safari:kernel-progress",phase:"received"});
 x(n,request).then(value=>port.postMessage(value),error=>port.postMessage({error:y(error),id:request.id,ok:!1})).finally(()=>port.close());
 });chrome.runtime.onMessage.addListener('''
 OFFSCREEN_HOST_URL = 'e.src=`${chrome.runtime.getURL("js-kernel-host.html")}?scopeId=${encodeURIComponent(n)}`'
 OFFSCREEN_SANDBOX_URL = OFFSCREEN_HOST_URL + '+"&kernel="+encodeURIComponent(new URLSearchParams(location.search).get("kernel")??"")'
 
 KERNEL_REPLACEMENTS = {
+    'const c=new cF(chrome.runtime.connect({name:`browser-use-kernel:${e}`})),d=new uF(l)':
+        'const c=globalThis.ChatGPTSafariAgentKernel.connectBrowser(e),d=new uF(l)',
     'function vl(e){return Jy[e?.family??"chrome"]}':
         'function vl(e){return e?.family==="safari"?{displayName:"Safari",shortDisplayName:"Safari",backendCompatibilityKey:"chrome"}:Jy[e?.family??"chrome"]}',
     'return await W.security.runCommand({type:V,params:j},async()=>(':
@@ -79,6 +82,12 @@ def prepare_background(source: str) -> str:
                           'async function Ud(){await globalThis.ChatGPTSafariAgentKernel.ensureHostDocument()}')
     source = replace_once(source, PORT_ORIGIN,
                           'a.protocol!==s.protocol||a.host.toLowerCase()!==s.host.toLowerCase()')
+    # Same-document Safari frames do not deliver runtime messaging to their own
+    # background. Accept the real host MessagePort after exact frame validation,
+    # without inventing a runtime sender or changing the original RPC/security.
+    old = 'r.get(i)?.close();const o=new Rd(n);r.set(i,o),o.addCloseListener(()=>{r.get(i)===o&&(r.delete(i),t?.(i))});const[l,h]=kd(o,m=>"type"in m&&m.type==="control"?"a":"b",(m,d)=>d==="a"?{...m,type:"control"}:m);try{e(i,h,l)}catch(m){throw o.close(),m}})}'
+    new = 'accept(i,new Rd(n))});function accept(i,o){r.get(i)?.close();r.set(i,o),o.addCloseListener(()=>{r.get(i)===o&&(r.delete(i),t?.(i))});const[l,h]=kd(o,m=>"type"in m&&m.type==="control"?"a":"b",(m,d)=>d==="a"?{...m,type:"control"}:m);try{e(i,h,l)}catch(m){throw o.close(),m}}globalThis.ChatGPTSafariAgentKernel.onBrowserConnection(accept)}'
+    source = replace_once(source, old, new)
     source = replace_once(source, 't=await chrome.runtime.sendMessage(e),r=this.readResponse(t,e.id)',
                           't=await globalThis.ChatGPTSafariAgentKernel.sendRequest(e),r=this.readResponse(t,e.id)')
     source = replace_once(source, 'const s=chrome.runtime.sendMessage(n);try{',

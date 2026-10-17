@@ -67,6 +67,7 @@ enum ProviderRelayDiagnostics {
     static let counters: Set<String> = ["usedOrigin", "usedConnection", "connections", "contexts", "streamCalls", "failures", "scriptErrors", "unhandledRejections", "connectMessages"]
     static let booleans: Set<String> = ["channelConnected", "readyPosted", "parentSourceMatched", "parentTokenMatched"]
     static let kinds: Set<String> = ["Error", "TypeError", "ReferenceError", "RangeError", "SyntaxError", "SecurityError", "DOMException", "UnhandledRejection", "ModuleLoadError", "UnknownError"]
+    static let reasons: Set<String> = ["The side-chat extension is unavailable", "The Safari owner tab is no longer available", "The Safari side-chat context request timed out", "The ChatGPT account changed", "Load failed"]
 
     static func validate(_ value: Any) -> [String: Any]? {
         guard let input = value as? [String: Any], let state = input["state"] as? String,
@@ -95,12 +96,17 @@ enum ProviderRelayDiagnostics {
             guard let errors = value as? [[String: Any]], errors.count <= 4 else { return nil }
             var safeErrors: [[String: Any]] = []
             for error in errors {
-                guard Set(error.keys) == ["kind", "frames"], let kind = error["kind"] as? String, kinds.contains(kind),
+                guard Set(error.keys).isSubset(of: ["kind", "frames", "reason"]), let kind = error["kind"] as? String, kinds.contains(kind),
                       let frames = error["frames"] as? [String], frames.count <= 4 else { return nil }
                 for frame in frames {
                     guard frame.range(of: #"^/(?:cdn/assets/(?:async/)?[A-Za-z0-9_.-]{1,180}\.js|__chatgpt/(?:browser|sidechat-host)\.js)(?::[0-9]{1,9}(?::[0-9]{1,9})?)?$"#, options: .regularExpression) != nil else { return nil }
                 }
-                safeErrors.append(["kind": kind, "frames": frames])
+                var safe: [String: Any] = ["kind": kind, "frames": frames]
+                if let value = error["reason"] {
+                    guard let reason = value as? String, reasons.contains(reason) else { return nil }
+                    safe["reason"] = reason
+                }
+                safeErrors.append(safe)
             }
             report["errors"] = safeErrors
         }

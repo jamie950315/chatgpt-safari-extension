@@ -51,8 +51,14 @@ try {
     }
     previousContext = next;
   }
-  frame.addEventListener("load", () => {
-    if (disposed) return;
+  let providerDocument;
+  window.addEventListener("message", event => {
+    if (disposed || !event.isTrusted || event.source !== frame.contentWindow || event.origin !== entry.providerOrigin
+      || event.data?.type !== "chatgpt-safari-provider:ready" || event.data.token !== entry.bridgeToken
+      || typeof event.data.documentId !== "string" || !/^[0-9a-f-]{36}$/iu.test(event.data.documentId)
+      || event.data.documentId === providerDocument) return;
+    providerDocument = event.data.documentId;
+    clearInterval(interval);
     channel?.close();
     const pair = new MessageChannel();
     channel = pair.port1;

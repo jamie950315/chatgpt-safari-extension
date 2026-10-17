@@ -1,5 +1,8 @@
 const test = require("node:test");
 const assert = require("node:assert/strict");
+const fs = require("node:fs");
+const vm = require("node:vm");
+const { MessageChannel } = require("node:worker_threads");
 const { dispatch, sandboxURL } = require("../safari/ChatGPT for Safari/ChatGPT for Safari Extension/Resources/safari/agent-kernel-bridge.js");
 test("Safari high-level commands retain the original RPC session transport rather than CDP", async () => {
   const calls = [];
@@ -26,4 +29,46 @@ test("the original worker accepts only its dedicated capability-bound local sand
       set(invalid); assert.throws(sandboxURL, /Invalid isolated/);
     }
   } finally { globalThis.location = previous; }
+});
+test("same-document kernel browser RPC uses a real exact-host MessageChannel and propagates close", async () => {
+  const source = fs.readFileSync("safari/ChatGPT for Safari/ChatGPT for Safari Extension/Resources/safari/agent-kernel-bridge.js", "utf8");
+  const origin = "safari-web-extension://actual-extension", hostWindow = {};
+  const child = { src: origin + "/js-kernel-host.html?scopeId=original-scope", contentWindow: hostWindow };
+  const events = new Map();
+  const offscreen = { hidden: true, setAttribute() {}, contentDocument: { querySelectorAll: () => [child] },
+    addEventListener(type, callback) { events.set(type, callback); }, removeEventListener() {}, remove() {} };
+  const backgroundWindow = { addEventListener(type, callback) { this.listener = callback; } };
+  backgroundWindow.parent = backgroundWindow;
+  const background = { window: backgroundWindow, document: { body: { append() { queueMicrotask(() => events.get("load")()); } }, createElement: () => offscreen },
+    MessageChannel, URL, setTimeout, clearTimeout, module: { exports: {} },
+    chrome: { runtime: { getURL: path => origin + "/" + path } },
+    ChatGPTSafariSidebarOptions: { companion: { agentKernelURL: async () => "http://chatgpt-kernel-55555555-5555-4555-8555-555555555555.localhost:1234/sandbox?cap=" + "a".repeat(64) } } };
+  vm.runInNewContext(source, background);
+  const bridge = background.module.exports;
+  await bridge.ensureHostDocument();
+  let accepted;
+  bridge.onBrowserConnection((scope, transport) => { assert.equal(scope, "original-scope"); accepted = transport; });
+  const message = { isTrusted: true, source: hostWindow, origin, data: { type: "chatgpt-safari:kernel-browser", scopeId: "original-scope" } };
+  for (const invalid of [{ ...message, source: {} }, { ...message, origin: "https://unrelated.invalid" },
+    { ...message, data: { ...message.data, scopeId: "another-scope" } }]) {
+    const channel = new MessageChannel();
+    backgroundWindow.listener({ ...invalid, ports: [channel.port2] });
+    channel.port1.close(); channel.port2.close();
+  }
+  assert.equal(accepted, undefined);
+  backgroundWindow.postMessage = (data, _origin, ports) => backgroundWindow.listener({ ...message, data, ports });
+  hostWindow.parent = { parent: backgroundWindow };
+  const host = { window: hostWindow, MessageChannel, module: { exports: {} } };
+  vm.runInNewContext(source, host);
+  const client = host.module.exports.connectBrowser("original-scope");
+  const received = new Promise(resolve => accepted.setMessageCallback(resolve));
+  client.sendMessage({ original: "RPC request" });
+  assert.deepEqual(await received, { original: "RPC request" });
+  const response = new Promise(resolve => client.setMessageCallback(resolve));
+  accepted.sendMessage({ original: "RPC response" });
+  assert.deepEqual(await response, { original: "RPC response" });
+  const closed = new Promise(resolve => client.addCloseListener(resolve));
+  accepted.close(); await closed;
+  assert.equal(bridge.status().connections, 1);
+  assert.throws(() => client.sendMessage({}), /closed/);
 });

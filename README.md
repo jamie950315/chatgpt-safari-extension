@@ -36,6 +36,15 @@ It uses the website's own API-base setting to route requests to `/backend-api`.
 Original account/API identity headers go only to official nonstatic ChatGPT
 requests, never static or CDN resources.
 
+The relay compiles native async generators and `for await` syntax inside the
+inspected stream factories using bundled Babel 7.28.5 in a separate JavaScriptCore
+context. This avoids a reproduced WebKit crash while retaining the original
+parser and stream logic. Unrelated factories are unchanged. The compiler only
+parses provider source; it never executes it. Public module URLs and CSP remain
+unchanged. Its dedicated native compilation queue uses the containing app's
+JIT entitlement; extension permissions are unchanged. Original resume/turn
+headers stay on official nonstatic requests.
+
 The macOS package uses a **Manifest V2 persistent background page**, with the
 real `browserAction` toolbar API. Safari's MV3 worker stopped answering
 cold-start side-chat requests. Preparation retains the sandbox and original
@@ -46,9 +55,8 @@ provider frame policy.
 
 In the original inline sidebar, select **Work** and describe an action on an
 existing Safari tab, for example: "In this page, enter the project note and click
-Apply." Approve the original Browser confirmation when prompted. Its upstream
-confirmation can still say "Chrome"; supported actions are dispatched to the
-real Safari backend, not Chrome or an isolated browser profile.
+Apply." Approve the Browser confirmation when prompted. Supported actions are
+dispatched to the real Safari backend, not Chrome or an isolated browser profile.
 
 The original agent keeps its cloud tunnel, account scope, conversation UI,
 browser-control consent, and tab leases. Supported high-level commands use
@@ -66,8 +74,10 @@ require a fresh page read; delivered input is never automatically replayed.
 Safari lacks Chrome's manifest sandbox pages. The packaged original JavaScript
 worker therefore runs at a dedicated local origin with no extension APIs,
 credentials, or network access. Exact-parent ports connect it to the original
-security-gated host. This computation sandbox does not create website tabs or
-another login session.
+security-gated host. Host-to-background browser RPC uses a real MessageChannel
+bound to the nested host frame and scope, since Safari's same-background-frame
+runtime messaging does not reach its own listener. This computation sandbox
+does not create website tabs or another login session.
 
 **Installed end-to-end verification of this new sidebar path is still required.**
 The independent desktop control results below do not establish that acceptance.

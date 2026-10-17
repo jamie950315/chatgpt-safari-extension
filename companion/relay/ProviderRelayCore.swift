@@ -3,6 +3,7 @@
 import Foundation
 import Network
 import Security
+import JavaScriptCore
 
 let providerRelayQueue = DispatchQueue(label: "dev.jamie.chatgpt-safari.provider-relay")
 let providerRelayMaximumBody = 32 * 1024 * 1024
@@ -149,6 +150,7 @@ final class ProviderRelayClient {
     func error(_ status: Int, _ message: String) {
         if responded { finish(); return }
         server?.incrementRoute("rejections")
+        server?.incrementRoute("rejection_http_\(status)")
         let body = "<!doctype html><html lang=\"en\"><meta charset=\"utf-8\"><title>\(providerRelayEscapeHTML(ProviderRelayMessages.text("relayStatusTitle")))</title><h1>\(providerRelayEscapeHTML(ProviderRelayMessages.text("chatUnavailable")))</h1><p>\(providerRelayEscapeHTML(message))</p><p>\(providerRelayEscapeHTML(ProviderRelayMessages.text("noAutomaticAction")))</p></html>"
         send(status, data: Data(body.utf8), headers: ["Content-Type": "text/html; charset=utf-8", "Content-Security-Policy": "default-src 'none'; base-uri 'none'; form-action 'none'"])
     }
@@ -175,11 +177,61 @@ final class ProviderRelayTransfer {
     var status = 0
     var headers: [String: String] = [:]
     var document = false
+    var script = false
     var body = Data()
     var received = 0
     var publicLinkAssets: [String] = []
     var settingsObservation: ProviderRelaySettingsObservation?
     init(client: ProviderRelayClient, url: URL, method: String, staticOnly: Bool) { self.client = client; self.url = url; self.method = method; self.staticOnly = staticOnly }
+}
+
+/// Compiles source only; never executes provider code in the native context.
+/// Ordinary generator/Promise output avoids WebKit's crashing async-generator VM path.
+final class ProviderStreamCompiler {
+    private let context: JSContext
+    private let transform: JSValue
+    static func needed(_ data: Data) -> Bool {
+        guard let source = String(data: data, encoding: .utf8) else { return false }
+        return source.range(of: #"\b(?:sY|tI|dd)\s*:\s*\(?\s*function\s*\("#, options: .regularExpression) != nil
+            && source.range(of: #"\basync\s*(?:function\s*\*|\*)|\bfor\s+await\s*\("#, options: .regularExpression) != nil
+    }
+    init(source: Data) throws {
+        guard let script = String(data: source, encoding: .utf8), let context = JSContext() else {
+            throw ProviderRelayError.invalidResource
+        }
+        context.evaluateScript(script)
+        guard context.exception == nil,
+              let transform = context.evaluateScript("""
+              source => {
+                const types = Babel.packages.types, targets = new Set(['sY', 'tI', 'dd']);
+                let changed = false;
+                const output = Babel.transform(source, {sourceType: 'module', compact: true, comments: false, sourceMaps: false,
+                  plugins: [() => ({visitor: {ObjectProperty(path) {
+                    const node = path.node, key = node.key.name ?? node.key.value;
+                    if (!targets.has(key) || node.value.type !== 'FunctionExpression' || node.value.params.length !== 3) return;
+                    const file = types.file(types.program([types.expressionStatement(node.value)]));
+                    const result = Babel.transformFromAst(file, '', {plugins: ['transform-async-generator-functions'], sourceType: 'script', ast: true, code: false});
+                    const body = result.ast.program.body, expression = body.pop().expression;
+                    body.push(types.returnStatement(expression));
+                    path.get('value').replaceWith(types.callExpression(types.functionExpression(null, [], types.blockStatement(body)), []));
+                    path.skip(); changed = true;
+                  }}})]});
+                return {code: changed ? output.code : source, changed};
+              }
+              """),
+              context.exception == nil else { throw ProviderRelayError.invalidResource }
+        self.context = context; self.transform = transform
+    }
+    func compile(_ data: Data) throws -> (Data, Bool) {
+        guard let source = String(data: data, encoding: .utf8) else { throw ProviderRelayError.invalidResource }
+        guard source.range(of: #"\basync\s*(?:function\s*\*|\*)|\bfor\s+await\s*\("#, options: .regularExpression) != nil else { return (data, false) }
+        context.exception = nil
+        guard let result = transform.call(withArguments: [source]), context.exception == nil,
+              let output = result.forProperty("code")?.toString(), output.utf8.count <= providerRelayMaximumBody else {
+            throw ProviderRelayError.invalidResource
+        }
+        return (Data(output.utf8), result.forProperty("changed")?.toBool() == true)
+    }
 }
 
 final class ProviderRelaySettingsObservation {
@@ -223,6 +275,9 @@ final class ProviderRelayServer: NSObject, URLSessionDataDelegate, URLSessionTas
 
     let browserShim: Data
     let sideChatHostScript: Data
+    private let streamCompilerSource: Data?
+    private var streamCompiler: ProviderStreamCompiler?
+    private let streamCompilerQueue = DispatchQueue(label: "dev.jamie.chatgpt-safari.provider-compiler")
     var startCompletion: ((Error?) -> Void)?
     var stopped = false
     var phase = "guest"
@@ -235,10 +290,11 @@ final class ProviderRelayServer: NSObject, URLSessionDataDelegate, URLSessionTas
     var requestRoutes = ["browserScript": 0, "hostModule": 0, "runtimeModule": 0, "rejections": 0]
     var settingsRequests: [ProviderRelaySettingsObservation] = []
 
-    init(mainOrigin: URL, browserShim: Data, sideChatHostScript: Data) throws {
+    init(mainOrigin: URL, browserShim: Data, sideChatHostScript: Data, streamCompilerSource: Data? = nil) throws {
         self.policy = ProviderRelayPolicy(key: try providerRelayRandomKey(), bridgeNonce: try providerRelayRandomKey(), bridgeToken: try providerRelayRandomKey(), mainOrigin: mainOrigin)
         self.browserShim = browserShim
         self.sideChatHostScript = sideChatHostScript
+        self.streamCompilerSource = streamCompilerSource
         self.loopbackHost = "chatgpt-provider-\(UUID().uuidString.lowercased()).localhost"
         super.init()
         session = makeSession()
@@ -332,7 +388,7 @@ final class ProviderRelayServer: NSObject, URLSessionDataDelegate, URLSessionTas
         let isMain = upstream.scheme == policy.mainOrigin.scheme && upstream.host == policy.mainOrigin.host && upstream.port == policy.mainOrigin.port
         let basic: Set<String> = ["accept", "accept-language", "user-agent", "content-type", "range", "if-range", "last-event-id"]
         for (name, value) in request.headers {
-            let protected = ["authorization", "chatgpt-account-id", "originator"].contains(name) || name.hasPrefix("oai-") || name.hasPrefix("openai-") || name.hasPrefix("x-openai-")
+            let protected = ["authorization", "chatgpt-account-id", "originator", "x-conduit-token"].contains(name) || name.hasPrefix("oai-") || name.hasPrefix("openai-") || name.hasPrefix("x-openai-") || name.hasPrefix("x-oai-")
             guard basic.contains(name) || (isMain && !staticOnly && protected) else { continue }
             if value.utf8.count <= 8192 { outgoing.setValue(value, forHTTPHeaderField: name) }
         }
@@ -488,6 +544,12 @@ final class ProviderRelayServer: NSObject, URLSessionDataDelegate, URLSessionTas
             }
             guard let transfer = self.transfers[key] else { completionHandler(.cancel); return }
             transfer.status = response.statusCode
+            if transfer.url.path == "/backend-api/f/conversation/resume" {
+                self.incrementRoute("resume_http_\(response.statusCode)")
+            } else if transfer.url.path.hasPrefix("/backend-api/conversation/") {
+                let kind = transfer.url.path.hasSuffix("/stream_status") ? "stream_status" : "conversation"
+                self.incrementRoute("\(kind)_http_\(response.statusCode)")
+            }
             transfer.settingsObservation?.status = response.statusCode
             transfer.settingsObservation?.stage = "response"
             if response.value(forHTTPHeaderField: "cf-mitigated") == "challenge" {
@@ -505,6 +567,7 @@ final class ProviderRelayServer: NSObject, URLSessionDataDelegate, URLSessionTas
                     completionHandler(.cancel); return
                 }
                 if mime == "image/svg+xml" { transfer.headers["Content-Security-Policy"] = "default-src 'none'; sandbox" }
+                transfer.script = ["application/javascript", "text/javascript", "application/x-javascript"].contains(mime)
             }
             transfer.headers["Content-Type"] = type
             transfer.document = type.lowercased().contains("text/html")
@@ -516,7 +579,7 @@ final class ProviderRelayServer: NSObject, URLSessionDataDelegate, URLSessionTas
                 transfer.headers["Location"] = rewritten
             }
             if !transfer.staticOnly, let policy = response.value(forHTTPHeaderField: "Content-Security-Policy") { transfer.headers["Content-Security-Policy"] = policy }
-            if !transfer.document || transfer.method == "HEAD" {
+            if (!transfer.document && !transfer.script) || transfer.method == "HEAD" {
                 transfer.client.sendHead(transfer.status, headers: transfer.headers)
             }
             completionHandler(.allow)
@@ -537,7 +600,7 @@ final class ProviderRelayServer: NSObject, URLSessionDataDelegate, URLSessionTas
             guard transfer.received <= (transfer.document ? providerRelayMaximumDocument : providerRelayMaximumBody) else {
                 transfer.client.error(502, ProviderRelayMessages.text("responseTooLarge")); dataTask.cancel(); return
             }
-            if transfer.document {
+            if transfer.document || transfer.script {
                 transfer.body.append(data)
                 dataTask.resume()
             } else {
@@ -563,6 +626,34 @@ final class ProviderRelayServer: NSObject, URLSessionDataDelegate, URLSessionTas
             transfer.settingsObservation?.stage = error == nil ? "complete" : "networkFailure"
             if error != nil { transfer.client.error(502, ProviderRelayMessages.text("upstreamFailed")); return }
             guard self.session === session, !transfer.client.completed else { return }
+            if transfer.script && transfer.method != "HEAD" {
+                if !ProviderStreamCompiler.needed(transfer.body) {
+                    transfer.client.send(transfer.status, data: transfer.body, headers: transfer.headers)
+                    return
+                }
+                // Compiling large modules must not block context/session RPCs
+                // or streaming traffic on the provider transport queue.
+                self.streamCompilerQueue.async {
+                    let result: Result<(Data, Bool), Error> = Result {
+                        if self.streamCompiler == nil {
+                            let source = try self.streamCompilerSource ?? Bundle.main.url(forResource: "BabelStandalone", withExtension: "js").map { try Data(contentsOf: $0) }
+                            guard let source else { throw ProviderRelayError.invalidResource }
+                            self.streamCompiler = try ProviderStreamCompiler(source: source)
+                        }
+                        return try self.streamCompiler!.compile(transfer.body)
+                    }
+                    providerRelayQueue.async {
+                        guard self.session === session, !self.stopped, !transfer.client.completed else { return }
+                        switch result {
+                        case .success(let (body, transformed)):
+                            if transformed { self.incrementRoute("compiledStreamModules") }
+                            transfer.client.send(transfer.status, data: body, headers: transfer.headers)
+                        case .failure: transfer.client.error(502, "The provider module could not be compiled for Safari.")
+                        }
+                    }
+                }
+                return
+            }
             if transfer.document && transfer.method != "HEAD" {
                 guard let html = String(data: transfer.body, encoding: .utf8) else { transfer.client.error(502, ProviderRelayMessages.text("invalidUTF8")); return }
                 let nonce = self.policy.bridgeNonce

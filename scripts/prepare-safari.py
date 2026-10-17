@@ -49,8 +49,20 @@ if(!safariTunnelState.registered)safariTunnelState.polling={state:"stopped",reas
 function safariObserveTunnelPolling(state,reason,httpStatus){
 safariTunnelState.polling={state:["connected","failed","offline","stopped","recovered"].includes(state)?state:"unknown",reason:["http","network","invalid_response","unknown"].includes(reason)?reason:null,httpStatus:safariTunnelHttpStatus(httpStatus)};
 }
-globalThis.ChatGPTSafariGetCloudTunnelState=()=>JSON.parse(JSON.stringify(safariTunnelState));
+globalThis.ChatGPTSafariGetCloudTunnelState=()=>JSON.parse(JSON.stringify({...safariTunnelState,kernel:globalThis.ChatGPTSafariAgentKernel?.status()}));
 '''
+
+# Remounting the inline provider reports signed_in again. The original tunnel
+# suspends active RPCs whenever setup runs, even when credentials are unchanged.
+# Compare only the already-authorized app session in memory before refreshing.
+APP_SESSION_CHANGED = r'''const safariSessionChanged=async()=>{
+const cached=await xr();
+if(cached!=null){
+const observed=await Ar(),session=observed.session;
+if(session!=null&&session.accessToken===cached.apiKey&&session.account.id===cached.account.id&&session.account.userId===cached.account.userId&&session.account.structure===cached.account.structure)return;
+}
+return l("app_session");
+};'''
 
 REPLACEMENTS = {
     'async function Ar(e){jn++;const t=AbortSignal.timeout(us),r=await fetch(`${qn}/api/auth/session`,{cache:"no-store",credentials:"include",redirect:"error",signal:e==null?t:AbortSignal.any([e,t])}),{status:n}=r;if(!r.ok)return{status:n,error:"http",retryAfterMs:ms(r)};let i;try{i=await r.json()}catch{return{status:n,error:"decode"}}if(typeof i=="object"&&i!=null&&!Array.isArray(i)&&Object.keys(i).length===0)return{status:n,session:null};try{const a=i;return a.error!=null||!a.accessToken.trim()?{status:n,error:"decode"}:{status:n,session:{accessToken:a.accessToken,account:ps(a.account,a.user.id),...typeof a.user.email=="string"?{email:a.user.email}:{}}}}catch{return{status:n,error:"decode"}}}':
@@ -61,13 +73,15 @@ REPLACEMENTS = {
     'function zd(e){let t;return(r,n,i)=>{const a=`${r}:${n??""}:${i??""}`;if(a===t)return;const s=r==="connected"&&t!==void 0;t=a,ai("polling",{state:s?"recovered":r,tunnel_id:e,reason:n,http_status:i})}}':
         ('function zd(e){let t;return(r,n,i)=>{safariObserveTunnelPolling(r,n,i);const a=`${r}:${n??""}:${i??""}`;if(a===t)return;const s=r==="connected"&&t!==void 0;t=a,ai("polling",{state:s?"recovered":r,tunnel_id:e,reason:n,http_status:i})}}', 1),
     'chrome.webNavigation.onCompleted.addListener(h,{url:[{hostEquals:new URL(qn).hostname}]});const d=f=>':
-        ('safariTunnelState.running=!0;const safariSessionChanged=()=>l("app_session");globalThis.ChatGPTSafariBrowserSessionChanged=safariSessionChanged;chrome.webNavigation.onCompleted.addListener(h,{url:[{hostEquals:new URL(qn).hostname}]});const d=f=>', 1),
+        ('safariTunnelState.running=!0;' + APP_SESSION_CHANGED + 'globalThis.ChatGPTSafariBrowserSessionChanged=safariSessionChanged;chrome.webNavigation.onCompleted.addListener(h,{url:[{hostEquals:new URL(qn).hostname}]});const d=f=>', 1),
     'm.stop()}}async function rh':
         ('m.stop();safariTunnelState.running=!1;safariTunnelState.registered=!1;safariTunnelState.polling={state:"stopped",reason:null,httpStatus:null};if(globalThis.ChatGPTSafariBrowserSessionChanged===safariSessionChanged)delete globalThis.ChatGPTSafariBrowserSessionChanged}}async function rh', 1),
     'Rr(Iw,v=>{v&&d()},m.signal)':
         ('Rr(Iw,v=>{safariTunnelState.kernelGate=v===!0;v&&d()},m.signal)', 1),
     'JSON.stringify({device_name:"Chrome",instance_id:l})':
         ('JSON.stringify({device_name:"Safari",instance_id:l})', 1),
+    'const c=Te[Mn(navigator)].shortDisplayName,p=n.requestMeta["openai/browser_context"]':
+        ('const c="Safari",p=n.requestMeta["openai/browser_context"]', 1),
     'async function xv({reason:e}){e!=="install"||Mn(globalThis.navigator)==="opera"||await wt(Dv).catch(()=>!1)&&await chrome.tabs.create({active:!0,url:`${Ir}/work/extension/installed`})}':
         ('async function xv(){}', 1),  # Setup belongs to the native Safari companion, not Chrome's installation page.
     'async function El(e,t){await oa(e,':

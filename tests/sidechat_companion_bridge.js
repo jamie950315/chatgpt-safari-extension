@@ -63,7 +63,7 @@ function fixture(options = {}) {
     gesture: trusted => emit(documentListeners, new MockEvent("pointerdown", { isTrusted: trusted })) };
 }
 const flush = () => new Promise(resolve => setImmediate(resolve));
-test("original stream adapters preserve parsing, arguments, iteration and cancellation without native for-await fast paths", async () => {
+test("original stream observations preserve iterators, arguments, live exports and cancellation", async () => {
   const runtime = { m: {}, c: {}, d(exports, getters) {
     for (const [name, get] of Object.entries(getters)) Object.defineProperty(exports, name, { get, enumerable: true });
   } };
@@ -83,10 +83,10 @@ test("original stream adapters preserve parsing, arguments, iteration and cancel
   runtime.m.tI({}, streams, runtime); runtime.m.sY({}, delta, runtime);
   const parsed = streams.uj.call(scope, "original body", signal);
   assert.equal(parsed[Symbol.asyncIterator](), parsed);
-  assert.notEqual(Object.prototype.toString.call(parsed), "[object AsyncGenerator]");
+  assert.equal(Object.prototype.toString.call(parsed), "[object AsyncGenerator]");
   const decoded = delta.i(parsed);
   assert.deepEqual(await decoded.next(), { value: { data: "original body" }, done: false });
-  assert.notEqual(input, parsed, "The nested original for-await loop also receives an ordinary iterator");
+  assert.equal(input, parsed, "Observation preserves the original parser input exactly");
   assert.equal(receiver, scope); assert.equal(forwardedSignal, signal); assert.equal(streams.untouched, signal);
   await decoded.return(); assert.equal(cleanup, 1, "Cancellation reaches both original generators");
   await assert.rejects(streams.sj().next(), /Original parse failure/);
@@ -129,7 +129,9 @@ test("isolated provider uses its real parent/origin and a capability-bound chann
   f.emitMessage({ ...connect, origin: "safari-web-extension://ACTUAL-OWNER" });
   assert.equal(typeof port.onmessage, "function");
   assert.equal(sent[0].type, "ready");
-  assert.equal(f.messages.length, 0);
+  assert.equal(f.messages.length, 1);
+  assert.equal(f.messages[0].data.type, "chatgpt-safari-provider:ready", "The parent can connect before iframe load or original context initialization");
+  assert.equal(f.messages[0].data.token, relay.bridgeToken);
   runtime.m.aH = (module, exports, require) => require.d(exports, { a: () => () => undefined });
   runtime.m.Kxt = () => {};
   runtime.m.ipG = (module, exports, require) => require.d(exports, { a: () => () => false });

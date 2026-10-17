@@ -16,6 +16,10 @@ This is a development-signed conversion of Chrome extension 1.26.1005.11759.
 - `companion/relay/` is a provider-only HTTPS relay adapted from Margina. Keep its
   loopback/Host/Origin/capability, framing, MIME, redirect, and streaming checks.
   Provider scripts never execute in the privileged extension wrapper.
+- Establish the exact-frame provider channel from its capability-bound document
+  readiness signal before original entry initialization. Waiting for iframe
+  `load` deadlocks the original context loader when module compilation delays it.
+  Duplicate readiness for the same document must not replace its live channel.
 - Explicit user authorization permits memory-only sharing of this app's own
   minimal secure HTTP-only ChatGPT session after an official session probe.
   Never read Safari/Margina cookies, persist credentials, or delete the original
@@ -26,6 +30,16 @@ This is a development-signed conversion of Chrome extension 1.26.1005.11759.
   Forward the actual browser User-Agent. Keep exact real frame/parent identity,
   account scope, and owner invalidation. Do not fake Chrome ancestry, strip CSP,
   or replace the original conversation UI/request construction.
+- The relay buffers public JavaScript modules and uses bundled Babel 7.28.5 in
+  a separate JavaScriptCore compilation context to lower async generators and
+  `for await` only inside the inspected `sY`, `tI`, and `dd` stream factories.
+  Keep generated helpers within each factory's closure. Wrapping native
+  iterators alone did not prevent the reproduced
+  WebKit crash. Never execute provider code in the compiler or privilege its
+  output; keep canonical module URLs, original logic, CSP, and license intact.
+  Compilation runs on its own queue. The containing app's allow-jit entitlement
+  is required for JavaScriptCore compiler performance; it does not grant eval/JIT
+  to the sandboxed extension or execute provider code in the native process.
 - Set the original website's own-origin `codex.browser.apiBaseUrl` to
   `/backend-api` before entry modules run. Forward actual account/API identity
   headers only to official nonstatic ChatGPT requests; never attach them or
@@ -60,7 +74,12 @@ This is a development-signed conversion of Chrome extension 1.26.1005.11759.
   checks. Never add eval permission to privileged extension pages or run agent
   scripts in the provider relay. Background/offscreen traffic uses a real
   parent-validated MessageChannel because runtime messages do not deliver to
-  Safari's replacement offscreen iframe in the same background document.
+  Safari's replacement offscreen iframe in the same background document. The
+  host's browser RPC also uses a real MessageChannel, accepted only from the
+  exact nested host frame and scope; never fabricate a runtime sender.
+- A same-session provider remount must not suspend active cloud RPCs. Compare
+  the verified in-memory app session before refreshing the original tunnel;
+  changed credentials/account and sign-out must still update it.
 - `native/SafariLiveInput.swift` uses public AX + CGEvent for trusted input.
   Preserve real Accessibility checks, Safari foreground/window/page identity,
   viewport mapping, native hit testing, and editable keyboard focus. Never use

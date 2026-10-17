@@ -42,6 +42,9 @@ test("provider relay uses real bounded HTTP, isolated capabilities, module gates
       res.writeHead(200, { "Content-Type": "application/json", "Set-Cookie": "synthetic_provider=fixture; HttpOnly; Path=/" }); res.end("{}");
     } else if (req.url === "/cdn/assets/bad-html-123.js") {
       res.writeHead(200, { "Content-Type": "text/html" }); res.end("<script>unexpected</script>");
+    } else if (req.url === "/cdn/assets/generator-123.js") {
+      res.writeHead(200, { "Content-Type": "application/javascript" });
+      res.end('export let closed = false; const modules = {tI: function(module, exports, require) { exports.stream = async function* (input) { try { for await (const item of input) yield await Promise.resolve(item + 1); } finally { closed = true; } }; }}; const value = {}; modules.tI({}, value, null); export const stream = value.stream; export async function* unrelated() { yield 0; }');
     } else if (req.url.startsWith("/cdn/assets/")) {
       res.writeHead(200, { "Content-Type": "application/javascript" }); res.end("export const fixture = true;");
     } else if (req.url === "/echo") {
@@ -53,7 +56,7 @@ test("provider relay uses real bounded HTTP, isolated capabilities, module gates
   });
   await new Promise(resolve => upstream.listen(0, "127.0.0.1", resolve));
   t.after(() => new Promise(resolve => { upstream.close(resolve); upstream.closeAllConnections(); }));
-  const child = spawn(binary, [`http://127.0.0.1:${upstream.address().port}`, path.join(root, "companion/relay/ProviderBrowser.js")], { stdio: ["pipe", "ignore", "pipe", "pipe"] });
+  const child = spawn(binary, [`http://127.0.0.1:${upstream.address().port}`, path.join(root, "companion/relay/ProviderBrowser.js"), path.join(root, "companion/relay/vendor/BabelStandalone.js")], { stdio: ["pipe", "ignore", "pipe", "pipe"] });
   t.after(() => child.kill("SIGTERM"));
   let pending = ""; const messages = [], waiters = [];
   child.stdio[3].on("data", chunk => {
@@ -133,6 +136,14 @@ test("provider relay uses real bounded HTTP, isolated capabilities, module gates
   assert.equal((await call("/cdn/assets/fixture-123.js", { authorized: false })).status, 200);
   assert.equal((await call("/cdn/assets/async/637745.14f70978dc.js", { authorized: false })).status, 200);
   assert.equal(received.at(-1).headers.cookie, undefined);
+  const compiledGenerator = await call("/cdn/assets/generator-123.js", { authorized: false });
+  assert.equal(compiledGenerator.status, 200);
+  const generatorModule = await import("data:text/javascript;base64," + compiledGenerator.body.toString("base64"));
+  assert.doesNotMatch(generatorModule.stream.toString(), /async\s*function\s*\*|for\s+await/);
+  assert.equal(Object.prototype.toString.call(generatorModule.unrelated()), "[object AsyncGenerator]", "Unrelated original factories and functions remain native");
+  const iterator = generatorModule.stream([1, 2]);
+  assert.deepEqual(await iterator.next(), { value: 2, done: false });
+  await iterator.return(); assert.equal(generatorModule.closed, true);
   assert.equal((await call("/cdn/assets/async/../fixture-123.js", { authorized: false })).status, 401);
   assert.equal((await call("/cdn/assets/bad-html-123.js", { authorized: false })).status, 502);
   const redirected = await call("/redirect");
@@ -162,18 +173,22 @@ test("provider relay uses real bounded HTTP, isolated capabilities, module gates
   });
   assert.equal(rawStatus, 400);
   const protectedHeaders = { Authorization: "Bearer synthetic-provider-token", "ChatGPT-Account-ID": "synthetic-account-scope",
-    "X-OpenAI-Expected-Account-Id": "synthetic-account-scope", Originator: "synthetic-browser-client", "OAI-Client-Version": "synthetic-client-version" };
+    "X-OpenAI-Expected-Account-Id": "synthetic-account-scope", Originator: "synthetic-browser-client", "OAI-Client-Version": "synthetic-client-version",
+    "X-Conduit-Token": "synthetic-resume-token", "X-OAI-Turn-Trace-ID": "synthetic-turn", "X-OAI-MCP-Form-Version": "2" };
   await call("/backend-api/settings/user?private=fixture-only", { headers: protectedHeaders });
   assert.equal(received.at(-1).headers["chatgpt-account-id"], "synthetic-account-scope");
   assert.equal(received.at(-1).headers["x-openai-expected-account-id"], "synthetic-account-scope");
   assert.equal(received.at(-1).headers.originator, "synthetic-browser-client");
   assert.equal(received.at(-1).headers.authorization, "Bearer synthetic-provider-token");
+  assert.equal(received.at(-1).headers["x-conduit-token"], "synthetic-resume-token");
+  assert.equal(received.at(-1).headers["x-oai-turn-trace-id"], "synthetic-turn");
+  assert.equal(received.at(-1).headers["x-oai-mcp-form-version"], "2");
   await call("/cdn/assets/async/637745.14f70978dc.js", { headers: protectedHeaders });
-  for (const name of ["authorization", "chatgpt-account-id", "x-openai-expected-account-id", "originator", "oai-client-version", "cookie"]) {
+  for (const name of [...Object.keys(protectedHeaders).map(name => name.toLowerCase()), "cookie"]) {
     assert.equal(received.at(-1).headers[name], undefined, `Static module must not receive protected ${name}`);
   }
   await call("/cdn/assets/fixture-123.js?cohort=synthetic", { headers: protectedHeaders });
-  for (const name of ["authorization", "chatgpt-account-id", "x-openai-expected-account-id", "originator", "oai-client-version", "cookie"]) {
+  for (const name of [...Object.keys(protectedHeaders).map(name => name.toLowerCase()), "cookie"]) {
     assert.equal(received.at(-1).headers[name], undefined, `Authenticated static resource must not receive protected ${name}`);
   }
   await call("/__codex-api/settings/user");

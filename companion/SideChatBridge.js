@@ -56,8 +56,10 @@ globalThis.__CHATGPT_SAFARI_ADAPTER_READY__ = (async () => {
       connectResolve();
     });
     window.addEventListener("pagehide", () => disconnectRelay(), { once: true });
-    // The extension parent initiates after frame load, as in Margina. Reply
-    // through its transferred port, not a message targeted at a custom scheme.
+    // Connect before original entry execution. Waiting for iframe.load can
+    // deadlock the original context loader while other modules are compiling.
+    window.parent.postMessage({ type: "chatgpt-safari-provider:ready", token: relay.bridgeToken,
+      documentId: crypto.randomUUID() }, "*");
   }
   function disconnectRelay() {
     relayPort?.close();
@@ -114,7 +116,7 @@ globalThis.__CHATGPT_SAFARI_ADAPTER_READY__ = (async () => {
         streamCalls: siteAdapter.streamCalls,
         failures: diagnostics.failures, scriptErrors: diagnostics.scriptErrors,
         unhandledRejections: diagnostics.unhandledRejections, channelConnected: relayPort != null, ...handshake,
-        errors: caughtErrors.map(error => ({ kind: error.kind, frames: error.frames.slice(0, 4) })) }).catch(() => {});
+        errors: caughtErrors.map(error => ({ kind: error.kind, frames: error.frames.slice(0, 4), ...(error.reason ? { reason: error.reason } : {}) })) }).catch(() => {});
     }, 2000);
     window.addEventListener("pagehide", () => clearInterval(report), { once: true });
   }
@@ -315,18 +317,9 @@ globalThis.__CHATGPT_SAFARI_ADAPTER_READY__ = (async () => {
     install("Kxt", () => (module, exports, require) => {
       require.d(exports, { BrowserSideChatConnection: () => NativeBrowserSideChatConnection });
     });
-    // Safari 27.0.1 repeatedly crashed in asyncIteratorNextWithDriver while
-    // consuming these original response/delta generators. Keep the original
-    // parsers and stream, but cross for-await boundaries as ordinary iterators
-    // rather than triggering JSC's native async-generator fast path.
-    const plainIterator = iterator => {
-      const result = { [Symbol.asyncIterator]() { return this; }, next(...args) { return iterator.next(...args); } };
-      for (const method of ["return", "throw"]) {
-        if (typeof iterator[method] === "function") result[method] = (...args) => iterator[method](...args);
-      }
-      return result;
-    };
-    const streamFactory = (members, wrapInput = false) => original => (module, exports, require) => {
+    // Observe the original stream APIs without replacing their iterators or
+    // parsers. The relay compiles native async-generator syntax for WebKit.
+    const streamFactory = members => original => (module, exports, require) => {
       const found = new Set();
       // Publish to the real exports immediately: tI has circular dependencies
       // that must see its original live bindings during factory execution.
@@ -343,11 +336,7 @@ globalThis.__CHATGPT_SAFARI_ADAPTER_READY__ = (async () => {
               const originalStream = originalGetter();
               if (typeof originalStream !== "function") throw new Error("The ChatGPT stream adapter no longer matches its public module");
               siteAdapter.streamCalls++;
-              if (wrapInput && typeof args[0]?.[Symbol.asyncIterator] === "function") {
-                const input = args[0];
-                args[0] = { [Symbol.asyncIterator]() { return plainIterator(input[Symbol.asyncIterator]()); } };
-              }
-              return plainIterator(Reflect.apply(originalStream, this, args));
+              return Reflect.apply(originalStream, this, args);
             };
             adapted[key] = () => stream;
           }
@@ -357,7 +346,7 @@ globalThis.__CHATGPT_SAFARI_ADAPTER_READY__ = (async () => {
       original(module, exports, loader);
       if (members.some(key => !found.has(key))) throw new Error("The ChatGPT stream adapter no longer matches its public module");
     };
-    install("sY", streamFactory(["i"], true));
+    install("sY", streamFactory(["i"]));
     install("tI", streamFactory(["sj", "uj"]));
     siteAdapter.state = "installed";
   }

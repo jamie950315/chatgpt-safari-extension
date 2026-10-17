@@ -6,8 +6,9 @@ import Foundation
         let upstream = URL(string: CommandLine.arguments[1])!
         guard upstream.scheme == "http", upstream.host == "127.0.0.1" else { fatalError("The fixture accepts loopback only") }
         let shim = try Data(contentsOf: URL(fileURLWithPath: CommandLine.arguments[2]))
+        let compiler = try Data(contentsOf: URL(fileURLWithPath: CommandLine.arguments[3]))
         let engine = try ProviderRelayServer(mainOrigin: upstream, browserShim: shim,
-            sideChatHostScript: Data("globalThis.__CHATGPT_SAFARI_ADAPTER_READY__ = Promise.resolve();".utf8))
+            sideChatHostScript: Data("globalThis.__CHATGPT_SAFARI_ADAPTER_READY__ = Promise.resolve();".utf8), streamCompilerSource: compiler)
         engine.policy.parentExtensionOrigin = "safari-web-extension://fixture-extension"
         func emit(_ extra: [String: Any] = [:]) {
             var result: [String: Any] = ["origin": engine.policy.localOrigin, "key": engine.policy.key,

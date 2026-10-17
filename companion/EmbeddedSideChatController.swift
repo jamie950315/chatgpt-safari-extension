@@ -198,6 +198,15 @@ final class EmbeddedSideChatController {
     private static func safeTunnelStatus(_ source: [String: Any]) -> [String: Any] {
         var result: [String: Any] = [:]
         for key in ["kernelGate", "running", "registered"] { if let value = source[key] as? Bool { result[key] = value } }
+        if let kernel = source["kernel"] as? [String: Any] {
+            var value: [String: Any] = [:]
+            if let phase = kernel["phase"] as? String,
+               ["idle", "preparing", "host_loaded", "sent", "executing", "ready", "failed"].contains(phase) { value["phase"] = phase }
+            for key in ["requests", "replies", "failures", "connections"] {
+                if let count = kernel[key] as? Int, (0...1_000_000).contains(count) { value[key] = count }
+            }
+            result["kernel"] = value
+        }
         let fields: [String: [String: Set<String>]] = [
             "setup": ["trigger": ["startup", "navigation", "retry", "unauthorized", "invalid_tunnel", "app_session", "unknown"],
                       "stage": ["session", "session_decode", "read_configuration", "create_tunnel", "save_registration", "configure_polling", "start_polling", "unknown"],

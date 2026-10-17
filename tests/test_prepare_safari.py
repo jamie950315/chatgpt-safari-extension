@@ -131,6 +131,7 @@ let stopped=0;
 const sandbox={Promise,AbortController,Date,URL,Error,console,setTimeout,clearTimeout,Vs:30000,Hs:60000,qn:"https://chatgpt.com",Dr:"retry",li:"health",
   Qd:()=>()=>{},nh:async metadata=>{triggers.push(metadata.trigger);return "unchanged"},
   rh:async()=>({suspend(){},resume:async()=>{},ensurePolling:async()=>{},stop(){stopped++}}),
+  xr:async()=>null,
   chrome:{webNavigation:{onCompleted:events},alarms:{onAlarm:events,create:async()=>{},clear:async()=>{}}}};
 vm.createContext(sandbox);vm.runInContext(SOURCE+"\nglobalThis.startTunnel=th;",sandbox);
 (async()=>{
@@ -141,6 +142,25 @@ vm.createContext(sandbox);vm.runInContext(SOURCE+"\nglobalThis.startTunnel=th;",
   assert.equal(sandbox.ChatGPTSafariGetCloudTunnelState().running,false);
 })().catch(error=>{console.error(error);process.exitCode=1});
 '''.replace("SOURCE", json.dumps(module.CLOUD_TUNNEL_DIAGNOSTICS + tunnel)))
+
+    def test_inline_remount_does_not_cancel_active_tunnel_for_unchanged_app_session(self):
+        self.run_javascript(r'''
+const assert=require("node:assert/strict"),vm=require("node:vm");
+let refreshes=0,observed,cached;
+const account={id:"synthetic-account",userId:"synthetic-user",structure:"personal"};
+const sandbox={xr:async()=>cached,Ar:async()=>observed,l:async trigger=>{assert.equal(trigger,"app_session");refreshes++}};
+vm.createContext(sandbox);vm.runInContext(SOURCE+"globalThis.changed=safariSessionChanged",sandbox);
+(async()=>{
+  cached={apiKey:"synthetic-token",account}; observed={session:{accessToken:"synthetic-token",account}};
+  await sandbox.changed(); assert.equal(refreshes,0,"Remount must leave active browser RPCs running");
+  observed={session:{accessToken:"refreshed-token",account}};
+  await sandbox.changed(); assert.equal(refreshes,1);
+  observed={session:{accessToken:"synthetic-token",account:{...account,id:"another-account"}}};
+  await sandbox.changed(); assert.equal(refreshes,2);
+  observed={session:null}; await sandbox.changed(); assert.equal(refreshes,3);
+  cached=null; await sandbox.changed(); assert.equal(refreshes,4);
+})().catch(error=>{console.error(error);process.exitCode=1});
+'''.replace("SOURCE", json.dumps(module.APP_SESSION_CHANGED)))
 
 
 if __name__ == "__main__":
