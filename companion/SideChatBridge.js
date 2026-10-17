@@ -87,6 +87,8 @@ globalThis.__CHATGPT_SAFARI_ADAPTER_READY__ = (async () => {
   ]);
   let capabilities = {}, browserContext = { instanceId: null }, lastGestureAt = 0;
   let activeSearch = 0;
+  let mentionConnection, mentionQuery;
+  const stopTabMentions = () => { activeSearch++; mentionQuery = undefined; };
   const diagnostics = { outbound: {}, received: {}, failures: 0, scriptErrors: 0, unhandledRejections: 0 };
   window.addEventListener("error", () => { diagnostics.scriptErrors++; });
   window.addEventListener("unhandledrejection", () => { diagnostics.unhandledRejections++; });
@@ -122,6 +124,20 @@ globalThis.__CHATGPT_SAFARI_ADAPTER_READY__ = (async () => {
   }
   function validRecord(value) { return value != null && typeof value === "object" && !Array.isArray(value); }
   function validRequestId(value) { return typeof value === "string" && value.length > 0 && value.length <= 128; }
+  function validInvocation(value) {
+    return validRecord(value) && value.type === "browser_side_chat_prompt_prefill"
+      && Number.isSafeInteger(value.createdAtMs) && Date.now() - value.createdAtMs >= 0
+      && Date.now() - value.createdAtMs <= 300000
+      && (value.prompt !== undefined || value.selectedText !== undefined)
+      && (value.prompt === undefined || typeof value.prompt === "string" && value.prompt.trim().length > 0 && value.prompt.length <= 8192)
+      && (value.selectedText === undefined || typeof value.selectedText === "string" && value.selectedText.trim().length > 0 && value.selectedText.length <= 80000);
+  }
+  function composerIsEmpty() {
+    const composer = document.querySelector?.("#prompt-textarea");
+    if (!composer || composer.isConnected === false) return false;
+    const text = typeof composer.value === "string" ? composer.value : composer.innerText ?? composer.textContent;
+    return typeof text === "string" && text.trim().length === 0;
+  }
   function publish(payload) {
     if (!validRecord(payload) || typeof payload.type !== "string") return;
     diagnostics.received[payload.type] = (diagnostics.received[payload.type] || 0) + 1;
@@ -146,10 +162,12 @@ globalThis.__CHATGPT_SAFARI_ADAPTER_READY__ = (async () => {
         throw new Error("The native side-chat document is not available");
       }
       siteAdapter.connections++;
+      mentionConnection = this;
       this.authScope = getAuthScope;
       this.listeners = new Set(); this.pending = new Set(); this.generation = 0;
       this.disposed = false; this.waiters = 0; this.currentContext = undefined;
       this.openAllowed = false; this.invocation = undefined; this.invocationListener = undefined;
+      this.invocationVersion = 0; this.invocationLoading = false; this.authState = undefined;
       this.message = event => {
         if (event.source !== window || event.origin !== location.origin || !event.isTrusted) return;
         const payload = event.data;
@@ -157,7 +175,11 @@ globalThis.__CHATGPT_SAFARI_ADAPTER_READY__ = (async () => {
           this.invalidate(new ContextInvalidated("The side-chat context changed"));
           if (this.waiters === 0) void this.getContext().catch(() => {});
         } else if (payload?.type === "browser_side_chat_prompt_prefill") {
-          this.invocation = payload; this.deliverInvocation();
+          if (validInvocation(payload)) { this.invocation = payload; this.invocationScope = this.authScope(); this.deliverInvocation(); }
+        } else if (payload?.type === "browser_side_chat_invocation_available") {
+          this.invocationVersion++; void this.refreshInvocation();
+        } else if (payload?.type === "browser_tab_mentions_invalidated") {
+          if (mentionConnection === this && mentionQuery) void refreshTabMentions(mentionQuery);
         } else if (payload?.type === "update" && validRecord(payload.status)) {
           this.status = payload.status; this.notify();
         } else if (payload?.type === "browser_side_chat_capabilities") {
@@ -166,9 +188,11 @@ globalThis.__CHATGPT_SAFARI_ADAPTER_READY__ = (async () => {
       };
       this.pageHide = () => { this.disposed = true; this.invalidate(); };
       this.pageShow = event => { if (event.persisted) { this.disposed = false; this.invalidate(); void this.getContext().catch(() => {}); } };
+      this.composerInput = () => this.deliverInvocation();
       window.addEventListener("message", this.message);
       window.addEventListener("pagehide", this.pageHide);
       window.addEventListener("pageshow", this.pageShow);
+      document.addEventListener("input", this.composerInput, true);
     }
     get confirmed() { return this.currentContext != null; }
     get context() { return this.currentContext; }
@@ -179,6 +203,7 @@ globalThis.__CHATGPT_SAFARI_ADAPTER_READY__ = (async () => {
     subscribe(listener) { this.listeners.add(listener); listener(); return () => this.listeners.delete(listener); }
     subscribeOpenInvocation(listener) {
       this.invocationListener = listener; this.deliverInvocation();
+      void this.refreshInvocation();
       return () => { if (this.invocationListener === listener) this.invocationListener = undefined; };
     }
     notify() { for (const listener of this.listeners) listener(); }
@@ -253,21 +278,50 @@ globalThis.__CHATGPT_SAFARI_ADAPTER_READY__ = (async () => {
     }
     setAuthState(state) {
       if (this.disposed || !["expired", "logout_requested", "signed_in", "signed_out"].includes(state)) return;
-      if (state !== "signed_in") { this.invocation = undefined; this.invalidate(); }
+      this.authState = state;
+      if (state !== "signed_in") {
+        this.invocation = undefined; this.invocationScope = undefined; this.invalidate();
+        if (mentionConnection === this) stopTabMentions();
+      }
       void request("authStateChanged", { state }).catch(() => {});
+      if (state === "signed_in") void this.refreshInvocation();
+    }
+    async refreshInvocation() {
+      if (!relayMode || this.disposed || !this.invocationListener || this.invocationLoading || this.authState !== "signed_in") return;
+      const scope = this.authScope(), version = this.invocationVersion;
+      if (scope == null) return;
+      this.invocationLoading = true;
+      try {
+        const result = await request("openInvocation", {});
+        if (this.disposed || this.authState !== "signed_in" || scope !== this.authScope()) return;
+        if (validInvocation(result?.invocation)) {
+          this.invocation = result.invocation; this.invocationScope = scope; this.deliverInvocation();
+        }
+      } catch { /* A disconnected owner never replays a consumed invocation. */ }
+      finally {
+        this.invocationLoading = false;
+        if (version !== this.invocationVersion) void this.refreshInvocation();
+      }
     }
     deliverInvocation() {
       if (this.disposed || !this.invocationListener || !this.invocation) return;
-      const invocation = this.invocation; this.invocation = undefined;
+      const invocation = this.invocation;
       const age = Date.now() - invocation.createdAtMs;
-      if (age >= 0 && age <= 300000) this.invocationListener(invocation);
+      if (age < 0 || age > 300000 || this.invocationScope !== this.authScope()) { this.invocation = undefined; return; }
+      // The original invocation callback sets composer text. Wait while a
+      // restored draft or newly typed input exists instead of overwriting it.
+      if (!composerIsEmpty()) return;
+      this.invocation = undefined;
+      this.invocationListener(invocation);
     }
     dispose() {
       this.disposed = true; this.invalidate(); this.listeners.clear(); this.invocation = undefined;
+      if (mentionConnection === this) { stopTabMentions(); mentionConnection = undefined; }
       this.invocationListener = undefined;
       window.removeEventListener("message", this.message);
       window.removeEventListener("pagehide", this.pageHide);
       window.removeEventListener("pageshow", this.pageShow);
+      document.removeEventListener?.("input", this.composerInput, true);
     }
   }
   async function installSiteAdapter() {
@@ -414,8 +468,31 @@ globalThis.__CHATGPT_SAFARI_ADAPTER_READY__ = (async () => {
       publishStatus();
     }).catch(() => {});
   });
-  window.addEventListener("chatgpt-extension-stop-browser-tabs", () => { activeSearch++; });
-  window.addEventListener("pagehide", () => { activeSearch++; });
+  window.addEventListener("chatgpt-extension-stop-browser-tabs", stopTabMentions);
+  window.addEventListener("pagehide", stopTabMentions);
+  async function refreshTabMentions(search) {
+    if (search !== mentionQuery || search.id !== activeSearch) return;
+    if (search.connection !== mentionConnection
+      || mentionConnection?.disposed || search.scope !== mentionConnection?.authScope()) { stopTabMentions(); return; }
+    if (search.loading) { search.changed = true; return; }
+    search.loading = true;
+    search.changed = false;
+    try {
+      const result = await request("tabMentions", { query: search.query, limit: search.limit });
+      if (search !== mentionQuery || search.id !== activeSearch || search.connection !== mentionConnection
+        || mentionConnection?.disposed || search.scope !== mentionConnection?.authScope()) return;
+      const candidates = Array.isArray(result?.candidates) ? result.candidates : [];
+      const root = document.documentElement;
+      if (!root) return;
+      root.setAttribute("data-chatgpt-extension-browser-tabs", JSON.stringify(candidates));
+      try { window.dispatchEvent(new Event("chatgpt-extension-browser-tabs")); }
+      finally { root.removeAttribute("data-chatgpt-extension-browser-tabs"); }
+    } catch { /* A closed owner cannot publish another profile's candidates. */ }
+    finally {
+      search.loading = false;
+      if (search.changed && search === mentionQuery) void refreshTabMentions(search);
+    }
+  }
   window.addEventListener("chatgpt-extension-request-browser-tab-mentions", event => {
     const detail = event instanceof CustomEvent ? event.detail : null;
     if (!validRecord(detail) || Object.keys(detail).some(key => !["query", "limit"].includes(key))
@@ -423,16 +500,9 @@ globalThis.__CHATGPT_SAFARI_ADAPTER_READY__ = (async () => {
       || !Number.isSafeInteger(detail.limit) || detail.limit < 0 || detail.limit > 100
       || Date.now() - lastGestureAt >= 5000 || lastGestureAt === 0
       || capabilities["browserTabMentions.search"] !== true) return;
-    const search = ++activeSearch;
-    void request("tabMentions", { query: detail.query, limit: detail.limit }).then(result => {
-      if (search !== activeSearch) return;
-      const candidates = Array.isArray(result?.candidates) ? result.candidates : [];
-      const root = document.documentElement;
-      if (!root) return;
-      root.setAttribute("data-chatgpt-extension-browser-tabs", JSON.stringify(candidates));
-      try { window.dispatchEvent(new Event("chatgpt-extension-browser-tabs")); }
-      finally { root.removeAttribute("data-chatgpt-extension-browser-tabs"); }
-    }).catch(() => {});
+    if (!mentionConnection || mentionConnection.disposed || mentionConnection.authScope() == null) return;
+    const search = mentionQuery = { id: ++activeSearch, connection: mentionConnection, scope: mentionConnection.authScope(), query: detail.query, limit: detail.limit };
+    void refreshTabMentions(search);
   });
   const api = Object.freeze({
     receive(payload) {

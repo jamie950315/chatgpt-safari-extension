@@ -212,7 +212,11 @@
     }
 
     async function closeState(state, reason, alreadyUnmounted = false) {
-      if (agentSelection?.owner === state) agentSelection.cancelled = true;
+      if (agentSelection?.owner === state) {
+        agentSelection.cancelled = true;
+        clearTimeout(agentSelection.dialogTimer);
+        if (!agentSelection.inUse) agentSelection = undefined;
+      }
       if (usesContent && !alreadyUnmounted) await unmountContent(state);
       if (options.companion) await options.companion.close(state);
       const created = mediaTabs.get(state.instanceId);
@@ -270,6 +274,21 @@
       const selection = await serialize(async () => {
         const owner = Array.from(openByWindow.values()).find(state => state.instanceId === ownerToken);
         if (!embedded || !owner) throw new Error("The Safari agent no longer owns its inline sidebar");
+        if (agentSelection?.dialogHeld && !agentSelection.inUse) {
+          const pending = agentSelection;
+          if (pending.cancelled || Date.now() >= pending.dialogDeadline) {
+            clearTimeout(pending.dialogTimer);
+            agentSelection = undefined;
+            throw Object.assign(new Error("The dialog selection expired or changed. Inspect the current page; no input was repeated."), { code: "FOCUS_CHANGED" });
+          }
+          if (scope.action !== pending.dialogKind || pending.owner !== owner || pending.targetTab.id !== targetTab.id
+            || pending.targetTab.windowId !== targetTab.windowId || pending.targetTab.url !== targetTab.url) {
+            throw new Error("Respond to the current JavaScript dialog before selecting another agent target");
+          }
+          pending.assertCurrent();
+          pending.inUse = true;
+          return pending;
+        }
         if (agentSelection) throw new Error("Another Safari agent selection is in progress");
         const nativeGroupMove = NATIVE_GROUP_MOVES.has(scope.nativeGroupMove) ? scope.nativeGroupMove : undefined;
         if (owner.tabId === targetTab.id && !nativeGroupMove) return null;
@@ -277,7 +296,7 @@
         if (current.windowId !== owner.windowId || current.incognito || !/^https?:\/\//iu.test(current.url || "")) {
           throw new Error("The Safari agent sidebar owner is no longer available");
         }
-        const value = { owner, ownerTab: current, targetTab, expected: [], cancelled: false, expectedWindow: targetTab.windowId };
+        const value = { owner, ownerTab: current, targetTab, expected: [], cancelled: false, expectedWindow: targetTab.windowId, inUse: true };
         value.assertCurrent = () => {
           if (value.cancelled || agentSelection !== value || openByWindow.get(owner.windowId) !== owner) {
             const error = new Error("Safari selection changed during the agent command. Read the current page before continuing; do not repeat input.");
@@ -295,6 +314,25 @@
           }
           await api.windows.update(tab.windowId, { focused: true });
           value.assertCurrent();
+        };
+        value.holdDialog = (kind = "dialog") => {
+          value.assertCurrent();
+          if (!["dialog", "filechooser"].includes(kind)) throw new Error("Unsupported native modal selection");
+          if (value.dialogHeld) return;
+          value.dialogHeld = true;
+          value.dialogKind = kind;
+          value.dialogDeadline = Date.now() + 5 * 60 * 1000;
+          value.dialogTimer = setTimeout(() => {
+            // Expiry never answers a modal or steals focus back to its owner.
+            value.cancelled = true;
+            if (!value.inUse && agentSelection === value) agentSelection = undefined;
+          }, 5 * 60 * 1000);
+          value.dialogTimer?.unref?.();
+        };
+        value.releaseDialog = () => {
+          value.assertCurrent();
+          value.dialogHeld = false;
+          clearTimeout(value.dialogTimer);
         };
         value.runNativeGroupMove = async (action, perform) => {
           value.assertCurrent();
@@ -484,7 +522,7 @@
         // Do not attempt to switch native groups for an owner that was moved.
         const movedOwner = selection.verifiedNativeSelection && selection.owner.tabId === targetTab.id;
         const restoredOwner = selection.verifiedNativeSelection?.tabId === selection.owner.tabId;
-        if (!selection.cancelled && !movedOwner && !restoredOwner && openByWindow.get(selection.owner.windowId) === selection.owner) {
+        if (!selection.dialogHeld && !selection.cancelled && !movedOwner && !restoredOwner && openByWindow.get(selection.owner.windowId) === selection.owner) {
           const verified = selection.owner.tabId !== targetTab.id ? selection.verifiedNativeSelection : undefined;
           try {
             const current = await api.tabs.get(verified?.tabId ?? targetTab.id);
@@ -493,7 +531,14 @@
               && current.title === verified.title && current.url === verified.url);
             if (current.active && window.focused && unchanged) {
               const owner = await api.tabs.get(selection.owner.tabId);
-              if (owner.windowId === selection.owner.windowId) await selection.select(owner);
+              if (owner.windowId === selection.owner.windowId) {
+                await selection.select(owner);
+                selection.assertCurrent();
+                if (typeof scope.afterOwnerRestored === "function") {
+                  await scope.afterOwnerRestored(owner);
+                  selection.assertCurrent();
+                }
+              }
             }
           } catch (error) {
             if (verified) {
@@ -505,7 +550,11 @@
         }
         return result;
       } finally {
-        if (agentSelection === selection) agentSelection = undefined;
+        selection.inUse = false;
+        if (!selection.dialogHeld || selection.cancelled) {
+          clearTimeout(selection.dialogTimer);
+          if (agentSelection === selection) agentSelection = undefined;
+        }
       }
     }
 

@@ -3,7 +3,8 @@ import Darwin
 
 /// Writes bounded downloads received from the owning ordinary-profile page.
 /// The live broker validates operation, profile, session, and owner before every
-/// call. This class receives bytes only, never browser credentials or fetch URLs.
+/// call. This class receives bytes and asset-manifest metadata, never browser
+/// credentials or instructions to fetch URLs.
 /// All methods run on the containing app's serial download I/O queue.
 final class SafariDownloadWriter {
     static let maximumBytes = 32 * 1024 * 1024
@@ -12,13 +13,23 @@ final class SafariDownloadWriter {
         let id: String
         let operationID: String
         let filename: String
+        let directory: URL
+        let bundleID: String?
         let partial: URL
         let descriptor: Int32
         var bytes = 0
         var sequence = 0
     }
+    private struct Bundle {
+        let id: String
+        let operationID: String
+        let directory: URL
+        var files: Set<String> = []
+        var bytes = 0
+    }
     private let directory: URL
     private var transfers: [String: Transfer] = [:]
+    private var bundles: [String: Bundle] = [:]
 
     init(directory: URL = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Downloads", isDirectory: true)) {
         self.directory = directory
@@ -33,17 +44,80 @@ final class SafariDownloadWriter {
                 }
             }
             try requireAuthorization()
+            if input["action"] as? String == "bundleBegin" {
+                guard !bundles.values.contains(where: { $0.operationID == operationID }),
+                      !transfers.values.contains(where: { $0.operationID == operationID }) else {
+                    throw Failure("INVALID_BUNDLE", "This operation already owns an active download or asset bundle.")
+                }
+                let id = UUID().uuidString
+                let destination = directory.appendingPathComponent("ChatGPT Page Assets \(id)", isDirectory: true)
+                try requireAuthorization()
+                guard mkdir(destination.path, S_IRWXU) == 0 else {
+                    throw Failure(errno == EACCES || errno == EPERM ? "DOWNLOAD_ACCESS_DENIED" : "DOWNLOAD_WRITE_FAILED",
+                                  "macOS could not create a private page-asset directory in Downloads.")
+                }
+                bundles[id] = Bundle(id: id, operationID: operationID, directory: destination)
+                var attributes = stat()
+                guard lstat(destination.path, &attributes) == 0, attributes.st_mode & S_IFMT == S_IFDIR,
+                      attributes.st_uid == getuid(), attributes.st_mode & 0o777 == 0o700 else {
+                    throw Failure("DOWNLOAD_WRITE_FAILED", "The private asset directory could not be verified.")
+                }
+                try requireAuthorization()
+                return Self.success(["bundleId": id, "directoryPath": destination.path])
+            }
+            if ["bundleFinish", "bundleCancel"].contains(input["action"] as? String ?? "") {
+                guard let id = input["bundleId"] as? String, let bundle = bundles[id], bundle.operationID == operationID else {
+                    throw Failure("STALE_DOWNLOAD", "This page-asset bundle no longer belongs to the live operation.")
+                }
+                if input["action"] as? String == "bundleCancel" {
+                    cancel(operationID: operationID)
+                    return Self.success(["cancelled": true, "completedFilesPreserved": true])
+                }
+                guard !transfers.values.contains(where: { $0.operationID == operationID }),
+                      let manifest = input["manifest"] as? [String: Any],
+                      let assets = manifest["assets"] as? [[String: Any]], manifest["failures"] is [[String: Any]],
+                      assets.allSatisfy({ ($0["path"] as? String).map(bundle.files.contains) == true }),
+                      JSONSerialization.isValidJSONObject(manifest) else {
+                    throw Failure("INVALID_BUNDLE", "A complete asset manifest must reference only files actually saved by this bundle.")
+                }
+                let data = try JSONSerialization.data(withJSONObject: manifest, options: [.prettyPrinted, .sortedKeys])
+                guard data.count <= 512 * 1024 else { throw Failure("INVALID_BUNDLE", "The page-asset manifest is too large.") }
+                let opened = try Self.unwrap(handle(["action": "begin", "filename": "manifest.json", "bundleId": id], operationID: operationID, isAuthorized: isAuthorized))
+                let transferID = opened["transferId"] as! String
+                var sequence = 0
+                for offset in stride(from: 0, to: data.count, by: Self.maximumChunkBytes) {
+                    let chunk = data.subdata(in: offset..<min(offset + Self.maximumChunkBytes, data.count))
+                    _ = try Self.unwrap(handle(["action": "append", "transferId": transferID, "sequence": sequence,
+                                                "data": chunk.base64EncodedString()], operationID: operationID, isAuthorized: isAuthorized))
+                    sequence += 1
+                }
+                let saved = try Self.unwrap(handle(["action": "finish", "transferId": transferID, "sequence": sequence,
+                                                      "expectedBytes": data.count], operationID: operationID, isAuthorized: isAuthorized))
+                bundles.removeValue(forKey: id)
+                return Self.success(["directoryPath": bundle.directory.path, "manifestPath": saved["path"]!])
+            }
             if input["action"] as? String == "begin" {
                 guard !transfers.values.contains(where: { $0.operationID == operationID }),
                       let filename = input["filename"] as? String else {
                     throw Failure("INVALID_DOWNLOAD", "A new download requires a filename and an unused operation.")
+                }
+                var destination = directory
+                let bundleID = input["bundleId"] as? String
+                if bundleID == nil && bundles.values.contains(where: { $0.operationID == operationID }) {
+                    throw Failure("INVALID_BUNDLE", "An asset-bundle operation must use its private bundle destination.")
+                }
+                if let bundleID {
+                    guard let bundle = bundles[bundleID], bundle.operationID == operationID, bundle.files.count < 256 else {
+                        throw Failure("STALE_DOWNLOAD", "The page-asset destination is no longer valid or exceeds 256 files.")
+                    }
+                    destination = bundle.directory
                 }
                 // Creating a new file in Downloads is an explicitly permitted
                 // macOS file-access path. Do not open/read the entire parent
                 // directory: that requests access to unrelated existing files
                 // and can wait for a separate system permission prompt.
                 let id = UUID().uuidString
-                let partial = directory.appendingPathComponent(".chatgpt-\(id).download")
+                let partial = destination.appendingPathComponent(".chatgpt-\(id).download")
                 try requireAuthorization()
                 let descriptor = open(partial.path, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, S_IRUSR | S_IWUSR)
                 guard descriptor >= 0 else {
@@ -51,7 +125,7 @@ final class SafariDownloadWriter {
                     throw Failure("DOWNLOAD_WRITE_FAILED", "Could not create a private download file.")
                 }
                 transfers[id] = Transfer(id: id, operationID: operationID, filename: Self.safeFilename(filename),
-                                         partial: partial, descriptor: descriptor)
+                                         directory: destination, bundleID: bundleID, partial: partial, descriptor: descriptor)
                 var attributes = stat()
                 guard fstat(descriptor, &attributes) == 0, attributes.st_mode & S_IFMT == S_IFREG,
                       attributes.st_uid == getuid(), fchmod(descriptor, S_IRUSR | S_IWUSR) == 0 else {
@@ -78,6 +152,12 @@ final class SafariDownloadWriter {
                       transfer.bytes <= Self.maximumBytes - data.count else {
                     discard(id)
                     throw Failure("DOWNLOAD_SIZE", "Download data is invalid or exceeds the 32 MiB limit. The incomplete file was discarded.")
+                }
+                if let bundleID = transfer.bundleID {
+                    guard let bundle = bundles[bundleID], bundle.operationID == operationID,
+                          bundle.bytes <= Self.maximumBytes - transfer.bytes - data.count else {
+                        throw Failure("DOWNLOAD_SIZE", "The page-asset bundle exceeds its combined 32 MiB limit.")
+                    }
                 }
                 try data.withUnsafeBytes { buffer in
                     var offset = 0
@@ -114,7 +194,7 @@ final class SafariDownloadWriter {
                 for index in 0..<10000 {
                     try requireAuthorization()
                     let filename = Self.collisionFilename(transfer.filename, index: index)
-                    let candidate = directory.appendingPathComponent(filename)
+                    let candidate = transfer.directory.appendingPathComponent(filename)
                     // Publish the owned partial by an atomic exclusive move,
                     // never by creating another hard-link alias. A file,
                     // directory, or symlink appearing here is not overwritten.
@@ -123,6 +203,9 @@ final class SafariDownloadWriter {
                 }
                 guard let saved else { throw Failure("DOWNLOAD_COLLISIONS", "There are too many downloads with this filename.") }
                 let bytes = transfer.bytes
+                if let bundleID = transfer.bundleID, var bundle = bundles[bundleID] {
+                    bundle.files.insert(saved.path); bundle.bytes += bytes; bundles[bundleID] = bundle
+                }
                 transfers.removeValue(forKey: id)
                 Darwin.close(transfer.descriptor)
                 return Self.success(["state": "complete", "path": saved.path, "filename": saved.lastPathComponent, "bytesWritten": bytes])
@@ -141,9 +224,18 @@ final class SafariDownloadWriter {
 
     func cancel(operationID: String) {
         for id in transfers.values.filter({ $0.operationID == operationID }).map(\.id) { discard(id) }
+        for bundle in bundles.values.filter({ $0.operationID == operationID }) {
+            bundles.removeValue(forKey: bundle.id)
+            // rmdir removes only our own empty directory. Completed files and
+            // any user-added files are never recursively deleted.
+            rmdir(bundle.directory.path)
+        }
     }
 
-    func close() { for id in Array(transfers.keys) { discard(id) } }
+    func close() {
+        for id in Array(transfers.keys) { discard(id) }
+        for bundle in Array(bundles.values) { bundles.removeValue(forKey: bundle.id); rmdir(bundle.directory.path) }
+    }
     deinit { close() }
 
     private func discard(_ id: String) {
@@ -181,6 +273,11 @@ final class SafariDownloadWriter {
 
     private struct Failure: Error { let code: String; let message: String
         init(_ code: String, _ message: String) { self.code = code; self.message = message }
+    }
+    private static func unwrap(_ value: [String: Any]) throws -> [String: Any] {
+        if value["ok"] as? Bool == true, let result = value["result"] as? [String: Any] { return result }
+        let error = value["error"] as? [String: Any]
+        throw Failure(error?["code"] as? String ?? "DOWNLOAD_WRITE_FAILED", error?["message"] as? String ?? "The asset bundle could not be completed.")
     }
     private static func success(_ value: [String: Any]) -> [String: Any] { ["ok": true, "result": value] }
 }

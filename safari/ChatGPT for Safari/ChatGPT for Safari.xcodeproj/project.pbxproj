@@ -7,6 +7,11 @@
 	objects = {
 
 /* Begin PBXBuildFile section */
+		A03001200010001000100001 /* SafariFileChooser.swift in Sources */ = {isa = PBXBuildFile; fileRef = A03001200010001000100002 /* SafariFileChooser.swift */; };
+		A03001400010001000100001 /* SafariViewport.swift in Sources */ = {isa = PBXBuildFile; fileRef = A03001400010001000100002 /* SafariViewport.swift */; };
+		A03001100010001000100001 /* SafariNotifications.swift in Sources */ = {isa = PBXBuildFile; fileRef = A03001100010001000100002 /* SafariNotifications.swift */; };
+		A03001000010001000100001 /* SafariBookmarks.swift in Sources */ = {isa = PBXBuildFile; fileRef = A03001000010001000100002 /* SafariBookmarks.swift */; };
+		A03000900010001000100001 /* SafariPersonalData.swift in Sources */ = {isa = PBXBuildFile; fileRef = A03000900010001000100002 /* SafariPersonalData.swift */; };
 		A03000700010001000100001 /* SafariDownloadWriter.swift in Sources */ = {isa = PBXBuildFile; fileRef = A03000700010001000100002 /* SafariDownloadWriter.swift */; };
 		A03000800010001000100001 /* SafariTabOrganization.swift in Sources */ = {isa = PBXBuildFile; fileRef = A03000800010001000100002 /* SafariTabOrganization.swift */; };
 		A03000600010001000100001 /* SafariLiveBroker.swift in Sources */ = {isa = PBXBuildFile; fileRef = A03000600010001000100002 /* SafariLiveBroker.swift */; };
@@ -73,6 +78,11 @@
 /* End PBXCopyFilesBuildPhase section */
 
 /* Begin PBXFileReference section */
+		A03001200010001000100002 /* SafariFileChooser.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "../../native/SafariFileChooser.swift"; sourceTree = SOURCE_ROOT; };
+		A03001400010001000100002 /* SafariViewport.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "../../native/SafariViewport.swift"; sourceTree = SOURCE_ROOT; };
+		A03001100010001000100002 /* SafariNotifications.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "../../native/SafariNotifications.swift"; sourceTree = SOURCE_ROOT; };
+		A03001000010001000100002 /* SafariBookmarks.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "../../native/SafariBookmarks.swift"; sourceTree = SOURCE_ROOT; };
+		A03000900010001000100002 /* SafariPersonalData.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "../../native/SafariPersonalData.swift"; sourceTree = SOURCE_ROOT; };
 		A03000700010001000100002 /* SafariDownloadWriter.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "../../native/SafariDownloadWriter.swift"; sourceTree = SOURCE_ROOT; };
 		A03000800010001000100002 /* SafariTabOrganization.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "../../native/SafariTabOrganization.swift"; sourceTree = SOURCE_ROOT; };
 		A03000600010001000100002 /* SafariLiveBroker.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "../../companion/SafariLiveBroker.swift"; sourceTree = SOURCE_ROOT; };
@@ -138,6 +148,11 @@
 			children = (
 				7D22E7F73081CAC000CD05F6 /* ChatGPT for Safari */,
 				A03000400010001000100002 /* SideChatBridge.js */,
+				A03000900010001000100002 /* SafariPersonalData.swift */,
+				A03001000010001000100002 /* SafariBookmarks.swift */,
+				A03001100010001000100002 /* SafariNotifications.swift */,
+				A03001200010001000100002 /* SafariFileChooser.swift */,
+				A03001400010001000100002 /* SafariViewport.swift */,
 				A03000500010001000100002 /* SafariLiveInput.swift */,
 				A03000600010001000100002 /* SafariLiveBroker.swift */,
 				A03000700010001000100002 /* SafariDownloadWriter.swift */,
@@ -343,6 +358,11 @@
 			isa = PBXSourcesBuildPhase;
 			files = (
 				7D22E8053081CAC000CD05F6 /* ViewController.swift in Sources */,
+				A03000900010001000100001 /* SafariPersonalData.swift in Sources */,
+				A03001000010001000100001 /* SafariBookmarks.swift in Sources */,
+				A03001100010001000100001 /* SafariNotifications.swift in Sources */,
+				A03001200010001000100001 /* SafariFileChooser.swift in Sources */,
+				A03001400010001000100001 /* SafariViewport.swift in Sources */,
 				A03000500010001000100001 /* SafariLiveInput.swift in Sources */,
 				A03000600010001000100001 /* SafariLiveBroker.swift in Sources */,
 				A03000700010001000100001 /* SafariDownloadWriter.swift in Sources */,
@@ -615,6 +635,7 @@
 					SafariServices,
 					"-framework",
 					WebKit,
+					"-lsqlite3",
 				);
 				PRODUCT_BUNDLE_IDENTIFIER = "dev.jamie.chatgpt-safari";
 				PRODUCT_NAME = "$(TARGET_NAME)";
@@ -659,6 +680,7 @@
 					SafariServices,
 					"-framework",
 					WebKit,
+					"-lsqlite3",
 				);
 				PRODUCT_BUNDLE_IDENTIFIER = "dev.jamie.chatgpt-safari";
 				PRODUCT_NAME = "$(TARGET_NAME)";

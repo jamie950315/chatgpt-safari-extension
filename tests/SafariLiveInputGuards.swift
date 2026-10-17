@@ -46,6 +46,29 @@ struct SafariLiveInputGuards {
         rejects("INVALID_ARGUMENTS") { _ = try request(["action": "scroll", "deltaY": 0]) }
         rejects("INVALID_ARGUMENTS") { _ = try request(["action": "scroll", "deltaX": 10_001]) }
         _ = try request(["action": "scroll", "deltaY": 300])
+        rejects("UNSUPPORTED_KEY") { _ = try request(["action": "key", "key": "q", "modifiers": ["Meta"]]) }
+        rejects("UNSUPPORTED_KEY") { _ = try request(["action": "key", "key": "l", "modifiers": ["Meta"]]) }
+        for key in ["Meta+w", "Meta+Shift+c", "Meta+Shift+Backspace", "Meta+Alt+ArrowRight", "Control+ArrowLeft", "Control+Space", "Control+Tab", "Control+Alt+q"] {
+            rejects("UNSUPPORTED_KEY") { _ = try request(["action": "key", "key": key]) }
+        }
+        _ = try request(["action": "key", "key": "Meta+Shift+z"])
+        _ = try request(["action": "key", "key": "Alt+Shift+ArrowLeft"])
+        _ = try request(["action": "key", "key": "ControlOrMeta+a"])
+        _ = try request(["clickCount": 2, "button": "right", "modifiers": ["Shift"]])
+        rejects("INVALID_ARGUMENTS") { _ = try request(["clickCount": 1.5]) }
+        rejects("INVALID_ARGUMENTS") { _ = try request(["clickCount": true]) }
+        rejects("INVALID_ARGUMENTS") { _ = try request(["modifiers": ["Hyper"]]) }
+        _ = try request(["action": "move"])
+        _ = try request(["action": "drag", "path": [["x": 600, "y": 400], ["x": 700, "y": 500]]])
+        rejects("INVALID_ARGUMENTS") { _ = try request(["action": "drag", "path": [["x": 601, "y": 400], ["x": 700, "y": 500]]]) }
+        rejects("INVALID_ARGUMENTS") { _ = try request(["action": "drag", "path": [["x": 600, "y": 400], ["x": 1200, "y": 500]]]) }
+        _ = try request(["action": "select", "options": [["label": "Blue", "index": 1]]])
+        _ = try request(["action": "select", "options": [], "multiple": true])
+        rejects("INVALID_ARGUMENTS") { _ = try request(["action": "select", "options": []]) }
+        rejects("INVALID_ARGUMENTS") { _ = try request(["action": "select", "options": [["label": "Blue", "index": true]]]) }
+        rejects("INVALID_ARGUMENTS") { _ = try request(["action": "select", "multiple": true, "options": [["label": "Red", "index": 0], ["label": "Blue", "index": 0]]]) }
+        _ = try SafariLiveInput.captureClip(["x": 1, "y": 2, "width": 200, "height": 100], viewport: CGSize(width: 1200, height: 800))
+        rejects("INVALID_ARGUMENTS") { _ = try SafariLiveInput.captureClip(["x": 1, "y": 2, "width": 1200, "height": 100], viewport: CGSize(width: 1200, height: 800)) }
 
         let window = CGRect(x: -1300, y: 25, width: 1200, height: 900)
         let visible = CGRect(x: -1300, y: 125, width: 1200, height: 800)
@@ -104,7 +127,15 @@ struct SafariLiveInputGuards {
         let mouse = SafariLiveInput.InputState(flags: [], leftMouseDown: true, rightMouseDown: false)
         precondition(mouse.active && mouse.heldModifiers.isEmpty)
         precondition(mouse.data["leftMouseDown"] as? Bool == true)
-        precondition(mouse.data.count == 3, "Input diagnostics must not contain typed keys or text.")
+        precondition(mouse.data.count == 4, "Input diagnostics must not contain typed keys or text.")
+        precondition(SafariLiveInput.InputState(flags: [], leftMouseDown: false, rightMouseDown: false, middleMouseDown: true).active)
+        var cancelled: [String: Any]?
+        let input = SafariLiveInput()
+        input.handle(base, isAuthorized: { false }) { cancelled = $0 }
+        let deadline = Date().addingTimeInterval(3)
+        while cancelled == nil, Date() < deadline { _ = RunLoop.current.run(mode: .default, before: Date().addingTimeInterval(0.01)) }
+        precondition((cancelled?["error"] as? [String: Any])?["code"] as? String == "STALE_OPERATION")
+        precondition((cancelled?["error"] as? [String: Any])?["eventsPosted"] as? Int == 0)
         print("Safari live native input/focus target guards, safe keys, viewport mapping, and Unicode event chunks passed. No activation or input events were posted.")
     }
 }

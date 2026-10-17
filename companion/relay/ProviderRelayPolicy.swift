@@ -201,6 +201,26 @@ struct ProviderRelayPolicy {
         return Self.staticAssetPath(parts.percentEncodedPath)
     }
 
+    /// A browser reload uses the deliberately clean document URL, not fetch's
+    /// capability header. Keep that request unauthorized; only its inert error
+    /// document may ask the exact containing wrapper for a fresh native entry.
+    func documentRecoveryParent(for request: ProviderRelayRequest, enabled: Bool) -> String? {
+        guard enabled, Self.validParent(parentExtensionOrigin), request.method == "GET", request.body.isEmpty,
+              request.headers["x-chatgpt-relay"] == nil,
+              request.headers["accept"]?.lowercased().contains("text/html") == true,
+              request.headers["sec-fetch-dest"].map({ $0 == "iframe" }) ?? true,
+              let local = URLComponents(string: localOrigin + request.target),
+              !(local.queryItems ?? []).contains(where: { $0.name == providerRelayKeyParameter || $0.name == providerRelayInlineParameter }),
+              let rejection = rejection(for: request, enabled: enabled), rejection.0 == 401,
+              rejection.1 == "The provider capability is invalid",
+              let upstream = upstreamURL(request.target), upstream.scheme == mainOrigin.scheme,
+              upstream.host == mainOrigin.host, upstream.port == mainOrigin.port,
+              var official = URLComponents(url: upstream, resolvingAgainstBaseURL: false) else { return nil }
+        official.scheme = "https"; official.host = "chatgpt.com"; official.port = nil
+        guard let url = official.url, Self.validConversation(url) else { return nil }
+        return parentExtensionOrigin
+    }
+
     static func staticAssetPath(_ path: String) -> Bool {
         path.range(of: #"^/cdn/assets/(?:[A-Za-z0-9_-]+[.-][A-Za-z0-9._-]+\.(?:js|css|woff2|woff|svg|png|webp|ico)|async/[A-Za-z0-9_-]+[.-][A-Za-z0-9._-]+\.js)$"#, options: .regularExpression) != nil
     }

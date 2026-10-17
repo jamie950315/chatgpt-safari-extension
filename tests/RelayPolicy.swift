@@ -37,6 +37,20 @@ import Foundation
         precondition(policy.rejection(for: request("/__chatgpt/upstream/chatgpt.com%2f.attacker.invalid/"), enabled: true)?.0 == 403)
         precondition(policy.rejection(for: request(headers: ["upgrade": "websocket"]), enabled: true)?.0 == 501)
         precondition(policy.rejection(for: request(), enabled: false)?.0 == 503)
+        let reload = ProviderRelayRequest(method: "GET", target: "/c/fixture?surface=browser_side_chat",
+            headers: ["host": "chatgpt-provider-fixture.localhost:34567", "accept": "text/html,application/xhtml+xml", "sec-fetch-dest": "iframe"], body: Data())
+        precondition(policy.rejection(for: reload, enabled: true)?.0 == 401, "Reload stays unauthorized until the wrapper obtains a fresh entry")
+        precondition(policy.documentRecoveryParent(for: reload, enabled: true) == parent)
+        precondition(policy.documentRecoveryParent(for: reload, enabled: false) == nil)
+        for invalid in [ProviderRelayRequest(method: "POST", target: reload.target, headers: reload.headers, body: Data()),
+                        ProviderRelayRequest(method: "GET", target: "/backend-api/me", headers: reload.headers, body: Data()),
+                        ProviderRelayRequest(method: "GET", target: "/api/auth/session", headers: reload.headers, body: Data()),
+                        ProviderRelayRequest(method: "GET", target: "/?__chatgpt_key=wrong", headers: reload.headers, body: Data()),
+                        ProviderRelayRequest(method: "GET", target: reload.target, headers: reload.headers.merging(["origin": "https://attacker.invalid"]) { _, new in new }, body: Data()),
+                        ProviderRelayRequest(method: "GET", target: reload.target, headers: reload.headers.merging(["sec-fetch-dest": "script"]) { _, new in new }, body: Data()),
+                        ProviderRelayRequest(method: "GET", target: reload.target, headers: reload.headers.merging(["accept": "application/json"]) { _, new in new }, body: Data())] {
+            precondition(policy.documentRecoveryParent(for: invalid, enabled: true) == nil)
+        }
         func publicAsset(_ path: String) -> Bool {
             policy.publicStatic(ProviderRelayRequest(method: "GET", target: path, headers: [:], body: Data()))
         }

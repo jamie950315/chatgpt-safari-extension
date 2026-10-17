@@ -16,6 +16,11 @@ This is a development-signed conversion of Chrome extension 1.26.1005.11759.
 - `companion/relay/` is a provider-only HTTPS relay adapted from Margina. Keep its
   loopback/Host/Origin/capability, framing, MIME, redirect, and streaming checks.
   Provider scripts never execute in the privileged extension wrapper.
+- A clean provider document reload cannot inherit fetch capability headers.
+  Missing-capability HTML stays a 401 and may send only a content-free recovery
+  signal to its exact wrapper. Re-entry must retain the same account/provider
+  scope; never refresh the session to hide this failure, put keys in storage or
+  cookies, or expose a bridge token in the error document.
 - Establish the exact-frame provider channel from its capability-bound document
   readiness signal before original entry initialization. Waiting for iframe
   `load` deadlocks the original context loader when module compilation delays it.
@@ -67,6 +72,28 @@ This is a development-signed conversion of Chrome extension 1.26.1005.11759.
   consent, claimed-tab leases, session/turn scope, and owner cancellation. The
   executor calls the same ordinary-profile live backend internally; it does not
   start safaridriver or fake CDP responses. Unsupported APIs stay disabled.
+- The packaged upstream selector helper runs statically in ISOLATED worlds;
+  preserve real frame sender/document chains for cross-origin locators. Never
+  move upstream `Dc` into MAIN: its required realm lockdown freezes page
+  intrinsics. Public Safari AppleEvents cannot select an isolated realm.
+- Clipboard state belongs to the original session, not the OS clipboard.
+  Intercept clipboard chords in every DOM/CUA/locator key route. Console capture
+  starts at claim, is bounded to the active turn/five minutes, and must be
+  released on account/owner/turn teardown. Asset bundles use the existing
+  operation-bound private writer and original consent, not fabricated paths.
+- History uses trusted SFExtensionProfileKey observations and exact read-only
+  metadata/store binding. Unknown mappings never select a default store.
+  Bookmarks use a capability-addressed inert temporary page and native editor;
+  preserve the owning sidebar and never write Safari's live plist. Row handles
+  bind native identity, profile, and account epoch.
+- `SafariFileChooser` accepts only a native-opened panel and its exact observed
+  DOM input/profile/document/owner/session/turn lease. Keep original upload
+  approval, native file/path readback, and no-replay outcomes. Never substitute
+  DOM file assignments or guessed inputs. Native input authorization is checked
+  again after serial-queue admission and before later events.
+- Notifications use the containing app's real UserNotifications authorization
+  and scheduling acknowledgment. Only an explicit diagnostics button requests
+  permission; no silent empty successes or invented display receipts.
 - Chat tab mentions retain the original consent-gated `executeTabRead` extractor.
   Use its existing 80,000-character traversal/output bounds; do not replace Chat
   requests or turn the owner-only `tabContext` event into cross-tab page access.
@@ -123,6 +150,10 @@ This is a development-signed conversion of Chrome extension 1.26.1005.11759.
   without replaying it. Page keys require an already focused node. A loading
   document keeps its real tab handle and completed inputs (`pagePending`), not
   an error that invites repeating a delivered navigation.
+- Native modal inspection includes attached AXSheets, not only AXChildren.
+  Fixed native input receipts distinguish dispatch, native completion, extension
+  acknowledgment, and final resolution without logging page contents or tokens.
+  A callback timeout is an observation, never permission to replay an input.
 - `Resources/safari/sidebar-adapter.js` is the sole toolbar/sidebar state owner.
   Its companion binding brokers real Safari context/selection/tab mentions and
   releases ownership when the inline sidebar closes.

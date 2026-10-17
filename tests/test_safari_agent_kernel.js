@@ -52,6 +52,54 @@ test("a rejected download policy or failed preflight cannot start a transfer", a
     assert.deepEqual(events, failure === "preflight" ? ["safari_download_inspect"] : ["safari_download_inspect", "policy"]);
   }
 });
+test("page asset bundles approve the real page and each observed fetch origin before native writing", async () => {
+  const events = [], command = { type: "tab_page_assets_bundle", browser_id: "0", tab_id: "12", inventoryId: "inventory" };
+  const context = { clientInfo: { family: "safari" }, security: {
+    async ensurePageAssetDownloadAllowed(url) { events.push(["page", url]); },
+    async ensurePageAssetFallbackFetchAllowed(page, url) { events.push(["fetch", page, url]); },
+  }, api: { async executeUnhandledCommand(value) {
+    events.push([value.command.type]);
+    return value.command.type === "safari_assets_inspect" ? { pageUrl: "https://example.com/", assets: [
+      { id: "svg", inline: true, url: "inline-svg:svg" }, { id: "image", url: "https://cdn.example/image.png" }, { id: "font", url: "https://cdn.example/font.woff2" },
+    ] } : { directoryPath: "/Downloads/Bundle" };
+  } } };
+  assert.deepEqual(await dispatch(context, command, () => assert.fail("No CDP asset handler")), { directoryPath: "/Downloads/Bundle" });
+  assert.deepEqual(events.map(x => x[0]), ["safari_assets_inspect", "page", "fetch", "tab_page_assets_bundle"]);
+  context.security.ensurePageAssetDownloadAllowed = async () => { throw new Error("Asset policy denied"); };
+  await assert.rejects(dispatch(context, command, () => assert.fail("No CDP asset handler")), /policy denied/);
+});
+test("the original upload policy runs once after chooser validation and before native file selection", async () => {
+  const events = [], command = { type: "playwright_file_chooser_set_files", browser_id: "0", tab_id: "12", file_chooser_id: "real-native-chooser", files: ["/tmp/one", "/tmp/two"] };
+  const context = { clientInfo: { family: "safari" }, security: { async ensureFileUploadAllowed(id) { assert.equal(id, 12); events.push("policy"); } },
+    api: { async executeUnhandledCommand(value) { events.push(value.command.type); return {}; } } };
+  await dispatch(context, command, () => assert.fail("File selection must not enter Chrome's CDP executor"));
+  assert.deepEqual(events, ["safari_file_chooser_inspect", "policy", "playwright_file_chooser_set_files"]);
+  events.length = 0;
+  context.security.ensureFileUploadAllowed = async () => { events.push("policy"); throw new Error("Original upload denied"); };
+  await assert.rejects(dispatch(context, command, () => assert.fail("No CDP")), /Original upload denied/);
+  assert.deepEqual(events, ["safari_file_chooser_inspect", "policy"]);
+});
+test("content exports approve only the derived official source before starting source fetch or native writing", async () => {
+  for (const denied of [false, true]) {
+    const events = [], command = { type: "tab_content_export_gsuite", browser_id: "0", tab_id: "12", format: "pdf", href: "https://model-override.test/" };
+    const context = { clientInfo: { family: "safari" }, security: { async ensureDownloadAllowed(id, href) {
+      assert.equal(id, 12); assert.equal(href, "https://docs.google.com/document/d/id/export?format=pdf"); events.push("policy"); if (denied) throw new Error("Original download denied");
+    } }, api: { async executeUnhandledCommand(value) {
+      events.push(value.command.type);
+      if (value.command.type === "safari_content_export_inspect") return { href: "https://docs.google.com/document/d/id/export?format=pdf", exportId: "verified-export-id" };
+      assert.equal(value.command.exportId, "verified-export-id"); return { path: "/Downloads/real.pdf" };
+    } } };
+    const result = dispatch(context, command, () => assert.fail("No original CDP export or no-op filesystem"));
+    if (denied) await assert.rejects(result, /Original download denied/); else assert.deepEqual(await result, { path: "/Downloads/real.pdf" });
+    assert.deepEqual(events, ["safari_content_export_inspect", "policy", ...(denied ? [] : ["tab_content_export_gsuite"])]);
+  }
+});
+test("original browser viewport commands retain the security transport without requiring a model-selected tab ID", async () => {
+  const calls = [], command = { type: "browser_viewport_set", browser_id: "0", width: 1000, height: 700 };
+  const context = { clientInfo: { family: "safari" }, api: { async executeUnhandledCommand(value) { calls.push(value); return {}; } } };
+  assert.deepEqual(await dispatch(context, command, () => assert.fail("Viewport must not use Chrome emulation")), {});
+  assert.deepEqual(calls, [{ type: "browser_safari_command", command }]);
+});
 test("the original worker accepts only its dedicated capability-bound local sandbox URL", () => {
   const previous = globalThis.location;
   try {

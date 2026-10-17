@@ -65,6 +65,16 @@ return l("app_session");
 };'''
 
 REPLACEMENTS = {
+    'async createNotification(e){return await this.activateSession(e),await chrome.notifications.create({type:"basic",iconUrl:chrome.runtime.getURL("/images/icon128.png"),title:e.title,message:e.message})}':
+        ('async createNotification(e){return await this.activateSession(e),await globalThis.ChatGPTSafariNotifications.create(e)}', 1),
+    'async getBookmarks(e){return await this.activateSession(e),await chrome.bookmarks.getTree()}':
+        ('async getBookmarks(e){return await this.activateSession(e),await globalThis.ChatGPTSafariPersonalData.getBookmarks()}', 1),
+    'async getRecentlyClosedSessions(e){return await this.activateSession(e),await chrome.sessions.getRecentlyClosed()}':
+        ('async getRecentlyClosedSessions(e){await this.activateSession(e);throw new Error("Safari does not expose its recently closed session inventory through a public WebExtension API. No browsing-history substitute or fabricated restore handle is returned.")}', 1),
+    'async getTopSites(e){return await this.activateSession(e),await chrome.topSites.get()}':
+        ('async getTopSites(e){await this.activateSession(e);throw new Error("Safari does not expose its frequently visited Top Sites inventory through a public WebExtension API. Bookmarks and history rankings are different data and are not substituted.")}', 1),
+    'async getUserHistory(e){return await this.activateSession(e),await D_(e)}':
+        ('async getUserHistory(e){return await this.activateSession(e),await globalThis.ChatGPTSafariPersonalData.history(e)}', 1),
     'async function Ar(e){jn++;const t=AbortSignal.timeout(us),r=await fetch(`${qn}/api/auth/session`,{cache:"no-store",credentials:"include",redirect:"error",signal:e==null?t:AbortSignal.any([e,t])}),{status:n}=r;if(!r.ok)return{status:n,error:"http",retryAfterMs:ms(r)};let i;try{i=await r.json()}catch{return{status:n,error:"decode"}}if(typeof i=="object"&&i!=null&&!Array.isArray(i)&&Object.keys(i).length===0)return{status:n,session:null};try{const a=i;return a.error!=null||!a.accessToken.trim()?{status:n,error:"decode"}:{status:n,session:{accessToken:a.accessToken,account:ps(a.account,a.user.id),...typeof a.user.email=="string"?{email:a.user.email}:{}}}}catch{return{status:n,error:"decode"}}}':
         (BROWSER_SESSION_SOURCE, 1),
     'var Vs=3e4': (CLOUD_TUNNEL_DIAGNOSTICS + 'var Vs=3e4', 1),
@@ -97,7 +107,7 @@ REPLACEMENTS = {
     'function nc(){chrome.action.onClicked.addListener':
         ('function nc(){if(globalThis.ChatGPTSafariSidebar)return;chrome.action.onClicked.addListener', 1),
     'const f=new av(t);if(r)':
-        ('const f=new av(t);globalThis.ChatGPTSafariNativeManager=f;globalThis.ChatGPTSafariHooks={getInstanceId:Ce,getTabMentions:v=>l.getUserTabs(v)};if(r)', 1),
+        ('const f=new av(t);globalThis.ChatGPTSafariNativeManager=f;globalThis.ChatGPTSafariHooks={getInstanceId:Ce,getTabMentions:v=>l.getUserTabs(v),subscribeTabMentionsInvalidated:listener=>l.subscribeInvalidations(listener)};if(r)', 1),
     'async function Fv(e){let t;const r=a=>{t=a,ga=ga.then(async()=>{if(e.aborted||a!==t||a.kind===ar?.kind)return;ar=void 0;const s=await ec(a);if(e.aborted||a!==t)return;const o=s?a:At;await wa(o,!0),ar=o}).catch(()=>{console.warn("Failed to update Chrome side panel destination.")})},i=await zv();if(!e.aborted){i?.kind==="work_sidepanel"&&await wa(i);try{await Rr(Ws,(a,s,o)=>{s==="Ready"?r(Zl(o==null||a)):t=void 0},e)}catch{r({kind:"waiting_room"})}}}':
         ('async function Fv(e){if(!e.aborted){await ec({kind:"work_sidepanel"});await wa({kind:"work_sidepanel"},!0)}}', 1),
     'family:this.browserFamily,name:Te[this.browserFamily].shortDisplayName,version:':
@@ -169,7 +179,7 @@ if __name__ == "__main__":
     resources = TARGET.parent
     manifest = prepare_manifest(json.loads((ROOT / "vendor/manifest.safari-input.json").read_text()))
     (resources / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
-    adapters = ["native-transport.js", "diagnostics-background.js", "sidechat-preload-background.js", "companion-background.js", "downloads-background.js", "live-background.js", "management-background.js", "agent-background.js", "sidebar-adapter.js", "session-windows.js"]
+    adapters = ["native-transport.js", "diagnostics-background.js", "sidechat-preload-background.js", "companion-background.js", "notifications-background.js", "personal-data-background.js", "downloads-background.js", "viewport-background.js", "live-background.js", "management-background.js", "agent-background.js", "sidebar-adapter.js", "session-windows.js"]
     TARGET.write_text(sidebar_functions() + "\n".join((resources / "safari" / name).read_text() for name in adapters)
                       + "\n" + prepare_safari_agent.prepare_background(prepare(SOURCE.read_text())))
     prepare_safari_agent.prepare_resources(resources)

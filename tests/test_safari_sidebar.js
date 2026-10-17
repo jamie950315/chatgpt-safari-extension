@@ -132,6 +132,57 @@ test("an original-agent batch selects its target and restores the genuine sideba
   await assert.rejects(f.adapter.withAgentSelection("stale-owner", f.tabs.get(12), async () => {}), /no longer owns/);
 });
 
+test("viewport rollback page commit follows only a completed genuine owner restoration", async () => {
+  const f = fixture({ companion: { embedded: true, onClosed: event(), async open() {}, async close() {} } });
+  await f.adapter.sidePanel.open({ tabId: 11 });
+  const owner = f.messages[0].message, commits = [];
+  const scope = { action: "viewport", async afterOwnerRestored(tab) {
+    assert.equal(f.tabs.get(11).active, true);
+    assert.equal(tab.id, 11); commits.push(tab.url);
+  } };
+  await f.adapter.withAgentSelection(owner.instanceId, await f.api.tabs.get(12), async selection => {
+    await selection.select(await f.api.tabs.get(12)); return {};
+  }, scope);
+  assert.equal(commits.length, 1);
+  await assert.rejects(f.adapter.withAgentSelection(owner.instanceId, await f.api.tabs.get(12), async selection => {
+    await selection.select(await f.api.tabs.get(12)); throw new Error("uncertain native result");
+  }, scope), /uncertain native result/);
+  assert.equal(commits.length, 1, "A failed operation cannot authorize a new native return page");
+});
+
+test("a native JavaScript dialog retains only its exact owner and target until a confirmed response", async () => {
+  const f = fixture({ companion: { embedded: true, onClosed: event(), async open() {}, async close() {} } });
+  await f.adapter.sidePanel.open({ tabId: 11 });
+  const owner = f.messages[0].message;
+  await f.adapter.withAgentSelection(owner.instanceId, await f.api.tabs.get(12), async selection => {
+    await selection.select(await f.api.tabs.get(12));
+    selection.holdDialog();
+  });
+  assert.deepEqual(f.selections, [12], "a blocking modal must not trigger an owner-tab switch");
+  await assert.rejects(f.adapter.withAgentSelection(owner.instanceId, await f.api.tabs.get(12), async () => {}, { action: "interact" }), /Respond to/);
+  await assert.rejects(f.adapter.withAgentSelection(owner.instanceId, await f.api.tabs.get(11), async () => {}, { action: "dialog" }), /Respond to/);
+  await f.adapter.withAgentSelection(owner.instanceId, await f.api.tabs.get(12), async selection => {
+    selection.holdDialog();
+  }, { action: "dialog" });
+  assert.deepEqual(f.selections, [12]);
+  await f.adapter.withAgentSelection(owner.instanceId, await f.api.tabs.get(12), async selection => {
+    selection.releaseDialog();
+  }, { action: "dialog" });
+  assert.deepEqual(f.selections, [12, 11]);
+});
+
+test("a manually changed dialog selection is never restored or reused", async () => {
+  const f = fixture({ companion: { embedded: true, onClosed: event(), async open() {}, async close() {} } });
+  await f.adapter.sidePanel.open({ tabId: 11 });
+  const owner = f.messages[0].message;
+  await f.adapter.withAgentSelection(owner.instanceId, await f.api.tabs.get(12), async selection => {
+    await selection.select(await f.api.tabs.get(12)); selection.holdDialog();
+  });
+  f.api.windows.onFocusChanged.emit(44);
+  await assert.rejects(f.adapter.withAgentSelection(owner.instanceId, await f.api.tabs.get(12), async () => {}, { action: "dialog" }), { code: "FOCUS_CHANGED" });
+  assert.deepEqual(f.selections, [12]);
+});
+
 test("manual selection during an agent batch cancels it and does not restore or steal focus", async () => {
   const f = fixture({ companion: { embedded: true, onClosed: event(), async open() {}, async close() {} } });
   f.tabs.set(13, { id: 13, windowId: 3, url: "https://manual.example/", active: false });

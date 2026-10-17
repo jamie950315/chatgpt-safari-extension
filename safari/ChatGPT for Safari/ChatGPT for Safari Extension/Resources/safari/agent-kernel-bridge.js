@@ -2,13 +2,27 @@
 (function (root) {
   "use strict";
   const nativeCommands = new Set([
-    "dom_cua_get_visible_dom", "dom_cua_click", "dom_cua_type",
+    "dom_cua_get_visible_dom", "dom_cua_click", "dom_cua_double_click", "dom_cua_type",
     "dom_cua_keypress", "dom_cua_scroll", "dom_cua_download_media", "navigate_tab_url",
     "navigate_tab_back", "navigate_tab_forward", "navigate_tab_reload", "close_tab",
     "browser_management_call", "browser_management_get_audit_trail",
+    "browser_viewport_set", "browser_viewport_reset",
+    "tab_screenshot", "tab_get_js_dialog", "tab_handle_js_dialog",
+    "cua_click", "cua_double_click", "cua_drag", "cua_move", "cua_keypress", "cua_scroll", "cua_type", "cua_download_media",
+    "tab_clipboard_read", "tab_clipboard_read_text", "tab_clipboard_write", "tab_clipboard_write_text",
+    "tab_dev_logs",
+    "tab_page_assets_list", "tab_page_assets_bundle",
+    "playwright_dom_snapshot", "playwright_locator_click", "playwright_locator_dblclick", "playwright_locator_fill",
+    "playwright_locator_count", "playwright_locator_is_enabled", "playwright_locator_is_visible", "playwright_locator_press",
+    "playwright_locator_get_attribute", "playwright_locator_inner_text", "playwright_locator_all_text_contents",
+    "playwright_locator_press_sequentially", "playwright_locator_set_checked", "playwright_locator_text_content",
+    "playwright_locator_read_all", "playwright_locator_wait_for", "playwright_locator_select_option", "playwright_wait_for_load_state",
+    "playwright_wait_for_timeout", "playwright_wait_for_url", "playwright_locator_download_media",
+    "playwright_wait_for_file_chooser", "playwright_file_chooser_set_files",
+    "tab_content_export_gsuite", "tab_content_export_youtube_transcript",
   ]);
   const originalCommands = new Set([
-    "browser_user_open_tabs", "browser_user_claim_tab", "browser_user_get_tab_context",
+    "browser_user_open_tabs", "browser_user_claim_tab", "browser_user_get_tab_context", "browser_user_history",
     "get_tab", "list_tabs", "create_tab", "selected_tab", "mark_tab", "name_session",
   ]);
   let hostDocument;
@@ -23,20 +37,44 @@
       // Original inventory/claim handlers do not call the live executor. Bind
       // these reads and leases to the same real sidebar owner as native input.
       await context.api.executeUnhandledCommand({ type: "browser_safari_context" });
-      return original();
+      const result = await original();
+      if (["browser_user_claim_tab", "create_tab"].includes(command.type) && typeof result?.id === "string") {
+        await context.api.executeUnhandledCommand({ type: "browser_safari_command", command: { type: "safari_logs_start", browser_id: command.browser_id, tab_id: result.id } });
+      }
+      return result;
     }
     if (!nativeCommands.has(command.type)) throw new Error(`Safari does not support agent command "${command.type}".`);
-    if (typeof command.browser_id !== "string" || (!command.type.startsWith("browser_management_")
+    if (typeof command.browser_id !== "string" || (!command.type.startsWith("browser_management_") && !command.type.startsWith("browser_viewport_")
       && (!/^[1-9]\d*$/u.test(command.tab_id || "") || !Number.isSafeInteger(Number(command.tab_id))))) {
       throw new Error("A Safari agent command requires its browser and claimed tab IDs.");
     }
-    if (command.type === "dom_cua_download_media") {
+    if (["dom_cua_download_media", "playwright_locator_download_media", "cua_download_media"].includes(command.type)) {
       const link = await context.api.executeUnhandledCommand({ type: "browser_safari_command",
-        command: { ...command, type: "safari_download_inspect" } });
+        command: { ...command, type: "safari_download_inspect", sourceType: command.type } });
       // Keep original source/destination download consent and policy. Only the
       // inspected href, never a model-supplied override, reaches the transfer.
       await context.security.ensureDownloadAllowed(Number(command.tab_id), link.href);
       return context.api.executeUnhandledCommand({ type: "browser_safari_command", command: { ...command, href: link.href } });
+    }
+    if (command.type === "tab_page_assets_bundle") {
+      const selected = await context.api.executeUnhandledCommand({ type: "browser_safari_command", command: { ...command, type: "safari_assets_inspect" } });
+      await context.security.ensurePageAssetDownloadAllowed(selected.pageUrl);
+      const approved = new Set();
+      for (const asset of selected.assets) if (!asset.inline && !approved.has(new URL(asset.url).origin)) {
+        await context.security.ensurePageAssetFallbackFetchAllowed(selected.pageUrl, asset.url); approved.add(new URL(asset.url).origin);
+      }
+      return context.api.executeUnhandledCommand({ type: "browser_safari_command", command });
+    }
+    if (command.type === "playwright_file_chooser_set_files") {
+      await context.api.executeUnhandledCommand({ type: "browser_safari_command", command: { ...command, type: "safari_file_chooser_inspect" } });
+      await context.security.ensureFileUploadAllowed(Number(command.tab_id));
+      return context.api.executeUnhandledCommand({ type: "browser_safari_command", command });
+    }
+    if (["tab_content_export_gsuite", "tab_content_export_youtube_transcript"].includes(command.type)) {
+      const selected = await context.api.executeUnhandledCommand({ type: "browser_safari_command",
+        command: { ...command, type: "safari_content_export_inspect", exportType: command.type } });
+      await context.security.ensureDownloadAllowed(Number(command.tab_id), selected.href);
+      return context.api.executeUnhandledCommand({ type: "browser_safari_command", command: { ...command, exportId: selected.exportId } });
     }
     return context.api.executeUnhandledCommand({ type: "browser_safari_command", command });
   }

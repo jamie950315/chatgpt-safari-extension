@@ -98,9 +98,29 @@ function m(t,o,e){if(location.origin!==t||o!=null&&location.href!==o)return{sele
 (() => {
   const api = globalThis.browser || globalThis.chrome;
   api.runtime.onMessage.addListener((message, sender, respond) => {
+    if (["chatgpt-safari:notification-status", "chatgpt-safari:notification-request-permission"].includes(message?.type)) {
+      if (sender.id !== api.runtime.id || sender.url !== api.runtime.getURL("diagnostics.html")) return false;
+      const notifications = globalThis.ChatGPTSafariNotifications;
+      if (!notifications) {
+        respond({ ok: false, error: { code: "NOTIFICATIONS_UNAVAILABLE", message: "The app notification service is unavailable. Open the signed-in ChatGPT sidebar and try again." } });
+        return false;
+      }
+      const operation = message.type === "chatgpt-safari:notification-status" ? "status" : "requestPermission";
+      Promise.resolve().then(() => notifications[operation]()).then(
+        result => respond({ ok: true, result }),
+        error => respond({ ok: false, error: { code: error.code || "NOTIFICATION_FAILED", message: error.message } }),
+      );
+      return true;
+    }
     if (message?.type === "chatgpt-safari:transport-status" && sender.id === api.runtime.id
       && sender.url === api.runtime.getURL("diagnostics.html")) {
-      respond({ manager: globalThis.ChatGPTSafariNativeManager?.getStatus(), transport: globalThis.ChatGPTSafariNativeTransportStatus });
+      const methods = { captureVisibleTab: api.tabs?.captureVisibleTab, createWindow: api.windows?.create,
+        moveTab: api.tabs?.move, frames: api.webNavigation?.getAllFrames,
+        nativeBookmarks: api.bookmarks?.getTree, nativeHistory: api.history?.search,
+        notifications: api.notifications?.create, recentlyClosed: api.sessions?.getRecentlyClosed,
+        topSites: api.topSites?.get };
+      respond({ manager: globalThis.ChatGPTSafariNativeManager?.getStatus(), transport: globalThis.ChatGPTSafariNativeTransportStatus,
+        safariAPIs: Object.fromEntries(Object.entries(methods).map(([name, value]) => [name, typeof value === "function"])) });
       return false;
     }
     if (message?.type !== "chatgpt-safari:open-diagnostics" || sender.id !== api.runtime.id
@@ -168,6 +188,45 @@ function m(t,o,e){if(location.origin!==t||o!=null&&location.href!==o)return{sele
     let owner;
     let polling = false;
     let timer;
+    let ownerContext;
+    let invocation;
+    let mentionObservation;
+    let invocationQueue = Promise.resolve();
+    const invocationKey = tabId => `codexWorkSidePanelInvocation:${tabId}`;
+    function validInvocation(value) {
+      return value && typeof value === "object" && !Array.isArray(value)
+        && value.type === "browser_side_chat_prompt_prefill"
+        && Number.isSafeInteger(value.createdAtMs) && Date.now() - value.createdAtMs >= 0
+        && Date.now() - value.createdAtMs <= 300000
+        && (value.prompt !== undefined || value.selectedText !== undefined)
+        && (value.prompt === undefined || typeof value.prompt === "string" && value.prompt.trim().length > 0 && value.prompt.length <= 8192)
+        && (value.selectedText === undefined || typeof value.selectedText === "string" && value.selectedText.trim().length > 0 && value.selectedText.length <= 80000);
+    }
+    async function clearInvocation(state) {
+      if (invocation?.state === state) invocation = undefined;
+      if (!embedded) return;
+      await api.storage.session.remove(invocationKey(state.tabId));
+    }
+    function takeInvocation(state) {
+      const result = invocationQueue.then(async () => {
+        const tab = await ownedTab(state);
+        const current = invocation;
+        if (!current || current.state !== state) return { invocation: null };
+        if (invocation === current) invocation = undefined;
+        await api.storage.session.remove(invocationKey(state.tabId));
+        const after = await ownedTab(state);
+        if (after.url !== tab.url || current.url !== after.url || current.tabId !== after.id
+          || current.windowId !== after.windowId || !validInvocation(current.value)) return { invocation: null };
+        // Keep only the original invocation vocabulary. Browser identity stays
+        // in the privileged owner binding, not in provider-supplied parameters.
+        const value = current.value;
+        return { invocation: { type: value.type, createdAtMs: value.createdAtMs,
+          ...(value.prompt === undefined ? {} : { prompt: value.prompt }),
+          ...(value.selectedText === undefined ? {} : { selectedText: value.selectedText }) } };
+      });
+      invocationQueue = result.catch(() => {});
+      return result;
+    }
     const closeListeners = new Set();
     const send = async command => {
       if (embedded && ["status", "poll", "update"].includes(command.action)) {
@@ -195,11 +254,29 @@ function m(t,o,e){if(location.origin!==t||o!=null&&location.href!==o)return{sele
       const instanceId = await environment.ChatGPTSafariHooks.getInstanceId();
       let selectedText = null, selectionId = null;
       if (includeSelection && tab.status !== "loading") {
-        const [capture] = await api.scripting.executeScript({
+        const url = new URL(tab.url), segments = url.pathname.split("/").filter(Boolean);
+        const documentType = segments[0], idIndex = segments.indexOf("d", 1);
+        const workspace = url.host === "docs.google.com"
+          && ["document", "presentation", "spreadsheets"].includes(documentType)
+          && idIndex >= 0 && !!segments[idIndex + 1] && segments.at(-1) !== "pub";
+        const mode = !workspace ? "none" : documentType === "spreadsheets" ? "event" : "polling";
+        let [capture] = await api.scripting.executeScript({
           target: { tabId: tab.id, frameIds: [0] },
           func: environment.ChatGPTSafariSidebarFunctions.selection,
-          args: [tab.url, state.instanceId, "none"],
+          args: [tab.url, state.instanceId, mode],
         });
+        if (capture?.result?.needsRecovery && capture.documentId) {
+          const target = { tabId: tab.id, documentIds: [capture.documentId] };
+          const [recovered] = await api.scripting.executeScript({ target, world: "MAIN",
+            func: environment.ChatGPTSafariSidebarFunctions.recoverSelection, args: [url.origin, tab.url, 80000] });
+          const current = await ownedTab(state);
+          if (current.url !== tab.url || current.status === "loading") throw new Error("The Safari page changed during selection capture");
+          const text = recovered?.result?.selectedText;
+          [capture] = await api.scripting.executeScript({ target,
+            func: environment.ChatGPTSafariSidebarFunctions.selection,
+            args: [tab.url, state.instanceId, mode, { captureGeneration: capture.result.captureGeneration,
+              selectedText: typeof text === "string" && text.trim().length > 0 ? text : null }] });
+        }
         const after = await ownedTab(state);
         if (after.url !== tab.url || after.status === "loading") throw new Error("The Safari page changed during selection capture");
         selectedText = capture?.result?.selectedText || null;
@@ -210,6 +287,10 @@ function m(t,o,e){if(location.origin!==t||o!=null&&location.href!==o)return{sele
     }
     const capabilities = { "browserSideChat.openInBrowser": true, "browserSideChat.tabContext.read": true, "browserTabMentions.search": true };
     const sessionChanged = () => {
+      mentionObservation?.unsubscribe();
+      mentionObservation = undefined;
+      // Release passive developer capture with the original owner/session.
+      Promise.resolve(environment.ChatGPTSafariAgent?.invalidateAll?.()).catch(() => {});
       if (typeof environment.ChatGPTSafariBrowserSessionChanged === "function") {
         Promise.resolve(environment.ChatGPTSafariBrowserSessionChanged()).catch(() => {});
       }
@@ -219,9 +300,22 @@ function m(t,o,e){if(location.origin!==t||o!=null&&location.href!==o)return{sele
       const params = request.params || {};
       switch (request.method) {
       case "context": return { context: await context(state, params.includeSelection === true), capabilities };
+      case "openInvocation": return takeInvocation(state);
       case "tabContext": { const tab = await ownedTab(state); return { tabId: tab.id, url: tab.url }; }
       case "tabMentions": {
         await ownedTab(state);
+        if (embedded && mentionObservation?.state !== state
+          && typeof environment.ChatGPTSafariHooks.subscribeTabMentionsInvalidated === "function") {
+          mentionObservation?.unsubscribe();
+          const unsubscribe = environment.ChatGPTSafariHooks.subscribeTabMentionsInvalidated(() => {
+            if (owner !== state || mentionObservation?.state !== state) return;
+            // Only a hint crosses runtime messaging. Candidate content is read
+            // again through the exact wrapper's authorized original host call.
+            Promise.resolve(api.runtime.sendMessage({ type: "chatgpt-safari:tab-mentions-invalidated",
+              instanceId: state.instanceId, tabId: state.tabId, windowId: state.windowId })).catch(() => {});
+          });
+          mentionObservation = { state, unsubscribe };
+        }
         const candidates = await environment.ChatGPTSafariHooks.getTabMentions({ query: params.query || "", limit: params.limit ?? 20, includeFavicons: true });
         await ownedTab(state);
         return { ok: true, candidates };
@@ -240,7 +334,9 @@ function m(t,o,e){if(location.origin!==t||o!=null&&location.href!==o)return{sele
         await api.storage.session.set({ [`codexWorkSidePanelConversationUrl:${state.tabId}`]: url.href });
         return { ok: true };
       }
-      case "authStateChanged": return { ok: true };
+      case "authStateChanged":
+        if (params.state !== "signed_in") await clearInvocation(state);
+        return { ok: true };
       default: throw new Error("Unknown native side-chat request");
       }
     }
@@ -285,6 +381,7 @@ function m(t,o,e){if(location.origin!==t||o!=null&&location.href!==o)return{sele
         ...(profile ? { liveProfileId: profile } : {}),
         ownerToken: state.instanceId, context: value, capabilities,
         bounds: { left: window.left, top: window.top, width: window.width, height: window.height } });
+      if (owner === state) ownerContext = value;
     }
     const binding = {
       embedded,
@@ -304,7 +401,13 @@ function m(t,o,e){if(location.origin!==t||o!=null&&location.href!==o)return{sele
         await ownedTab(state);
         const profileId = (await api.storage.local.get("safariLiveProfileId")).safariLiveProfileId;
         if (typeof profileId !== "string" || !/^[0-9a-f-]{36}$/i.test(profileId)) throw new Error("The Safari browser profile is not ready");
-        return { instanceId: state.instanceId, profileId, tabId: state.tabId, windowId: state.windowId };
+        const response = await send({ action: "embeddedEntry", ownerToken: state.instanceId });
+        await ownedTab(state);
+        const entry = response.entry;
+        if (entry?.phase !== "signedIn" || typeof entry.accountScope !== "string" || !entry.accountScope || entry.accountScope.length > 128) {
+          throw new Error("Sign in to ChatGPT before using its Safari agent");
+        }
+        return { instanceId: state.instanceId, profileId, accountScope: entry.accountScope, tabId: state.tabId, windowId: state.windowId };
       },
       async rebindAgentOwner(state, previousTabId) {
         let step = "REBIND_STATE";
@@ -325,6 +428,8 @@ function m(t,o,e){if(location.origin!==t||o!=null&&location.href!==o)return{sele
               if (snapshot) { snapshot.nodes.clear(); snapshot.snapshotId = null; }
             } });
           step = "REBIND_CONVERSATION";
+          invocation = undefined;
+          await api.storage.session.remove(invocationKey(previousTabId));
           const previousKey = `codexWorkSidePanelConversationUrl:${previousTabId}`;
           const conversation = (await api.storage.session.get(previousKey))[previousKey];
           step = "REBIND_STATE";
@@ -369,6 +474,14 @@ function m(t,o,e){if(location.origin!==t||o!=null&&location.href!==o)return{sele
           const response = await send({ action: "embeddedEntry", ownerToken: state.instanceId });
           return response.entry;
         }
+        if (payload.operation === "authentication") {
+          if (!["open", "resume", "logout"].includes(payload.action)) throw new Error("Unknown app-profile authentication operation");
+          await clearInvocation(state);
+          const response = await send({ action: "embeddedAuth", ownerToken: state.instanceId, authOperation: payload.action });
+          await ownedTab(state);
+          if (payload.action === "resume") sessionChanged();
+          return response;
+        }
         if (payload.operation !== "host" || typeof payload.method !== "string") throw new Error("Unknown embedded side-chat operation");
         const params = payload.params || {};
         if (JSON.stringify(params).length > 96000) throw new Error("The side-chat request is too large");
@@ -380,8 +493,9 @@ function m(t,o,e){if(location.origin!==t||o!=null&&location.href!==o)return{sele
           await send({ action: "embeddedLocation", ownerToken: state.instanceId, url: params.url });
         } else if (payload.method === "authStateChanged") {
           if (!["expired", "logout_requested", "signed_in", "signed_out"].includes(params.state)) throw new Error("Invalid ChatGPT authentication state");
-          await send({ action: "embeddedAuth", ownerToken: state.instanceId, state: params.state });
+          const response = await send({ action: "embeddedAuth", ownerToken: state.instanceId, state: params.state });
           sessionChanged();
+          return { ...result, authentication: response.authentication };
         }
         return result;
       },
@@ -396,6 +510,7 @@ function m(t,o,e){if(location.origin!==t||o!=null&&location.href!==o)return{sele
         const state = states.find(item => item.instanceId === response.state?.ownerToken);
         if (!state || response.state.ownerAvailable !== true) return;
         owner = state;
+        ownerContext = await context(state);
         if (!timer) timer = setInterval(poll, 500);
         await poll();
         sessionChanged();
@@ -403,9 +518,15 @@ function m(t,o,e){if(location.origin!==t||o!=null&&location.href!==o)return{sele
       },
       async open(state) {
         const previous = owner;
+        const previousContext = ownerContext;
+        if (previous !== state) {
+          if (previous) await clearInvocation(previous);
+          await clearInvocation(state);
+          ownerContext = undefined;
+        }
         owner = state;
         try { await update(state, "open"); }
-        catch (error) { owner = previous; throw error; }
+        catch (error) { owner = previous; ownerContext = previousContext; throw error; }
         sessionChanged();
         if (!timer) timer = setInterval(poll, 500);
         await poll();
@@ -414,15 +535,24 @@ function m(t,o,e){if(location.origin!==t||o!=null&&location.href!==o)return{sele
         if (owner?.instanceId !== state.instanceId) return;
         await send({ action: embedded ? "embeddedClose" : "close", ownerToken: state.instanceId });
         owner = undefined;
+        ownerContext = undefined;
         sessionChanged();
         clearInterval(timer);
         timer = undefined;
+        await clearInvocation(state);
         await api.scripting.executeScript({ target: { tabId: state.tabId }, func: environment.ChatGPTSafariSidebarFunctions.removeSelection, args: [state.instanceId] }).catch(() => {});
       },
       poll,
       context,
       handleRequest,
     };
+    api.storage.onChanged?.addListener((changes, area) => {
+      if (!embedded || area !== "session" || !owner || !ownerContext) return;
+      const value = changes[invocationKey(owner.tabId)]?.newValue;
+      if (!validInvocation(value)) return;
+      invocation = { state: owner, tabId: owner.tabId, windowId: owner.windowId,
+        url: ownerContext.url, value };
+    });
     api.tabs.onUpdated.addListener((tabId, change) => {
       if (owner?.tabId === tabId && (change.url || change.status === "complete")) {
         update(owner, "update").catch(error => console.error("Unable to update Safari side-chat context:", error.message));
@@ -435,12 +565,363 @@ function m(t,o,e){if(location.origin!==t||o!=null&&location.href!==o)return{sele
   if (api?.runtime?.id) root.ChatGPTSafariSidebarOptions = { companion: createCompanion(api, root, { embedded: true }) };
 })(globalThis);
 
+/* App notifications use the signed-in native owner, never a website-supplied icon or action. */
+(function (root) {
+  "use strict";
+  const record = value => value !== null && typeof value === "object" && !Array.isArray(value);
+  const authorizations = new Set(["not_determined", "denied", "authorized", "provisional", "unknown"]);
+  function createNotifications(api, companion) {
+    async function execute(operation, request) {
+      const content = {};
+      if (operation === "create") {
+        if (!record(request) || typeof request.title !== "string" || !request.title.trim()
+          || request.title.length > 200 || request.title.includes("\0") || typeof request.message !== "string"
+          || request.message.length > 4000 || request.message.includes("\0")) {
+          throw new TypeError("A notification needs a nonempty title of at most 200 UTF-16 units and a message of at most 4000 UTF-16 units, without null characters");
+        }
+        content.title = request.title;
+        content.message = request.message;
+      }
+      let owner;
+      try { owner = await companion.agentOwner(); }
+      catch {
+        throw Object.assign(new Error("Open the ChatGPT sidebar in an ordinary Safari tab and sign in before managing app notifications."), { code: "NOTIFICATION_OWNER_REQUIRED" });
+      }
+      if (typeof owner.accountScope !== "string" || !owner.accountScope || owner.accountScope.length > 128) {
+        throw Object.assign(new Error("The verified ChatGPT account scope is unavailable for notifications. Open the signed-in ChatGPT sidebar and try again."), { code: "NOTIFICATION_OWNER_REQUIRED" });
+      }
+      let response;
+      try {
+        response = await api.runtime.sendNativeMessage("dev.jamie.chatgpt-safari", { operation: "companion", command: {
+          action: "personalData", ownerToken: owner.instanceId, profileId: owner.profileId,
+          command: { action: "notification", profileId: owner.profileId,
+            ...(operation === "create" ? {} : { operation }), ...content },
+        } });
+      } catch (error) {
+        if (operation !== "status") {
+          error.message += ". The native notification or permission request may already have completed; do not repeat it.";
+          error.doNotReplay = true;
+        }
+        throw error;
+      }
+      let current;
+      try { current = await companion.agentOwner(); } catch { /* Treat a closed or signed-out owner exactly like a changed one. */ }
+      if (!current || current.instanceId !== owner.instanceId || current.profileId !== owner.profileId || current.accountScope !== owner.accountScope) {
+        const error = new Error("The signed-in sidebar owner changed during the notification operation. A notification or permission request may already have completed; do not repeat it.");
+        error.code = "STALE_NOTIFICATION_OWNER";
+        error.doNotReplay = operation !== "status";
+        throw error;
+      }
+      if (response?.ok !== true) {
+        const error = new Error(response?.error?.message || "The macOS notification operation failed");
+        error.code = response?.error?.code;
+        error.data = response?.error?.data;
+        if (error.data?.doNotReplay === true) error.doNotReplay = true;
+        throw error;
+      }
+      const result = response.result;
+      if (operation === "create") {
+        if (!record(result) || typeof result.id !== "string" || !/^chatgpt-safari-[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/iu.test(result.id)
+          || result.status !== "scheduled" || !["authorized", "provisional"].includes(result.authorization)) {
+          throw Object.assign(new Error("The native notification result is invalid and scheduling was not confirmed; do not repeat a possibly completed request."),
+            { code: "NOTIFICATION_RESULT_UNCONFIRMED", doNotReplay: true });
+        }
+        return result.id;
+      }
+      if (!record(result) || !authorizations.has(result.authorization)) throw new Error("The native notification result is invalid");
+      if (typeof result.alertsEnabled !== "boolean" || typeof result.notificationCenterEnabled !== "boolean"
+        || result.permissionRequestAvailable !== (result.authorization === "not_determined")
+        || (operation === "requestPermission" && result.granted !== ["authorized", "provisional"].includes(result.authorization))) {
+        throw new Error("The native notification permission result is invalid");
+      }
+      return result;
+    }
+    return Object.freeze({ create: request => execute("create", request), status: () => execute("status"),
+      requestPermission: () => execute("requestPermission") });
+  }
+  if (typeof module === "object" && module.exports) module.exports = { createNotifications };
+  const api = root.browser || root.chrome;
+  if (api?.runtime?.id) root.ChatGPTSafariNotifications = createNotifications(api, root.ChatGPTSafariSidebarOptions.companion);
+})(globalThis);
+
+/* Original consent/security remains in the cloud-command dispatcher. */
+(function (root) {
+  "use strict";
+  const sameOwner = (left, right) => left.instanceId === right.instanceId
+    && left.profileId === right.profileId && left.accountScope === right.accountScope;
+  function nativeFailure(response, fallback) {
+    const error = new Error(response?.error?.message || fallback);
+    error.code = response?.error?.code;
+    error.data = response?.error?.data;
+    for (const key of ["mutationApplied", "doNotReplay"]) {
+      if (typeof error.data?.[key] === "boolean") error[key] = error.data[key];
+    }
+    return error;
+  }
+  function createPersonalData(api, companion, sidebar = root.ChatGPTSafariSidebar) {
+    let bookmarksBusy = false;
+    const currentOwner = async owner => {
+      if (!sameOwner(await companion.agentOwner(), owner)) throw new Error("The original side-chat owner changed; personal data was not returned");
+    };
+    const send = (owner, command) => api.runtime.sendNativeMessage("dev.jamie.chatgpt-safari", { operation: "companion", command: {
+      action: "personalData", ownerToken: owner.instanceId, profileId: owner.profileId,
+      command: { ...command, profileId: owner.profileId },
+    } });
+    async function readyTab(tabId, windowId, url, owner, navigation) {
+      const check = async () => {
+        await currentOwner(owner);
+        if (!navigation.untouched) throw new Error("The temporary Safari bookmark navigation changed");
+        const tab = await api.tabs.get(tabId);
+        const tabs = await api.tabs.query({ windowId });
+        if (tab.windowId !== windowId || tab.incognito || tabs.length !== 1 || tabs[0].id !== tabId
+          || tab.pendingUrl != null && tab.pendingUrl !== "" && tab.pendingUrl !== url) {
+          navigation.untouched = false;
+          throw new Error("The temporary Safari bookmark page or its pending navigation changed");
+        }
+        if (tab.url === url) {
+          navigation.committed = true;
+          return tab.status !== "loading" ? tab : undefined;
+        }
+        // Safari can acknowledge windows.create while its one initial tab is
+        // still blank. Observe that already-delivered navigation, without
+        // selecting the tab or invoking any native bookmark operation yet.
+        if (!navigation.committed && [undefined, "", "about:blank"].includes(tab.url)) return undefined;
+        navigation.untouched = false;
+        throw new Error("The temporary Safari bookmark page changed");
+      };
+      // Observe the one delivered navigation; never reload it after a timeout.
+      let listener, timeout, resolveChanged, rejectChanged;
+      const changed = new Promise((resolve, reject) => { resolveChanged = resolve; rejectChanged = reject; });
+      // An update can arrive while the initial native owner read is pending.
+      // Retain that rejection without an unhandled-rejection side effect.
+      changed.catch(() => {});
+      listener = (id, change = {}) => {
+        if (id !== tabId) return;
+        if (change.url != null && change.url !== url || change.pendingUrl != null && change.pendingUrl !== "" && change.pendingUrl !== url) {
+          navigation.untouched = false;
+          rejectChanged(new Error("The temporary Safari bookmark navigation changed; no bookmark command was started"));
+          return;
+        }
+        check().then(tab => { if (tab) resolveChanged(tab); }, rejectChanged);
+      };
+      api.tabs.onUpdated?.addListener(listener);
+      try {
+        const initial = await check();
+        if (initial) return initial;
+        return await Promise.race([changed, new Promise((_, reject) => {
+          timeout = setTimeout(() => reject(new Error("Safari's temporary bookmark page did not finish loading")), 5000);
+        })]);
+      } finally { clearTimeout(timeout); api.tabs.onUpdated?.removeListener(listener); }
+    }
+    async function bookmarks(method, args = [], expectedOwner) {
+      if (bookmarksBusy) throw new Error("Another native Safari bookmark operation is running; this request was not queued");
+      if (!["getTree", "search", "get", "getChildren", "getSubTree", "update", "createFolder", "create", "remove", "removeTree", "move"].includes(method)
+        || !Array.isArray(args) || args.length > 2) throw new Error("This native Safari bookmark method is unsupported");
+      // The sidebar adapter initializes after this background module.
+      const activeSidebar = sidebar || root.ChatGPTSafariSidebar;
+      if (typeof activeSidebar?.withAgentSelection !== "function") throw new Error("Safari's owner-bound bookmark selection is unavailable");
+      bookmarksBusy = true;
+      let owner, windowId, tabId, url, nativeDelivered = false, navigationWatcher;
+      const navigation = { untouched: true, committed: false };
+      const mutation = ["update", "createFolder", "create", "remove", "removeTree", "move"].includes(method);
+      try {
+        owner = await companion.agentOwner();
+        if (expectedOwner && !sameOwner(owner, expectedOwner)) throw new Error("The original side-chat owner changed before reading bookmarks");
+        const entry = await send(owner, { action: "utilityEntry" });
+        await currentOwner(owner);
+        if (entry?.ok !== true) throw nativeFailure(entry, "Safari's temporary bookmark page is unavailable");
+        const parsed = new URL(entry.result?.url);
+        if (parsed.protocol !== "http:" || !/^chatgpt-utility-[a-f0-9-]{36}\.localhost$/iu.test(parsed.hostname)
+          || !parsed.port || !/^\/bookmarks\/[a-f0-9-]{36}$/iu.test(parsed.pathname)
+          || parsed.username || parsed.password || parsed.search || parsed.hash) throw new Error("The native bookmark utility address is invalid");
+        url = parsed.href;
+        const before = await api.windows.getAll({ windowTypes: ["normal"] });
+        await currentOwner(owner);
+        const created = await api.windows.create({ url, focused: false, type: "normal" });
+        // A mismatched response never grants cleanup authority over another window.
+        if (!Number.isSafeInteger(created?.id) || created.id <= 0 || before.some(item => item.id === created.id)) {
+          const error = new Error("Safari did not identify the newly created bookmark window. Inspect current windows before repeating the request");
+          error.doNotReplay = true; throw error;
+        }
+        windowId = created.id;
+        const tabs = await api.tabs.query({ windowId });
+        if (tabs.length !== 1 || tabs[0].incognito || tabs[0].windowId !== windowId
+          || !Number.isSafeInteger(tabs[0].id) || tabs[0].id <= 0) {
+          throw new Error("Safari did not return the sole temporary bookmark tab");
+        }
+        tabId = tabs[0].id;
+        navigationWatcher = (id, change = {}) => {
+          if (id !== tabId) return;
+          const allowed = nativeDelivered ? [url, "bookmarks://"] : [url];
+          if (change.url != null && !allowed.includes(change.url)
+            || change.pendingUrl != null && change.pendingUrl !== "" && !allowed.includes(change.pendingUrl)) navigation.untouched = false;
+        };
+        api.tabs.onUpdated?.addListener(navigationWatcher);
+        const tab = await readyTab(tabId, windowId, url, owner, navigation);
+        const outcome = await activeSidebar.withAgentSelection(owner.instanceId, tab, async selection => {
+          // Returning failures lets the selection owner restore the original
+          // window. Throwing here would skip that normal restoration path.
+          try {
+            if (!selection) throw new Error("The Safari sidebar no longer owns this bookmark operation");
+            await selection.select(tab);
+            await currentOwner(owner);
+            const current = await api.tabs.get(tabId), siblings = await api.tabs.query({ windowId });
+            if (current.windowId !== windowId || current.url !== url || current.status === "loading"
+              || current.pendingUrl != null && current.pendingUrl !== "" && current.pendingUrl !== url
+              || siblings.length !== 1 || siblings[0].id !== tabId) {
+              navigation.untouched = false;
+              throw new Error("The temporary Safari bookmark tab changed before native execution");
+            }
+            const window = await api.windows.get(windowId);
+            if (window.type !== "normal" || window.incognito || !window.focused) throw new Error("The temporary bookmark window is not focused");
+            const windowBounds = Object.fromEntries(["left", "top", "width", "height"].map(key => [key, window[key]]));
+            if (Object.values(windowBounds).some(value => !Number.isFinite(value)) || windowBounds.width <= 0 || windowBounds.height <= 0) {
+              throw new Error("Safari did not return actual bookmark-window bounds");
+            }
+            selection.assertCurrent();
+            nativeDelivered = true;
+            const response = await send(owner, { action: "bookmarks", expectedUrl: url, windowBounds, method, arguments: args });
+            return response?.ok === true ? { value: response.result } : { error: nativeFailure(response, "Safari's native bookmark operation failed") };
+          } catch (error) { return { error }; }
+        });
+        await currentOwner(owner);
+        if (outcome.error) throw outcome.error;
+        return outcome.value;
+      } catch (error) {
+        if (nativeDelivered && mutation) {
+          error.doNotReplay = true;
+          error.message += ". The native bookmark command was delivered once. Inspect current bookmarks before continuing; do not replay it.";
+        }
+        throw error;
+      } finally {
+        // Close only our untouched, sole-tab utility window, after the owner
+        // was restored. A focus change, user tab, navigation or account change
+        // leaves it in place instead of closing or refocusing the user's work.
+        if (owner && windowId && tabId) {
+          try {
+            await currentOwner(owner);
+            const ownerWindow = await api.windows.get(owner.windowId);
+            const window = await api.windows.get(windowId);
+            const tabs = await api.tabs.query({ windowId });
+            const pendingInitial = !navigation.committed && !nativeDelivered && [undefined, "", "about:blank"].includes(tabs[0]?.url)
+              && tabs[0]?.pendingUrl === url;
+            if (navigation.untouched && ownerWindow.focused && !window.focused && tabs.length === 1 && tabs[0].id === tabId
+              && ([url, "bookmarks://"].includes(tabs[0].url) || pendingInitial)
+              && (tabs[0].pendingUrl == null || tabs[0].pendingUrl === "" || [url, "bookmarks://"].includes(tabs[0].pendingUrl))) await api.windows.remove(windowId);
+          } catch { /* No cleanup authority remains after a changed owner/window. */ }
+        }
+        if (navigationWatcher) api.tabs.onUpdated?.removeListener(navigationWatcher);
+        bookmarksBusy = false;
+      }
+    }
+    return Object.freeze({
+      bookmarks,
+      getBookmarks: () => bookmarks("getTree"),
+      async history(request) {
+        const owner = await companion.agentOwner();
+        const args = {};
+        if (request.queries != null) {
+          if (!Array.isArray(request.queries) || request.queries.length === 0 || request.queries.some(value => typeof value !== "string")) {
+            throw new TypeError("History queries must be a nonempty array of strings");
+          }
+          args.queries = request.queries;
+        }
+        if (request.limit != null) {
+          if (!Number.isSafeInteger(request.limit) || request.limit <= 0) throw new TypeError("History limit must be a positive integer");
+          args.limit = request.limit;
+        }
+        for (const key of ["from", "to"]) if (request[key] != null) {
+          if (typeof request[key] !== "string" || !Number.isFinite(Date.parse(request[key]))) throw new TypeError(`History ${key} must be a valid date`);
+          args[key] = new Date(request[key]).toISOString();
+        }
+        const response = await send(owner, { action: "history", arguments: args });
+        await currentOwner(owner);
+        if (response?.ok !== true) {
+          throw nativeFailure(response, "Safari history could not be read");
+        }
+        if (!Array.isArray(response.result) || response.result.some(item => !item || typeof item.url !== "string"
+          || typeof item.dateVisited !== "string" || !Number.isFinite(Date.parse(item.dateVisited))
+          || (item.title !== undefined && typeof item.title !== "string"))) throw new Error("The native Safari history result is invalid");
+        return response.result;
+      },
+    });
+  }
+  if (typeof module === "object" && module.exports) module.exports = { createPersonalData };
+  const api = root.browser || root.chrome;
+  if (api?.runtime?.id) root.ChatGPTSafariPersonalData = createPersonalData(api, root.ChatGPTSafariSidebarOptions.companion);
+})(globalThis);
+
 /* Downloads use the claimed page's own Safari session. Credentials never cross
  * the isolated-world boundary; only bounded response bytes reach the writer. */
 (function (root) {
   "use strict";
   const maximumBytes = 32 * 1024 * 1024;
   const chunkBytes = 48 * 1024;
+
+  function assetInventoryPageOperation(operation, args) {
+    const fail = message => ({ ok: false, error: { code: "STALE_ASSET_INVENTORY", message } });
+    const newId = () => Array.from(crypto.getRandomValues(new Uint8Array(16)), byte => byte.toString(16).padStart(2, "0")).join("");
+    const key = "__chatGPTSafariLiveDocument";
+    if (!globalThis[key]) Object.defineProperty(globalThis, key, { value: { documentId: newId(), nodes: new Map(), snapshotId: null, url: location.href } });
+    const state = globalThis[key]; state.assetInventories ||= new Map();
+    if (operation !== "list") {
+      const inventory = state.assetInventories.get(args.inventoryId);
+      if (!inventory || inventory.scope !== args.scope || inventory.documentId !== state.documentId || inventory.pageUrl !== location.href) return fail("List assets in the current claimed document before bundling them.");
+      const requested = args.assetIds || [...inventory.items.keys()];
+      if (requested.some(id => !inventory.items.has(id))) return fail("The bundle contains an unknown asset ID.");
+      let items = [...new Set(requested)].map(id => inventory.items.get(id));
+      if (args.kinds) items = items.filter(item => args.kinds.includes(item.kind));
+      if (args.assetIds && items.some(item => !["font", "image", "stylesheet", "video"].includes(item.kind))) return fail("Only font, image, stylesheet, and video assets can be bundled.");
+      items = items.filter(item => ["font", "image", "stylesheet", "video"].includes(item.kind));
+      return { ok: true, result: { pageUrl: inventory.pageUrl, documentId: inventory.documentId, items } };
+    }
+    const byURL = new Map(), inlineSvgs = [], items = new Map();
+    const kindFor = (value, hint) => /\.(woff2?|ttf|otf|eot)(?:[?#]|$)/i.test(value) ? "font"
+      : /\.(png|jpe?g|gif|webp|avif|svg|ico)(?:[?#]|$)/i.test(value) ? "image"
+      : /\.css(?:[?#]|$)/i.test(value) ? "stylesheet" : /\.(mp4|webm|mov|m4v)(?:[?#]|$)/i.test(value) ? "video" : hint || "other";
+    const add = (raw, kind, source, base = document.baseURI) => {
+      if (!raw) return;
+      let url; try { url = new URL(raw, base); } catch { return; }
+      if (!["https:", "http:", "data:", "blob:"].includes(url.protocol) || url.username || url.password) return;
+      url.hash = "";
+      let asset = byURL.get(url.href);
+      if (!asset) {
+        const id = "asset-" + (byURL.size + 1);
+        let name; try { name = decodeURIComponent(url.pathname.split("/").pop() || id); } catch { name = id; }
+        asset = { id, kind: kindFor(url.href, kind), name: name.slice(0, 240), sources: [], url: url.href };
+        byURL.set(url.href, asset); items.set(id, asset);
+      }
+      if (!asset.sources.some(item => item.kind === source.kind && item.property === source.property)) asset.sources.push(source);
+    };
+    const visit = root => {
+      for (const element of root.querySelectorAll("*")) {
+        const tag = element.tagName.toLowerCase(), source = property => ({ kind: "attribute", property });
+        if (tag === "img") add(element.currentSrc || element.src, "image", source("currentSrc"), element.baseURI);
+        if (tag === "video") { add(element.currentSrc || element.src, "video", source("currentSrc"), element.baseURI); add(element.poster, "image", source("poster"), element.baseURI); }
+        if (tag === "image") add(element.href?.baseVal, "image", source("href"), element.baseURI);
+        if (tag === "script") add(element.src, "script", source("src"), element.baseURI);
+        if (tag === "link" && element.relList.contains("stylesheet")) add(element.href, "stylesheet", source("href"), element.baseURI);
+        if (tag === "svg") {
+          const svg = { id: "svg-" + (inlineSvgs.length + 1), markup: element.outerHTML, name: element.getAttribute("aria-label") || element.querySelector("title")?.textContent || "Inline SVG" };
+          inlineSvgs.push(svg); items.set(svg.id, { ...svg, kind: "image", url: "inline-svg:" + svg.id, inline: true });
+        }
+        const style = element.ownerDocument.defaultView.getComputedStyle(element);
+        for (const property of ["background-image", "border-image-source", "list-style-image", "mask-image"]) {
+          for (const match of style.getPropertyValue(property).matchAll(/url\(\s*(['"]?)(.*?)\1\s*\)/g)) add(match[2], "image", { kind: "computedStyle", property }, element.baseURI);
+        }
+        if (element.shadowRoot) visit(element.shadowRoot);
+        if (tag === "iframe") { try { if (element.contentDocument) visit(element.contentDocument); } catch { /* Cross-origin subdocuments remain outside their parent's DOM inventory. */ } }
+      }
+    };
+    visit(document);
+    for (const entry of performance.getEntriesByType("resource")) add(entry.name, ({ img: "image", css: "stylesheet", script: "script", video: "video" })[entry.initiatorType], { kind: "resource" });
+    const assets = [...byURL.values()], byKind = { font: 0, image: 0, other: 0, script: 0, stylesheet: 0, video: 0 };
+    for (const asset of assets) byKind[asset.kind]++;
+    const id = newId();
+    state.assetInventories.set(id, { scope: args.scope, documentId: state.documentId, pageUrl: location.href, items });
+    return { ok: true, result: { assets, id, inlineSvgs, pageUrl: location.href,
+      summary: { byKind, inlineSvgCount: inlineSvgs.length, totalCount: assets.length } } };
+  }
 
   // Self-contained because WebExtension scripting serializes this function.
   async function downloadPageOperation(operation, args) {
@@ -465,17 +946,20 @@ function m(t,o,e){if(location.origin!==t||o!=null&&location.href!==o)return{sele
       if (transfer) stop(transfer);
       return { ok: true, result: { cancelled: true } };
     }
-    const current = () => live && live.documentId === args.documentId && live.snapshotId === args.snapshotId
-      && live.url === location.href && location.href === args.expectedUrl;
+    const inventory = args.assetId ? live?.assetInventories?.get(args.inventoryId) : null;
+    const asset = inventory && inventory.scope === args.scope ? inventory.items.get(args.assetId) : null;
+    const current = () => live && live.documentId === args.documentId && location.href === args.expectedUrl
+      && (args.assetId ? inventory?.documentId === live.documentId && inventory.pageUrl === location.href : live.snapshotId === args.snapshotId && live.url === location.href);
     const anchor = live?.nodes.get(args.node);
     const href = () => {
+      if (args.assetId) return current() && asset ? asset.url : null;
       if (!current() || !anchor?.isConnected || !anchor.matches("a[href]")) return null;
       const rect = anchor.getBoundingClientRect(), style = getComputedStyle(anchor);
       if (rect.width <= 0 || rect.height <= 0 || style.visibility === "hidden" || style.display === "none" || Number(style.opacity) === 0) return null;
       try {
         const value = new URL(anchor.href);
         value.hash = "";
-        if (!["https:", "http:"].includes(value.protocol) || value.origin !== location.origin || value.username || value.password) return null;
+        if (!["https:", "http:"].includes(value.protocol) || value.username || value.password) return null;
         return value.href;
       } catch { return null; }
     };
@@ -483,7 +967,7 @@ function m(t,o,e){if(location.origin!==t||o!=null&&location.href!==o)return{sele
     if (!source || (operation !== "inspect" && source !== args.href)) {
       const transfer = state.get(args.transferId);
       if (transfer) stop(transfer);
-      return failure("DOWNLOAD_TARGET_CHANGED", "Read the current visible DOM before downloading a same-origin HTTP/HTTPS link. JavaScript buttons, blob URLs, and cross-origin links are not supported.");
+      return failure("DOWNLOAD_TARGET_CHANGED", "Read the current visible DOM before downloading its exact HTTP/HTTPS link. JavaScript buttons and blob URLs require a verified browser download event and are unsupported by this link route.");
     }
     if (operation === "inspect") return { ok: true, result: { href: source, url: location.href } };
     if (operation === "start") {
@@ -493,19 +977,32 @@ function m(t,o,e){if(location.origin!==t||o!=null&&location.href!==o)return{sele
       transfer.timer = setTimeout(() => { controller.abort(); state.delete(args.transferId); }, 30000);
       state.set(args.transferId, transfer);
       try {
-        // Never follow a redirect before the original download policy can
-        // approve its destination. This bounded route rejects all redirects.
-        const response = await fetch(source, { method: "GET", mode: "same-origin", credentials: "same-origin",
-          redirect: "error", cache: "no-store", signal: controller.signal });
+        if (asset?.inline) {
+          const bytes = new TextEncoder().encode(asset.markup); let consumed = false;
+          transfer.reader = { async read() { if (consumed) return { done: true }; consumed = true; return { done: false, value: bytes }; }, async cancel() {} };
+          return { ok: true, result: { filename: asset.id + ".svg", mime: "image/svg+xml" } };
+        }
+        // Cross-origin sources pass original source/destination approval.
+        // Ordinary-profile fetch preserves Safari's real credentialed CORS.
+        // Manual redirects never contact an unapproved next destination.
+        const crossOrigin = new URL(source).origin !== location.origin;
+        const response = await fetch(source, { method: "GET", mode: asset || crossOrigin ? "cors" : "same-origin", credentials: asset || crossOrigin ? "include" : "same-origin",
+          redirect: "manual", cache: "no-store", signal: controller.signal });
         if (!current() || href() !== source) throw new Error("The download document changed during the request.");
-        if (!response.ok || response.redirected || response.type === "opaque" || new URL(response.url).origin !== location.origin) {
-          throw new Error("The download response was rejected. Only successful same-origin responses without redirects are supported.");
+        if (response.type === "opaqueredirect" || response.redirected || response.status >= 300 && response.status < 400) {
+          stop(transfer);
+          return failure("DOWNLOAD_REDIRECT_APPROVAL_REQUIRED", "Safari returned a redirect without a policy-approved destination identity. No redirected request or file write was performed; this download needs a verified browser download event.");
+        }
+        const responseURL = new URL(response.url);
+        if (!response.ok || response.type === "opaque" || responseURL.href !== source ||
+          (!["http:", "https:"].includes(responseURL.protocol) && !(asset && responseURL.protocol === "data:"))) {
+          throw new Error("The download response did not retain its approved source identity.");
         }
         const length = response.headers.get("content-length");
         if (length && (!/^\d+$/u.test(length) || Number(length) > 32 * 1024 * 1024)) throw new Error("This download exceeds the 32 MiB limit.");
         if (!response.body) throw new Error("The download response has no readable body.");
         transfer.reader = response.body.getReader();
-        let filename = anchor.getAttribute("download") || "";
+        let filename = asset?.name || anchor.getAttribute("download") || "";
         const disposition = response.headers.get("content-disposition") || "";
         const utf8 = disposition.match(/(?:^|;)\s*filename\*=UTF-8''([^;]*)/iu);
         const quoted = disposition.match(/(?:^|;)\s*filename="((?:[^"\\]|\\.)*)"/iu);
@@ -518,7 +1015,7 @@ function m(t,o,e){if(location.origin!==t||o!=null&&location.href!==o)return{sele
       } catch (error) {
         stop(transfer);
         return failure("DOWNLOAD_FETCH_FAILED", error.name === "AbortError" ? "The download expired or its document closed. It was not retried." :
-          "The download request failed. Only successful same-origin HTTP/HTTPS links without redirects are supported; the request was not retried.");
+          "The download request failed or Safari denied credentialed CORS access. Only the exact approved HTTP/HTTPS response can be saved; the request was not retried.");
       }
     }
     const transfer = state.get(args.transferId);
@@ -543,10 +1040,309 @@ function m(t,o,e){if(location.origin!==t||o!=null&&location.href!==o)return{sele
     }
   }
 
+  // Fixed, isolated-world export transfer. URLs are derived from the current
+  // official document, never supplied by the model. Only bounded file bytes
+  // cross to the operation-bound native writer after original download policy.
+  async function contentExportPageOperation(operation, args) {
+    const fail = message => ({ ok: false, error: { code: "CONTENT_EXPORT_REJECTED", message } });
+    const newId = () => Array.from(crypto.getRandomValues(new Uint8Array(16)), byte => byte.toString(16).padStart(2, "0")).join("");
+    const key = "__chatGPTSafariLiveDocument";
+    if (!globalThis[key]) Object.defineProperty(globalThis, key, { value: { documentId: newId(), nodes: new Map(), snapshotId: null, url: location.href } });
+    const live = globalThis[key];
+    if (!live.contentExports) {
+      live.contentExports = new Map();
+      addEventListener("pagehide", () => { for (const item of live.contentExports.values()) { item.controller?.abort(); clearTimeout(item.timer); } live.contentExports.clear(); }, { once: true });
+    }
+    if (operation === "inspect") {
+      if (typeof args.scope !== "string" || !args.scope || args.scope.length > 4096) return fail("A current sidebar account/session/turn scope is required.");
+      const page = new URL(location.href);
+      if (page.protocol !== "https:" || page.username || page.password || page.port) return fail("Exports require an official HTTPS document page.");
+      let href, videoId, format = args.format;
+      if (args.kind === "gsuite") {
+        const parts = page.pathname.split("/").filter(Boolean), type = parts[0], position = parts.indexOf("d", 1), id = parts[position + 1];
+        const formats = { document: ["pdf", "md", "docx"], spreadsheets: ["pdf", "xlsx", "csv"], presentation: ["pdf", "pptx"] };
+        if (page.host !== "docs.google.com" || !formats[type]?.includes(format) || position < 0 || !/^[A-Za-z0-9_-]+$/.test(id || "") || parts.at(-1) === "pub") return fail("This Google Workspace page does not support the requested export format.");
+        const exported = new URL(`https://docs.google.com/${type}/d/${id}/export`);
+        exported.searchParams.set("format", format);
+        if (page.searchParams.has("tab")) exported.searchParams.set("tab", page.searchParams.get("tab"));
+        exported.hash = page.hash; href = exported.href;
+      } else if (args.kind === "youtube") {
+        videoId = page.searchParams.get("v"); format = "txt";
+        if (!["www.youtube.com", "youtube.com"].includes(page.hostname) || page.pathname !== "/watch" || !/^[A-Za-z0-9_-]{11}$/.test(videoId || "")) return fail("Transcript export requires the current official YouTube watch page.");
+        href = page.href;
+      } else return fail("This content export is unsupported.");
+      const titleParts = (args.kind === "youtube" ? "youtube-" + videoId : document.title || "ExportedContent").split(" - ");
+      const title = (titleParts.length > 1 && titleParts.at(-1).startsWith("Google") ? titleParts.slice(0, -1).join(" - ") : titleParts.join(" - ")).replace(/[/\\?%*|"<>:\0]/gu, "_").trim().slice(0, 180) || "ExportedContent";
+      const id = newId(), item = { id, scope: args.scope, documentId: live.documentId, pageUrl: location.href, href, kind: args.kind, format, videoId,
+        filename: title + "-" + id + "." + format, createdAt: Date.now(), offset: 0 };
+      if (live.contentExports.size >= 4) {
+        const oldest = live.contentExports.values().next().value; oldest.controller?.abort(); clearTimeout(oldest.timer); live.contentExports.delete(oldest.id);
+      }
+      live.contentExports.set(id, item);
+      item.timer = setTimeout(() => { item.controller?.abort(); item.bytes = null; live.contentExports.delete(id); }, 30000);
+      item.timer?.unref?.();
+      return { ok: true, result: { exportId: id, documentId: item.documentId, pageUrl: item.pageUrl, href, kind: item.kind, format, videoId, filename: item.filename } };
+    }
+    const item = live.contentExports.get(args.exportId);
+    const current = () => item && item.scope === args.scope && item.documentId === live.documentId && item.pageUrl === location.href && Date.now() - item.createdAt <= 30000;
+    if (operation === "cancel") {
+      if (item?.scope === args.scope) { item.controller?.abort(); clearTimeout(item.timer); live.contentExports.delete(item.id); }
+      return { ok: true, result: { cancelled: true } };
+    }
+    if (!current()) return fail("The content export no longer belongs to this exact document and sidebar scope.");
+    if (operation === "check") return { ok: true, result: { current: true, pageUrl: item.pageUrl, documentId: item.documentId, kind: item.kind, format: item.format, videoId: item.videoId } };
+    if (operation === "start") {
+      if (item.bytes || item.controller) return fail("This export transfer already started; it was not repeated.");
+      if (item.kind === "youtube") {
+        if (typeof args.text !== "string" || !args.text.startsWith("YouTube transcript\nVideo ID: " + item.videoId + "\n") || new TextEncoder().encode(args.text).length > 501000) return fail("The fixed YouTube helper returned an invalid or oversized transcript.");
+        item.bytes = new TextEncoder().encode(args.text);
+      } else {
+        const controller = new AbortController(); item.controller = controller;
+        try {
+          const response = await fetch(item.href, { method: "GET", credentials: "same-origin", signal: controller.signal });
+          const final = new URL(response.url), mime = (response.headers.get("content-type") || "").split(";", 1)[0].trim().toLowerCase();
+          if (!current() || !response.ok || final.protocol !== "https:" || final.username || final.password
+            || !(final.hostname === "docs.google.com" || final.hostname.endsWith(".googleusercontent.com")) || response.type === "opaque" || !response.body
+            || !mime || /html|json|javascript|xml$/.test(mime)) throw new Error("The official Google export did not return an authenticated document response.");
+          const declared = response.headers.get("content-length");
+          if (declared && (!/^\d+$/.test(declared) || Number(declared) > 32 * 1024 * 1024)) throw new Error("The Google export exceeds 32 MiB.");
+          const reader = response.body.getReader(), chunks = []; let size = 0;
+          for (;;) {
+            const next = await reader.read(); if (next.done) break;
+            size += next.value.byteLength;
+            if (!current() || size > 32 * 1024 * 1024) { await reader.cancel(); throw new Error("The Google export changed document or exceeded 32 MiB."); }
+            chunks.push(next.value);
+          }
+          const bytes = new Uint8Array(size); let offset = 0; for (const chunk of chunks) { bytes.set(chunk, offset); offset += chunk.length; }
+          if (!size || /^\s*(?:<!doctype\s+html\b|<html\b)/i.test(new TextDecoder().decode(bytes.subarray(0, 256)))
+            || item.format === "pdf" && new TextDecoder().decode(bytes.subarray(0, 5)) !== "%PDF-"
+            || ["docx", "pptx", "xlsx"].includes(item.format) && !(bytes[0] === 0x50 && bytes[1] === 0x4b)) throw new Error("The Google response does not match the requested document format.");
+          // Preserve the original Google's Markdown cleanup exactly.
+          item.bytes = item.format === "md" ? new TextEncoder().encode(new TextDecoder().decode(bytes).replace(/^\s*\[[^\]]+\]:\s*<data:[^>]+>\s*\n?/gm, "").trim()) : bytes;
+        } catch (error) { return fail(error.message); }
+        finally { controller.abort(); }
+      }
+      if (!current() || !item.bytes?.length) return fail("No nonempty document export was produced.");
+      return { ok: true, result: { filename: item.filename, bytes: item.bytes.length } };
+    }
+    if (operation === "read") {
+      if (!item.bytes) return fail("Start this approved content export before reading its bytes.");
+      if (item.offset >= item.bytes.length) return { ok: true, result: { done: true, bytes: item.bytes.length } };
+      const chunk = item.bytes.subarray(item.offset, item.offset + 48 * 1024); item.offset += chunk.length;
+      let binary = ""; for (let index = 0; index < chunk.length; index += 8192) binary += String.fromCharCode(...chunk.subarray(index, index + 8192));
+      return { ok: true, result: { done: false, data: btoa(binary), bytes: chunk.length } };
+    }
+    return fail("Unknown fixed content export operation.");
+  }
+
+  // Adapted only from the version-bound upstream Me helper. MAIN is necessary
+  // for YouTube's own player methods; no model script or extension API enters
+  // this function. It restores the original captions state before returning.
+  async function youtubeTranscriptPageOperation(videoId, expectedUrl) {
+    const limits = { observationTimeoutMs: 4000, fetchTimeoutMs: 8000, maxJsonBytes: 5 * 1024 * 1024 };
+    if (location.href !== expectedUrl || !/^https:\/\/(?:www\.)?youtube\.com\/watch\?/.test(expectedUrl) || !/^[A-Za-z0-9_-]{11}$/.test(videoId)) return null;
+    const call = (object, name) => { const fn = Reflect.get(object, name); return typeof fn === "function" ? Reflect.apply(fn, object, []) : undefined; };
+    const player = () => {
+      const host = document.querySelector("ytd-player"), method = host && Reflect.get(host, "getPlayer");
+      if (typeof method === "function") { const value = Reflect.apply(method, host, []); if (value && typeof value === "object") return value; }
+      return document.querySelector("#movie_player");
+    };
+    const current = object => object && player() === object && location.href === expectedUrl && new URL(location.href).searchParams.get("v") === videoId && call(object, "getVideoData")?.video_id === videoId;
+    const original = player();
+    if (!current(original) || ["getVideoData", "isSubtitlesOn", "toggleSubtitles", "toggleSubtitlesOn"].some(name => typeof Reflect.get(original, name) !== "function")) return null;
+    const started = performance.now(); let observed = null;
+    const observer = new PerformanceObserver(list => {
+      for (const entry of list.getEntries()) if (entry.startTime + 0.5 >= started) {
+        try { const url = new URL(entry.name); if (url.protocol === "https:" && url.hostname === "www.youtube.com" && url.pathname === "/api/timedtext" && url.searchParams.get("v") === videoId) observed = url; } catch { /* Ignore unrelated resource names. */ }
+      }
+    });
+    observer.observe({ buffered: true, type: "resource" });
+    const subtitles = !!call(original, "isSubtitlesOn");
+    try {
+      if (subtitles) call(original, "toggleSubtitles"); call(original, "toggleSubtitlesOn");
+      const deadline = Date.now() + limits.observationTimeoutMs;
+      while (Date.now() < deadline && !observed && current(original)) await new Promise(resolve => setTimeout(resolve, 150));
+    } finally {
+      try { if (current(original)) { const enabled = !!call(original, "isSubtitlesOn"); if (subtitles && !enabled) call(original, "toggleSubtitlesOn"); else if (!subtitles && enabled) call(original, "toggleSubtitles"); } }
+      finally { observer.disconnect(); }
+    }
+    if (!observed || !current(original)) return null;
+    observed.searchParams.set("fmt", "json3");
+    const controller = new AbortController(), timer = setTimeout(() => controller.abort(), limits.fetchTimeoutMs);
+    try {
+      const response = await fetch(observed.href, { credentials: "include", redirect: "error", signal: controller.signal });
+      if (!response.ok || !response.headers.get("content-type")?.toLowerCase().includes("application/json") || !response.body) return null;
+      const declared = Number(response.headers.get("content-length") ?? NaN);
+      if (Number.isFinite(declared) && declared > limits.maxJsonBytes) return null;
+      const reader = response.body.getReader(), chunks = []; let size = 0;
+      for (;;) { const next = await reader.read(); if (next.done) break; size += next.value.byteLength; if (size > limits.maxJsonBytes || !current(original)) { await reader.cancel(); return null; } chunks.push(next.value); }
+      const bytes = new Uint8Array(size); let offset = 0; for (const chunk of chunks) { bytes.set(chunk, offset); offset += chunk.length; }
+      return current(original) ? { body: new TextDecoder().decode(bytes), captionKind: observed.searchParams.get("kind"), captionLanguage: observed.searchParams.get("lang"), pageUrl: location.href } : null;
+    } catch { return null; }
+    finally { clearTimeout(timer); controller.abort(); }
+  }
+
+  function formatYouTubeTranscript(videoId, data, expectedUrl) {
+    if (!data || Object.keys(data).length !== 4 || data.pageUrl !== expectedUrl || typeof data.body !== "string" || new TextEncoder().encode(data.body).length > 5 * 1024 * 1024
+      || [data.captionKind, data.captionLanguage].some(value => value !== null && (typeof value !== "string" || value.length > 100))) throw new Error("The fixed YouTube helper returned an invalid transcript response");
+    let parsed; try { parsed = JSON.parse(data.body); } catch { throw new Error("The YouTube caption response was not JSON"); }
+    if (!Array.isArray(parsed?.events)) throw new Error("No transcript is available for this YouTube video");
+    const lines = ["YouTube transcript", `Video ID: ${videoId}`, `Language: ${data.captionLanguage ?? "unknown"}`, `Captions: ${data.captionKind === "asr" ? "auto-generated" : "authored or unspecified"}`, ""];
+    const encoder = new TextEncoder(); let count = 0, size = encoder.encode(lines.join("\n")).length, truncated = false;
+    for (const event of parsed.events) {
+      if (count >= 5000) { truncated = true; break; }
+      if (!event || typeof event.tStartMs !== "number" || !Number.isFinite(event.tStartMs) || event.tStartMs < 0 || !Array.isArray(event.segs)
+        || !event.segs.every(segment => segment && typeof segment === "object" && (segment.utf8 === undefined || typeof segment.utf8 === "string"))) continue;
+      const text = event.segs.map(segment => segment.utf8 ?? "").join("").replace(/\s+/g, " ").trim(); if (!text) continue;
+      const second = Math.floor(event.tStartMs / 1000), hour = Math.floor(second / 3600), minute = Math.floor(second % 3600 / 60), remainder = second % 60;
+      const line = `[${hour > 0 ? hour + ":" + String(minute).padStart(2, "0") : minute}:${String(remainder).padStart(2, "0")}] ${text}`;
+      const bytes = encoder.encode("\n" + line).length; if (size + bytes > 500000) { truncated = true; break; }
+      lines.push(line); size += bytes; count++;
+    }
+    if (!count) throw new Error("No transcript is available for this YouTube video");
+    if (truncated) lines.push("", "[Transcript truncated]");
+    return lines.join("\n");
+  }
+
+  function createExports({ api, target, send, profileId, sessionId, assertTime, unwrap }) {
+    const page = async (tab, operation, args) => {
+      const [value] = await api.scripting.executeScript({ target: { tabId: tab.id, frameIds: [0] }, world: "ISOLATED", func: contentExportPageOperation, args: [operation, args] });
+      return unwrap(value?.result);
+    };
+    const inspect = (tab, args) => page(tab, "inspect", args);
+    async function execute(request, tab, args) {
+      let nativeID, sequence = 0, bytes = 0;
+      const check = async () => {
+        assertTime(); await target(args.handle, tab.url); const binding = await page(tab, "check", args);
+        if (binding.kind !== args.kind || args.kind === "gsuite" && binding.format !== args.format) throw new Error("The approved content export type or format changed");
+        return binding;
+      };
+      const write = async input => { await check(); return unwrap(await send({ action: "liveDownload", id: request.id, profileId, sessionId, input })); };
+      try {
+        const binding = await check(); let text;
+        if (binding.kind === "youtube") {
+          const [value] = await api.scripting.executeScript({ target: { tabId: tab.id, frameIds: [0] }, world: "MAIN", func: youtubeTranscriptPageOperation, args: [binding.videoId, binding.pageUrl] });
+          await check(); text = formatYouTubeTranscript(binding.videoId, value?.result, binding.pageUrl);
+        }
+        const metadata = await page(tab, "start", { ...args, ...(text === undefined ? {} : { text }) });
+        const opened = await write({ action: "begin", filename: metadata.filename }); nativeID = opened.transferId;
+        for (;;) {
+          await check(); const chunk = await page(tab, "read", args);
+          if (chunk.done) {
+            if (chunk.bytes !== bytes || bytes !== metadata.bytes) throw new Error("The exported document byte count changed before completion");
+            const saved = await write({ action: "finish", transferId: nativeID, sequence, expectedBytes: bytes }); nativeID = undefined;
+            return { path: saved.path };
+          }
+          if (!Number.isInteger(chunk.bytes) || chunk.bytes < 1 || chunk.bytes > chunkBytes || bytes + chunk.bytes > maximumBytes) throw new Error("The exported document exceeded its bounded transfer size");
+          const written = await write({ action: "append", transferId: nativeID, sequence, data: chunk.data }); bytes += chunk.bytes; sequence++;
+          if (written.bytesWritten !== bytes || written.sequence !== sequence) throw new Error("The native writer did not confirm the exact exported bytes");
+        }
+      } finally {
+        await page(tab, "cancel", args).catch(() => {});
+        if (nativeID) await send({ action: "liveDownload", id: request.id, profileId, sessionId, input: { action: "abort", transferId: nativeID } }).catch(() => {});
+      }
+    }
+    return { inspect, execute };
+  }
+
   function createDownloads({ api, target, send, profileId, sessionId, assertTime, unwrap }) {
     async function page(tab, operation, args) {
       const [value] = await api.scripting.executeScript({ target: { tabId: tab.id, frameIds: [0] }, func: downloadPageOperation, args: [operation, args] });
       return unwrap(value?.result);
+    }
+    async function inventory(tab, operation, args) {
+      const [value] = await api.scripting.executeScript({ target: { tabId: tab.id, frameIds: [0] }, func: assetInventoryPageOperation, args: [operation, args] });
+      return unwrap(value?.result);
+    }
+    async function listAssets(tab, args) {
+      await target(args.handle);
+      const result = await inventory(tab, "list", args);
+      await target(args.handle, result.pageUrl); return result;
+    }
+    async function inspectAssets(tab, args) {
+      const result = await inventory(tab, "inspect", args);
+      await target(args.handle, result.pageUrl);
+      return { pageUrl: result.pageUrl, assets: result.items.map(item => ({ id: item.id, url: item.url, inline: item.inline === true || /^(data|blob):/i.test(item.url) })) };
+    }
+    async function bundle(request, tab, args) {
+      const started = Date.now(), selected = await inventory(tab, "inspect", args);
+      if (!selected.items.length) throw new Error("The asset bundle matched no supported discovered assets");
+      const binding = { ...args, documentId: selected.documentId, expectedUrl: selected.pageUrl };
+      let bundleId, finished = false;
+      const assets = [], failures = [];
+      const write = async input => {
+        assertTime(); await target(args.handle, binding.expectedUrl); await inventory(tab, "inspect", args);
+        return unwrap(await send({ action: "liveDownload", id: request.id, profileId, sessionId, input }));
+      };
+      const acceptedType = (asset, contentType) => {
+        const type = contentType?.split(";", 1)[0].trim().toLowerCase();
+        if (!type) return asset.kind === "stylesheet";
+        if (type === "application/octet-stream") return /\.(woff2?|ttf|otf|eot|png|jpe?g|gif|webp|avif|svg|ico|css|mp4|webm|mov|m4v)(?:[?#]|$)/i.test(asset.url);
+        return asset.kind === "image" ? type.startsWith("image/") : asset.kind === "video" ? type.startsWith("video/")
+          : asset.kind === "stylesheet" ? type === "text/css" : type.startsWith("font/")
+            || ["application/font-woff", "application/font-woff2", "application/vnd.ms-fontobject", "application/x-font-opentype", "application/x-font-ttf"].includes(type);
+      };
+      try {
+        const destination = await write({ action: "bundleBegin" }); bundleId = destination.bundleId;
+        for (const asset of selected.items) {
+          assertTime();
+          const transferArgs = { ...binding, assetId: asset.id, href: asset.url, transferId: root.crypto.randomUUID() };
+          let nativeID, sequence = 0, bytes = 0, controller, reader, timer, contentType;
+          try {
+            const source = new URL(asset.url, binding.expectedUrl);
+            const crossOrigin = !asset.inline && ["http:", "https:"].includes(source.protocol) && source.origin !== new URL(binding.expectedUrl).origin;
+            let metadata;
+            if (crossOrigin) {
+              // The original security gate approved this observed asset origin.
+              // Fetch inside Safari's extension process, never in the native app.
+              controller = new AbortController(); timer = setTimeout(() => controller.abort(), 30000);
+              const response = await fetch(source.href, { credentials: "include", redirect: "error", signal: controller.signal });
+              if (!response.ok || response.redirected || response.type === "opaque" || !response.body) throw new Error("The observed asset could not be fetched without a redirect");
+              contentType = response.headers.get("content-type"); reader = response.body.getReader();
+              metadata = { filename: asset.id + "-" + asset.name, mime: contentType };
+            } else metadata = await page(tab, "start", transferArgs);
+            contentType ||= metadata.mime || null;
+            if (!acceptedType(asset, contentType)) throw new Error(`Asset response type ${contentType || "missing"} is not valid for ${asset.kind}`);
+            const opened = await write({ action: "begin", bundleId, filename: asset.id + "-" + (metadata.filename || asset.name) }); nativeID = opened.transferId;
+            const append = async (encoded, count) => {
+              if (bytes + count > maximumBytes) throw new Error("The asset exceeds the 32 MiB transfer limit");
+              const written = await write({ action: "append", transferId: nativeID, sequence, data: encoded });
+              bytes += count; sequence++;
+              if (written.bytesWritten !== bytes || written.sequence !== sequence) throw new Error("The asset writer did not confirm the exact bytes");
+            };
+            for (;;) {
+              assertTime(); await target(args.handle, binding.expectedUrl);
+              if (reader) {
+                const next = await reader.read();
+                if (next.done) break;
+                for (let offset = 0; offset < next.value.length; offset += chunkBytes) {
+                  const chunk = next.value.subarray(offset, offset + chunkBytes);
+                  let binary = ""; for (let index = 0; index < chunk.length; index += 8192) binary += String.fromCharCode(...chunk.subarray(index, index + 8192));
+                  await append(btoa(binary), chunk.length);
+                }
+              } else {
+                const chunk = await page(tab, "read", transferArgs);
+                if (chunk.done) { if (chunk.bytes !== bytes) throw new Error("The observed asset byte count changed"); break; }
+                await append(chunk.data, chunk.bytes);
+              }
+            }
+            const saved = await write({ action: "finish", transferId: nativeID, sequence, expectedBytes: bytes }); nativeID = undefined;
+            assets.push({ contentType, id: asset.id, kind: asset.kind, name: asset.name, path: saved.path, url: asset.url });
+          } catch (error) {
+            if (["STALE_DOWNLOAD", "STALE_ASSET_INVENTORY", "AGENT_OWNER_CHANGED", "LIVE_TIMEOUT", "PROFILE_DISCONNECTED"].includes(error.code)) throw error;
+            failures.push({ contentType: contentType || null, id: asset.id, name: asset.name, reason: error.message, url: asset.url });
+          } finally {
+            clearTimeout(timer); controller?.abort(); await reader?.cancel().catch(() => {});
+            await page(tab, "cancel", transferArgs).catch(() => {});
+            if (nativeID) await send({ action: "liveDownload", id: request.id, profileId, sessionId, input: { action: "abort", transferId: nativeID } }).catch(() => {});
+          }
+        }
+        const result = await write({ action: "bundleFinish", bundleId, manifest: { assets, failures } }); finished = true;
+        return { assets, failures, directoryPath: result.directoryPath, manifestPath: result.manifestPath,
+          summary: { downloadedCount: assets.length, elapsedMs: Date.now() - started, failedCount: failures.length, requestedCount: selected.items.length } };
+      } finally {
+        if (bundleId && !finished) await send({ action: "liveDownload", id: request.id, profileId, sessionId, input: { action: "bundleCancel", bundleId } }).catch(() => {});
+      }
     }
     async function inspect(tab, args) {
       await target(args.handle, args.expectedUrl);
@@ -591,11 +1387,211 @@ function m(t,o,e){if(location.origin!==t||o!=null&&location.href!==o)return{sele
           input: { action: "abort", transferId: nativeID } }).catch(() => {});
       }
     }
-    return { inspect, execute };
+    return { inspect, execute, listAssets, inspectAssets, bundle };
   }
-  const bridge = Object.freeze({ createDownloads, downloadPageOperation, maximumBytes, chunkBytes });
+  const bridge = Object.freeze({ createDownloads, createExports, downloadPageOperation, contentExportPageOperation, youtubeTranscriptPageOperation, formatYouTubeTranscript, assetInventoryPageOperation, maximumBytes, chunkBytes });
   if (typeof module === "object" && module.exports) module.exports = bridge;
   else Object.defineProperty(root, "ChatGPTSafariDownloads", { value: bridge });
+})(globalThis);
+
+/* Measured ordinary-Safari viewport sizing; no CDP/DPR/mobile emulation. */
+(function (root) {
+  "use strict";
+  const fail = (code, message, extra = {}) => Object.assign(new Error(message), { code, ...extra });
+  const supported = new Set(["browser_viewport_set", "browser_viewport_reset"]);
+  const dimensions = value => Number.isSafeInteger(value) && value > 0;
+  const scopeKey = scope => JSON.stringify([scope.profileId, scope.ownerId, scope.accountScope,
+    scope.sessionId, scope.turnId, scope.tabId]);
+
+  // A fixed read-only helper. Its document nonce never crosses to page code.
+  function observeViewport() {
+    const key = "__chatGPTSafariViewportDocument";
+    if (!globalThis[key]) Object.defineProperty(globalThis, key, { value: Array.from(crypto.getRandomValues(new Uint8Array(16)), byte => byte.toString(16).padStart(2, "0")).join("") });
+    return { documentId: globalThis[key], url: location.href, width: innerWidth, height: innerHeight };
+  }
+  function createViewport(api, companion, environment = root) {
+    const entries = new Map(), owners = new Map();
+    let busy = false;
+    const pause = ms => new Promise(resolve => environment.setTimeout(resolve, ms));
+    const unwrap = value => {
+      if (value?.ok !== true) throw Object.assign(new Error(value?.error?.message || "The native viewport operation failed"), value?.error);
+      return value.result;
+    };
+    const callNative = async (request, entry, operation, changes = {}) => unwrap(await api.runtime.sendNativeMessage("dev.jamie.chatgpt-safari", {
+      operation: "companion", command: { action: "liveViewport", id: request.id, profileId: entry.scope.profileId, sessionId: request.sessionId,
+        input: { operation, scope: entry.scope, expectedUrl: entry.url, windowBounds: entry.bounds,
+          ...(entry.leaseId ? { leaseId: entry.leaseId } : {}), ...changes } },
+    }));
+    async function execute(command, session, metadata, owner, assertCurrent) {
+      if (!supported.has(command.type)) throw fail("UNSUPPORTED_VIEWPORT", "Unknown Safari viewport command");
+      await assertCurrent();
+      if (session.currentTurnId !== metadata.turn_id) throw fail("STALE_TURN", "The original browser turn ended before viewport selection");
+      const base = { profileId: owner.profileId, ownerId: owner.instanceId, accountScope: owner.accountScope,
+        sessionId: metadata.session_id, turnId: metadata.turn_id };
+      if (command.type === "browser_viewport_reset") {
+        // A previous teardown may have refused rollback after a manual focus
+        // change. A fresh explicit reset may recover that retained lease, but
+        // only for the same verified owner/account/profile and native bounds.
+        const matches = [...entries.values()].filter(entry => ["profileId", "ownerId", "accountScope"].every(key => entry.scope[key] === base[key]));
+        for (const entry of matches) await reset(entry);
+        return {};
+      }
+      if (!dimensions(command.width) || !dimensions(command.height)) throw fail("INVALID_VIEWPORT", "Viewport dimensions must be positive safe integers");
+      // Upstream listSessionTabs resolves its logical active session tab, not
+      // whichever unrelated user tab currently has native focus.
+      const tabs = await session.listSessionTabs(), active = tabs.filter(tab => tab.active === true);
+      if (active.length !== 1) throw fail("VIEWPORT_NO_ACTIVE_TAB", "Claim and select one tab in this original browser turn before setting its viewport");
+      const tab = active[0], leases = await session.tabLeases.getSessionActiveLeases(session.sessionId);
+      const lease = leases.get(tab.id);
+      if (!lease || lease.state !== "active" || lease.sessionId !== metadata.session_id || lease.turnId !== metadata.turn_id) {
+        throw fail("VIEWPORT_UNCLAIMED_TAB", "The logical active tab must have this exact session and turn's active claim");
+      }
+      await session.requireOwnedTab(tab.id); await assertCurrent();
+      const source = await api.tabs.get(tab.id), returnTab = await api.tabs.get(owner.tabId);
+      if (source.windowId !== owner.windowId || returnTab.windowId !== owner.windowId || returnTab.incognito) {
+        throw fail("VIEWPORT_OWNER_WINDOW", "Use a claimed tab in the owning sidebar's native Safari window so automatic rollback never has to change the foreground window");
+      }
+      const scope = { ...base, tabId: String(tab.id) }, key = scopeKey(scope);
+      owners.set(key, { ...owner });
+      return companion.runAgentCommand({ action: "viewport", arguments: { operation: "set", scope,
+        handle: `live:${owner.profileId}:${tab.id}`, expectedUrl: source.url, width: command.width, height: command.height,
+        returnTarget: { tabId: owner.tabId, windowId: owner.windowId, url: returnTab.url } } }, owner);
+    }
+    async function reset(entry) {
+      const owner = owners.get(scopeKey(entry.scope));
+      if (!owner) throw fail("VIEWPORT_OWNER_ENDED", "The viewport's original sidebar owner is unavailable; native rollback must verify its retained window lease");
+      return companion.runAgentCommand({ action: "viewport", arguments: { operation: "reset", scope: entry.scope,
+        handle: entry.handle, expectedUrl: entry.url } }, owner);
+    }
+    async function run(request, selection) {
+      if (busy) throw fail("VIEWPORT_BUSY", "Another viewport operation is running; this resize was not queued or repeated");
+      busy = true;
+      try { return await apply(request, selection); } finally { busy = false; }
+    }
+    async function apply(request, selection) {
+      const args = request.command.arguments, scope = args.scope;
+      if (!scope || !["profileId", "ownerId", "accountScope", "sessionId", "turnId", "tabId"].every(key => typeof scope[key] === "string" && scope[key].length > 0)
+        || request.agentOwner !== scope.ownerId
+        || !["set", "reset"].includes(args.operation)
+        || args.handle !== `live:${scope.profileId}:${scope.tabId}`) throw fail("INVALID_VIEWPORT_SCOPE", "Viewport requires the original owner-bound profile, turn and claimed tab");
+      const key = scopeKey(scope);
+      let entry = entries.get(key), mutation = false;
+      const assert = () => {
+        selection?.assertCurrent();
+        if (Date.now() >= request.deadline) throw fail("VIEWPORT_EXPIRED", "The viewport operation expired; no resize was repeated");
+      };
+      const target = async (allowInactive = false) => {
+        assert();
+        const tab = await api.tabs.get(Number(scope.tabId));
+        if (tab.incognito || tab.url !== args.expectedUrl || (!allowInactive && !tab.active)) throw fail("VIEWPORT_TARGET_CHANGED", "The claimed viewport tab changed or is no longer selected");
+        const window = await api.windows.get(tab.windowId);
+        if (window.type !== "normal" || window.state !== "normal" || !window.focused) throw fail("VIEWPORT_WINDOW_STATE", "Viewport sizing requires the selected normal Safari window; fullscreen and minimized windows are unsupported");
+        return { tab, window };
+      };
+      const native = async (operation, changes = {}) => {
+        assert();
+        // The live executor injects its background session, never the model.
+        return callNative(request, entry, operation, changes);
+      };
+      const measure = async (allowInactive = false) => {
+        const { tab } = await target(allowInactive);
+        const result = await api.scripting.executeScript({ target: { tabId: tab.id, frameIds: [0] }, world: "ISOLATED", func: observeViewport });
+        assert();
+        const value = result?.[0]?.result;
+        if (!value || value.url !== args.expectedUrl || !dimensions(value.width) || !dimensions(value.height)
+          || typeof value.documentId !== "string" || (entry?.scope.documentId && value.documentId !== entry.scope.documentId)) {
+          throw fail("VIEWPORT_DOCUMENT_CHANGED", "The viewport measurement no longer belongs to the exact source document");
+        }
+        return value;
+      };
+      const restore = async () => {
+        if (!entry?.leaseId) return;
+        const result = await native("restore");
+        if (result.restored !== true) throw fail("VIEWPORT_RESTORE_UNCONFIRMED", "Safari did not confirm restoration of the original native window bounds");
+        entries.delete(key); owners.delete(key);
+        // No second mutation if original CSS dimensions changed with browser UI.
+        const observed = await measure(true);
+        if (observed.width !== entry.originalCSS.width || observed.height !== entry.originalCSS.height) {
+          throw fail("VIEWPORT_RESET_CSS_UNCONFIRMED", "The original native bounds were restored, but the original CSS viewport dimensions were not observed", { restoration: "bounds-restored" });
+        }
+      };
+      if (args.operation === "reset") {
+        if (!entry) return {};
+        await restore(); return {};
+      }
+      if (!dimensions(args.width) || !dimensions(args.height)) throw fail("INVALID_VIEWPORT", "Viewport dimensions must be positive safe integers");
+      try {
+        const before = await measure(), { tab, window } = await target();
+        if (!entry) {
+          entry = { scope: { ...scope, documentId: before.documentId }, url: args.expectedUrl, handle: args.handle,
+            windowId: window.id, bounds: { left: window.left, top: window.top, width: window.width, height: window.height },
+            originalCSS: { width: before.width, height: before.height } };
+          entries.set(key, entry);
+        } else if (entry.windowId !== tab.windowId) throw fail("VIEWPORT_WINDOW_CHANGED", "The original viewport tab moved to another native window");
+        const begun = await native("begin"); entry.leaseId = begun.leaseId; entry.bounds = begun.windowBounds;
+        let observed = before, prior, slope = { width: 1, height: 1 };
+        for (let step = 0; step <= 3; step++) {
+          await native("check");
+          if (observed.width === args.width && observed.height === args.height) {
+            const confirmed = await measure(); await native("check");
+            if (confirmed.width !== args.width || confirmed.height !== args.height) throw fail("VIEWPORT_LAYOUT_CHANGED", "The measured CSS viewport changed before completion");
+            return {};
+          }
+          if (step === 3) break;
+          if (prior) for (const axis of ["width", "height"]) {
+            const nativeDelta = entry.bounds[axis] - prior.bounds[axis], cssDelta = observed[axis] - prior.css[axis];
+            if (nativeDelta && cssDelta && Math.sign(nativeDelta) === Math.sign(cssDelta)) slope[axis] = cssDelta / nativeDelta;
+          }
+          const desired = Object.fromEntries(["width", "height"].map(axis => [axis,
+            Math.round(entry.bounds[axis] + (args[axis] - observed[axis]) / slope[axis])]));
+          if (!dimensions(desired.width) || !dimensions(desired.height)
+            || (desired.width === entry.bounds.width && desired.height === entry.bounds.height)) break;
+          prior = { css: observed, bounds: { ...entry.bounds } };
+          mutation = true;
+          const resized = await native("resize", desired); entry.bounds = resized.windowBounds;
+          await pause(80); observed = await measure();
+          if (entry.bounds.width === prior.bounds.width && entry.bounds.height === prior.bounds.height
+            && observed.width === prior.css.width && observed.height === prior.css.height) break;
+        }
+        throw fail("VIEWPORT_SIZE_UNATTAINABLE", "Safari did not produce the exact requested CSS viewport within three measured native adjustments; minimum size, screen area or browser UI may prevent it");
+      } catch (error) {
+        if (entry && error.windowBounds) entry.bounds = error.windowBounds;
+        if (entry?.leaseId) {
+          try { await restore(); error.restoration = "restored"; }
+          catch (restoration) { error.restoration = restoration.restoration || "unconfirmed"; error.message += ` Restoration: ${restoration.message}.`; }
+        } else { entries.delete(key); owners.delete(key); }
+        if (mutation) { error.mutationApplied = true; error.doNotReplay = true; }
+        throw error;
+      }
+    }
+    async function release(sessionId, turnId) {
+      for (const entry of [...entries.values()]) if (entry.scope.sessionId === sessionId && (turnId == null || entry.scope.turnId === turnId)) await reset(entry);
+    }
+    async function commitReturnPage(request, ownerTab) {
+      const args = request.command.arguments, entry = entries.get(scopeKey(args.scope));
+      const expected = args.returnTarget;
+      if (!entry || !expected || request.agentOwner !== entry.scope.ownerId || Date.now() >= request.deadline
+        || ownerTab.id !== expected.tabId || ownerTab.windowId !== expected.windowId || ownerTab.url !== expected.url
+        || entry.windowId !== ownerTab.windowId) {
+        throw fail("VIEWPORT_RETURN_PAGE_CHANGED", "The completed viewport selection did not restore its exact original sidebar owner page");
+      }
+      try {
+        const observed = await callNative(request, entry, "commitReturnPage", { returnUrl: ownerTab.url, returnTabId: ownerTab.id });
+        if (observed.committed !== true) throw fail("VIEWPORT_RETURN_PAGE_UNCONFIRMED", "Native Safari did not confirm the exact owner page for viewport rollback");
+      } catch (error) {
+        error.mutationApplied = true; error.doNotReplay = true;
+        error.message += ". The measured viewport operation completed, but its rollback owner-page binding is unconfirmed. Do not repeat the resize.";
+        throw error;
+      }
+    }
+    return { execute, run, release, commitReturnPage, async invalidateAll() { for (const entry of [...entries.values()]) await reset(entry); } };
+  }
+  let installed;
+  const exports = { observeViewport, supported, createViewport(...args) { return installed = createViewport(...args); },
+    commitReturnPage(request, tab) { if (!installed) throw fail("VIEWPORT_UNAVAILABLE", "The original Safari viewport owner is unavailable"); return installed.commitReturnPage(request, tab); },
+    run(request, selection) { if (!installed) throw fail("VIEWPORT_UNAVAILABLE", "The original Safari viewport owner is unavailable"); return installed.run(request, selection); } };
+  if (typeof module === "object" && module.exports) module.exports = exports;
+  else Object.defineProperty(root, "ChatGPTSafariViewport", { value: exports });
 })(globalThis);
 
 /* Existing-profile control. WebExtension APIs read/target pages; native input
@@ -603,31 +1599,278 @@ function m(t,o,e){if(location.origin!==t||o!=null&&location.href!==o)return{sele
 (function (root) {
   "use strict";
   const fail = (code, message) => Object.assign(new Error(message), { code });
+  function consoleCapture(operation, token) {
+    const key = "__chatGPTSafariConsoleCapture";
+    const previous = globalThis[key];
+    if (operation === "stop") { if (previous?.token === token) previous.stop(); return; }
+    if (previous?.token === token) return;
+    previous?.stop();
+    const originals = new Map(), wrappers = new Map();
+    let stopped = false, timer;
+    const format = value => {
+      if (value === null) return "null";
+      if (["string", "number", "boolean", "undefined", "bigint"].includes(typeof value)) return String(value).slice(0, 4000);
+      if (typeof value === "function") return "[function]";
+      const message = Object.getOwnPropertyDescriptor(value, "message")?.value;
+      return typeof message === "string" ? message.slice(0, 4000) : Array.isArray(value) ? "[array]" : "[object]";
+    };
+    const report = (level, values) => {
+      if (!stopped) window.postMessage({ type: "chatgpt-safari:console-entry", token, level,
+        message: values.slice(0, 32).map(format).join(" ").slice(0, 4000) }, location.origin);
+    };
+    for (const level of ["debug", "info", "log", "warn", "error"]) {
+      const original = console[level]; originals.set(level, original);
+      const wrapper = function (...args) { Reflect.apply(original, this, args); report(level, args); };
+      wrappers.set(level, wrapper); console[level] = wrapper;
+    }
+    const onError = event => report("error", [event.message || "Uncaught page error"]);
+    const onRejection = event => report("error", ["Unhandled rejection:", event.reason]);
+    window.addEventListener("error", onError); window.addEventListener("unhandledrejection", onRejection);
+    const state = { token, stop() {
+      if (stopped) return; stopped = true; clearTimeout(timer);
+      for (const [level, wrapper] of wrappers) if (console[level] === wrapper) console[level] = originals.get(level);
+      window.removeEventListener("error", onError); window.removeEventListener("unhandledrejection", onRejection);
+      if (globalThis[key] === state) delete globalThis[key];
+    } };
+    Object.defineProperty(globalThis, key, { value: state, configurable: true });
+    timer = setTimeout(state.stop, 5 * 60 * 1000);
+  }
   function pageOperation(operation, args) {
     const reject = (code, message) => ({ ok: false, error: { code, message } });
+    if (args._nativeObservationDeadline !== undefined && (!Number.isFinite(args._nativeObservationDeadline) || Date.now() >= args._nativeObservationDeadline)) {
+      return reject("POST_INPUT_READBACK_TIMEOUT", "This page observation expired before Safari could execute it. No late page action was performed.");
+    }
+    const newId = () => Array.from(crypto.getRandomValues(new Uint8Array(16)), byte => byte.toString(16).padStart(2, "0")).join("");
     const key = "__chatGPTSafariLiveDocument";
     let state = globalThis[key];
     if (!state) {
-      state = { documentId: crypto.randomUUID(), nodes: new Map(), snapshotId: null, url: location.href };
+      state = { documentId: newId(), nodes: new Map(), snapshotId: null, url: location.href };
       Object.defineProperty(globalThis, key, { value: state });
     }
+    if (args.expectedDocumentId && state.documentId !== args.expectedDocumentId) return reject("STALE_TARGET", "The selected iframe document changed after native frame resolution.");
+    if (["logs_bind", "logs_read", "logs_release"].includes(operation)) {
+      if (operation === "logs_release") {
+        if (state.logs?.scope !== args.scope) return { ok: true, result: { token: null } };
+        const token = state.logs.token; state.logs.release(); return { ok: true, result: { token } };
+      }
+      if (operation === "logs_bind" && state.logs?.scope !== args.scope) {
+        state.logs?.release();
+        const logs = { scope: args.scope, token: newId(), startedAt: new Date().toISOString(), entries: [], expired: false };
+        const listen = event => {
+          if (!event.isTrusted || event.source !== window || event.origin !== location.origin || event.data?.type !== "chatgpt-safari:console-entry"
+            || event.data.token !== logs.token || !["debug", "info", "log", "warn", "error"].includes(event.data.level)
+            || typeof event.data.message !== "string" || event.data.message.length > 4000) return;
+          logs.entries.push({ level: event.data.level, message: event.data.message, timestamp: new Date().toISOString(), url: location.href });
+          if (logs.entries.length > 500) logs.entries.shift();
+        };
+        let timer;
+        logs.release = () => { window.removeEventListener("message", listen); clearTimeout(timer); logs.entries.length = 0; if (state.logs === logs) state.logs = null; };
+        timer = setTimeout(() => { window.removeEventListener("message", listen); logs.expired = true; }, 5 * 60 * 1000);
+        state.logs = logs; window.addEventListener("message", listen);
+      }
+      const logs = state.logs;
+      if (!logs || logs.scope !== args.scope) return reject("LOG_CAPTURE_INACTIVE", "Console capture is not active for this sidebar turn.");
+      if (operation === "logs_bind") return { ok: true, result: { token: logs.token, startedAt: logs.startedAt, documentId: state.documentId } };
+      if (logs.expired) return reject("LOG_CAPTURE_EXPIRED", "The five-minute console capture window ended; claim the tab in a new turn to start another window.");
+      return { ok: true, result: { logs: logs.entries.filter(entry => (!args.levels || args.levels.includes(entry.level))
+        && (!args.filter || entry.message.includes(args.filter))).slice(-Math.min(args.limit || 100, 500)), startedAt: logs.startedAt } };
+    }
+    const roots = () => {
+      const found = [], visit = root => {
+        found.push(root);
+        for (const element of root.querySelectorAll("*")) {
+          if (element.shadowRoot) visit(element.shadowRoot);
+          if (element.tagName === "IFRAME") {
+            try { if (element.contentDocument) visit(element.contentDocument); } catch { /* Cross-origin frames use explicit frame-scoped queries. */ }
+          }
+        }
+      };
+      visit(document); return found;
+    };
+    const all = selector => roots().flatMap(root => [...root.querySelectorAll(selector)]);
+    const active = () => {
+      let element = document.activeElement;
+      while (element) {
+        let next = element.shadowRoot?.activeElement;
+        try { next ||= element.contentDocument?.activeElement; } catch { /* A cross-origin frame is its own focus boundary. */ }
+        if (!next || next === element) return element;
+        element = next;
+      }
+      return null;
+    };
+    const rectangle = element => {
+      const local = element.getBoundingClientRect();
+      let left = local.left, top = local.top, view = element.ownerDocument?.defaultView;
+      while (view && view !== window) {
+        const frame = view.frameElement;
+        if (!frame) throw new Error("The frame is no longer attached to this page.");
+        const r = frame.getBoundingClientRect();
+        left += r.left + frame.clientLeft; top += r.top + frame.clientTop; view = frame.ownerDocument.defaultView;
+      }
+      return { left, top, right: left + local.width, bottom: top + local.height, width: local.width, height: local.height };
+    };
+    const hitAt = (x, y) => {
+      let context = document, hit;
+      for (let depth = 0; depth < 40; depth++) {
+        const next = context.elementFromPoint(x, y);
+        if (!next || next === hit) break;
+        hit = next;
+        if (hit.shadowRoot) { context = hit.shadowRoot; continue; }
+        try {
+          if (hit.contentDocument) {
+            const r = hit.getBoundingClientRect(); x -= r.left + hit.clientLeft; y -= r.top + hit.clientTop;
+            context = hit.contentDocument; continue;
+          }
+        } catch { /* Native coordinate input can still target the frame itself. */ }
+        break;
+      }
+      return hit;
+    };
+    const contains = (element, hit) => {
+      for (let current = hit; current;) {
+        if (current === element || element.contains(current)) return true;
+        const root = current.getRootNode?.();
+        current = root?.host || current.ownerDocument?.defaultView?.frameElement;
+      }
+      return false;
+    };
     const visible = element => {
-      const r = element.getBoundingClientRect(), s = getComputedStyle(element);
+      const r = element.getBoundingClientRect(), s = (element.ownerDocument?.defaultView || globalThis).getComputedStyle(element);
       return r.width > 0 && r.height > 0 && s.visibility !== "hidden" && s.display !== "none" && Number(s.opacity) !== 0;
     };
     const label = element => {
-      const references = (element.getAttribute("aria-labelledby") || "").split(/\s+/).map(id => document.getElementById(id)?.textContent || "").join(" ");
+      const references = (element.getAttribute("aria-labelledby") || "").split(/\s+/).map(id => element.ownerDocument.getElementById(id)?.textContent || "").join(" ");
       return (element.getAttribute("aria-label") || references.trim() ||
         [...(element.labels || [])].map(x => x.textContent).join(" ") ||
         element.getAttribute("alt") || element.getAttribute("title") || element.getAttribute("placeholder") ||
         element.innerText || element.textContent || "").trim().replace(/\s+/g, " ").slice(0, 240);
     };
+    if (operation === "capture_state" || operation === "capture_scroll") {
+      if (operation === "capture_scroll") {
+        if (state.documentId !== args.documentId || location.href !== args.url) return reject("STALE_TARGET", "The screenshot document changed; its scroll was not modified.");
+        return (async () => {
+          scrollTo({ left: args.x, top: args.y, behavior: "instant" });
+          await new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+          return { ok: true, result: { x: scrollX, y: scrollY } };
+        })();
+      }
+      const sidebar = document.querySelector("[data-chatgpt-safari-sidebar]");
+      const sidebarRect = sidebar?.getBoundingClientRect();
+      const contentWidth = sidebarRect && sidebarRect.left > 0 && sidebarRect.right >= innerWidth - 1
+        ? Math.min(sidebarRect.left, document.documentElement.getBoundingClientRect().width) : innerWidth;
+      return { ok: true, result: { documentId: state.documentId, url: location.href, x: scrollX, y: scrollY,
+        viewport: { width: innerWidth, height: innerHeight }, contentWidth,
+        width: Math.max(contentWidth, document.body?.scrollWidth || 0),
+        height: Math.max(innerHeight, document.documentElement.scrollHeight, document.body?.scrollHeight || 0) } };
+    }
+    if (operation === "frame_resolve") {
+      const injected = globalThis.__chatGPTSafariPlaywright;
+      if (!injected) return reject("QUERY_HELPER_MISSING", "The original selector engine is unavailable.");
+      const frames = injected.querySelectorAll(injected.parseSelector(args.selector), document);
+      if (frames.length !== 1 || frames[0].tagName !== "IFRAME") return reject("STRICT_FRAME", "The frame selector must identify exactly one iframe.");
+      if (!state.snapshotId || state.url !== location.href) { state.nodes.clear(); state.snapshotId = newId(); state.url = location.href; }
+      const node = "f" + newId(); state.nodes.set(node, frames[0]);
+      frames[0].contentWindow.postMessage({ type: "chatgpt-safari:resolve-frame", nonce: args.nonce }, "*");
+      return { ok: true, result: { node, documentId: state.documentId, snapshotId: state.snapshotId, url: location.href } };
+    }
+    if (operation === "query") {
+      const command = args.command;
+      if (command.type === "safari_webmcp_probe") {
+        const provider = Reflect.get(document, "modelContext");
+        return { ok: true, result: { getTools: typeof provider?.getTools, executeTool: typeof provider?.executeTool, originOpaque: location.origin === "null" } };
+      }
+      let context = document, injected = globalThis.__chatGPTSafariPlaywright;
+      if (!injected) return reject("QUERY_HELPER_MISSING", "The original Playwright selector engine is unavailable.");
+      const select = (selector, root = context) => injected.querySelectorAll(injected.parseSelector(selector), root);
+      if (command.type === "playwright_dom_snapshot") {
+        const snapshot = injected.incrementalAriaSnapshot(document.body || document.documentElement, { mode: "ai" });
+        return { ok: true, result: { dom_snapshot: snapshot.full, frameRefs: snapshot.iframeRefs.filter(ref => ref in snapshot.iframeDepths) } };
+      }
+      if (command.type === "safari_selection_read") {
+        const element = active();
+        if (element?.tagName === "IFRAME") return reject("CROSS_ORIGIN_FOCUS", "Use a frame-scoped locator before reading this iframe's selection.");
+        if (element && injected.isProtectedCredentialField(element)) return reject("PROTECTED_FIELD", "Credential field selections are not exposed to the session clipboard.");
+        const selection = element && typeof element.selectionStart === "number"
+          ? element.value.slice(element.selectionStart, element.selectionEnd) : String(element?.ownerDocument?.getSelection() || document.getSelection() || "");
+        return { ok: true, result: { text: selection } };
+      }
+      if (command.type === "safari_point_prepare") {
+        const element = hitAt(command.x, command.y)?.closest("a[href]");
+        if (!element) return reject("NOT_A_LINK", "The visible point does not identify a current file link.");
+        if (!state.snapshotId || state.url !== location.href) {
+          state.nodes.clear(); state.snapshotId = newId(); state.url = location.href;
+        }
+        const node = "q" + newId(); state.nodes.set(node, element);
+        return { ok: true, result: { node, documentId: state.documentId, snapshotId: state.snapshotId, url: location.href } };
+      }
+      const parts = String(command.selector || "").split(" >> internal:control=enter-frame >> ");
+      for (const part of parts.slice(0, -1)) {
+        const frames = select(part);
+        if (frames.length !== 1 || frames[0].tagName !== "IFRAME") return reject("AMBIGUOUS_FRAME", "A frame locator must resolve to exactly one iframe.");
+        try {
+          context = frames[0].contentDocument;
+          if (!context) throw new Error();
+          injected = context.defaultView.__chatGPTSafariPlaywright;
+          if (!injected) throw new Error();
+        } catch { return reject("CROSS_ORIGIN_FRAME", "This frame requires a frame-scoped Safari query; its document was not read from the parent origin."); }
+      }
+      const elements = select(parts.at(-1));
+      const visible = element => injected.elementState(element, "visible").matches;
+      const protectedField = element => injected.isProtectedCredentialField(element);
+      const kind = command.type;
+      if (kind === "playwright_locator_count") return { ok: true, result: { count: elements.length } };
+      if (kind === "playwright_locator_all_text_contents") return { ok: true, result: { values: elements.map(x => x.textContent || "") } };
+      if (kind === "playwright_locator_read_all") {
+        const serialize = element => ({ attributes: Object.fromEntries([...element.attributes].filter(x => x.name.toLowerCase() !== "value" || !protectedField(element)).map(x => [x.name, x.value])),
+          inner_text: element.innerText || "", text_content: element.textContent });
+        return { ok: true, result: { values: elements.map(element => command.relative_selector ? (select(command.relative_selector, element)[0] ? serialize(select(command.relative_selector, element)[0]) : null) : serialize(element)) } };
+      }
+      if (kind === "playwright_locator_wait_for") {
+        const first = elements[0], wanted = command.state || "visible";
+        const matched = wanted === "attached" ? !!first : wanted === "detached" ? !first : wanted === "visible" ? !!first && visible(first) : wanted === "hidden" ? !first || !visible(first) : false;
+        return { ok: true, result: { matched } };
+      }
+      let matches = elements;
+      if (matches.length > 1) {
+        const shown = matches.filter(visible);
+        if (shown.length === 1) matches = shown;
+      }
+      if (matches.length !== 1) return reject("STRICT_LOCATOR", `The locator resolved to ${matches.length} elements; use an unambiguous locator.`);
+      let element = matches[0];
+      if (kind === "safari_locator_focus") {
+        const target = injected.retarget(element, "follow-label");
+        if (!target || typeof target.focus !== "function") return reject("NOT_FOCUSABLE", "The locator does not identify a focusable element.");
+        target.focus({ preventScroll: true });
+        element = target;
+      }
+      if (kind === "safari_select_read") {
+        if (element.tagName !== "SELECT") return reject("NOT_A_SELECT", "The locator does not identify a native select element.");
+        return { ok: true, result: { multiple: element.multiple, options: [...element.options].map((option, index) => ({
+          index, value: option.value, label: option.label, nativeLabel: option.label.trim().replace(/\s+/g, " "),
+          disabled: option.disabled || option.parentElement?.disabled === true, selected: option.selected,
+        })) } };
+      }
+      const read = kind === "playwright_locator_get_attribute" ? { value: String(command.name).toLowerCase() === "value" && protectedField(element) ? null : element.getAttribute(command.name) }
+        : kind === "playwright_locator_inner_text" ? { value: element.innerText || "" }
+        : kind === "playwright_locator_text_content" ? { value: element.textContent }
+        : kind === "playwright_locator_is_enabled" ? { value: injected.elementState(element, "enabled").matches }
+        : kind === "playwright_locator_is_visible" ? { value: visible(element) }
+        : kind === "safari_checked_read" ? { checked: element.matches("input[type=checkbox],input[type=radio]") ? element.checked : element.getAttribute("aria-checked") === "true", isRadio: element.matches("input[type=radio],[role=radio]") }
+        : null;
+      if (read) return { ok: true, result: read };
+      if (!state.snapshotId || state.url !== location.href) {
+        state.nodes.clear(); state.snapshotId = newId(); state.url = location.href;
+      }
+      const node = "q" + newId(); state.nodes.set(node, element);
+      return { ok: true, result: { node, documentId: state.documentId, snapshotId: state.snapshotId, url: location.href,
+        viewport: { width: innerWidth, height: innerHeight } } };
+    }
     if (operation === "read") {
       state.nodes.clear();
-      state.snapshotId = crypto.randomUUID(); state.url = location.href;
+      state.snapshotId = newId(); state.url = location.href;
       const nodes = [];
-      const selectors = "a[href],button,input,textarea,select,[role=button],[role=link],[role=textbox],[contenteditable=true],[tabindex]";
-      for (const element of document.querySelectorAll(selectors)) {
+      const selectors = "a[href],button,input,textarea,select,iframe,[role=button],[role=link],[role=textbox],[contenteditable=true],[tabindex]";
+      for (const element of all(selectors)) {
         if (nodes.length >= 500 || !visible(element)) continue;
         const id = "n" + (nodes.length + 1); state.nodes.set(id, element);
         const item = { node: id, tag: element.tagName.toLowerCase(), role: element.getAttribute("role"), label: label(element),
@@ -636,10 +1879,10 @@ function m(t,o,e){if(location.origin!==t||o!=null&&location.href!==o)return{sele
         if (element.matches("input:not([type=password]),textarea,select")) item.value = element.value.slice(0, 1000);
         nodes.push(item);
       }
-      const text = document.body?.innerText || "";
+      const text = roots().map(root => root.body?.innerText ?? root.innerText ?? root.textContent ?? "").join("\n");
       return { ok: true, result: { url: location.href, title: document.title, documentId: state.documentId,
         snapshotId: state.snapshotId, text: text.slice(0, args.maxLength), truncated: text.length > args.maxLength, nodes,
-        focusedNode: [...state.nodes].find(([, element]) => element === document.activeElement)?.[0] || null,
+        focusedNode: [...state.nodes].find(([, element]) => element === active())?.[0] || null,
         frames: [...document.querySelectorAll("iframe")].map(x => ({ title: x.title, src: x.src })), scroll: { x: scrollX, y: scrollY },
         scope: "top-frame", viewport: { width: innerWidth, height: innerHeight } } };
     }
@@ -647,6 +1890,33 @@ function m(t,o,e){if(location.origin!==t||o!=null&&location.href!==o)return{sele
       return reject("STALE_TARGET", "The page or snapshot changed. Read the page again before interacting.");
     }
     if (operation === "check") return { ok: true, result: { url: location.href } };
+    if (operation === "filechooser_arm") {
+      state.fileChooserObserver?.stop();
+      const token = args.token, runtime = globalThis.browser?.runtime || globalThis.chrome?.runtime;
+      if (typeof token !== "string" || !runtime?.sendMessage) return reject("FILE_CHOOSER_OBSERVER_UNAVAILABLE", "Safari cannot observe the source file input for this native action.");
+      let timer, trustedGesture = false;
+      const documents = roots().filter(root => root.nodeType === 9);
+      const gesture = event => {
+        const source = args.sourceNode ? state.nodes.get(args.sourceNode) : null;
+        if (event.isTrusted && (source ? event.composedPath().some(node => node?.nodeType && contains(source, node)) : Math.abs(event.clientX - args.point?.x) <= 2 && Math.abs(event.clientY - args.point?.y) <= 2)) trustedGesture = true;
+      };
+      const observer = { stop() { for (const root of documents) { root.removeEventListener("click", clicked, true); root.removeEventListener("click", gesture, true); root.removeEventListener("keydown", gesture, true); } clearTimeout(timer); if (state.fileChooserObserver === observer) state.fileChooserObserver = null; } };
+      const clicked = event => {
+        const input = event.composedPath().find(node => node?.tagName === "INPUT" && node.type === "file");
+        // A trusted label click and a page's input.click() within that actual
+        // user gesture both dispatch a file-input click. Observe them; never
+        // invoke a hidden input or manufacture a user activation ourselves.
+        if (!input || !trustedGesture || (!event.isTrusted && !navigator.userActivation?.isActive) || !input.isConnected || input.disabled
+          || state.documentId !== args.documentId || state.url !== location.href) return;
+        observer.stop();
+        const node = "u" + newId(); state.nodes.set(node, input);
+        runtime.sendMessage({ type: "chatgpt-safari:file-input", token, node, isMultiple: input.multiple === true,
+          documentId: state.documentId, snapshotId: state.snapshotId, url: location.href }).catch(() => {});
+      };
+      state.fileChooserObserver = observer; for (const root of documents) { root.addEventListener("click", gesture, true); root.addEventListener("keydown", gesture, true); root.addEventListener("click", clicked, true); }
+      timer = setTimeout(observer.stop, 3000);
+      return { ok: true, result: { armed: true } };
+    }
     const element = args.node ? state.nodes.get(args.node) : document.documentElement;
     if (!element?.isConnected) return reject("STALE_TARGET", "This node is no longer in the page. Read the page again.");
     if (operation === "focused") {
@@ -656,44 +1926,93 @@ function m(t,o,e){if(location.origin!==t||o!=null&&location.href!==o)return{sele
         const deadline = Date.now() + 600;
         do {
           if (!element.isConnected || state.url !== location.href) return reject("STALE_TARGET", "The page changed while waiting for native focus.");
-          if (document.activeElement === element || element.contains(document.activeElement)) return { ok: true, result: { focused: true } };
+          if (active() === element || element.contains(active())) return { ok: true, result: { focused: true } };
           await new Promise(resolve => setTimeout(resolve, 20));
         } while (Date.now() < deadline);
         return reject("FOCUS_CHANGED", "The intended page element did not receive focus. No text was entered.");
       })();
     }
     if (operation === "pointCheck") {
-      const hit = document.elementFromPoint(args.point.x, args.point.y);
-      return visible(element) && hit && (hit === element || element.contains(hit))
+      if (args.frameRect) {
+        const current = rectangle(element);
+        if (["left", "top", "width", "height"].some(name => Math.abs(current[name] - args.frameRect[name]) > 0.5)) return reject("FRAME_LAYOUT_CHANGED", "The frame moved after its target was mapped. No input was replayed.");
+      }
+      const hit = hitAt(args.point.x, args.point.y);
+      return visible(element) && hit && contains(element, hit)
         ? { ok: true, result: { actionable: true } } : reject("TARGET_MOVED", "The page target moved or became covered before native input.");
     }
     if (operation !== "prepare") return reject("INVALID_COMMAND", "Unknown live page operation.");
     return (async () => {
-      if (args.node) element.scrollIntoView({ block: "center", inline: "center", behavior: "instant" });
+      if (args.node && args.noScroll !== true) {
+        element.scrollIntoView({ block: "center", inline: "center", behavior: "instant" });
+        let view = element.ownerDocument?.defaultView;
+        while (view && view !== window && view.frameElement) {
+          view.frameElement.scrollIntoView({ block: "center", inline: "center", behavior: "instant" });
+          view = view.frameElement.ownerDocument.defaultView;
+        }
+      }
       await new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)));
       if (!element.isConnected || state.url !== location.href) return reject("STALE_TARGET", "The page changed while targeting the node.");
       if (!visible(element) || element.disabled || element.getAttribute("aria-disabled") === "true") {
         return reject("NOT_ACTIONABLE", "The target is hidden or disabled.");
       }
       const textInput = element.tagName === "INPUT" && ["text", "search", "email", "url", "tel", "password", "number"].includes(element.type);
-      if (args.type === "type" && (!(textInput || element.matches("textarea") || element.isContentEditable) ||
+      const focusedFrame = element.tagName === "IFRAME" && args.requireFocused === true && active() === element;
+      if (args.type === "type" && (!(textInput || element.matches("textarea") || element.isContentEditable || focusedFrame) ||
           element.readOnly || element.getAttribute("aria-readonly") === "true")) {
         return reject("NOT_EDITABLE", "The selected node is not an editable page element.");
       }
-      const rect = element.getBoundingClientRect();
-      const x = args.node ? Math.max(0, Math.min(innerWidth, (Math.max(0, rect.left) + Math.min(innerWidth, rect.right)) / 2)) : innerWidth / 2;
-      const y = args.node ? Math.max(0, Math.min(innerHeight, (Math.max(0, rect.top) + Math.min(innerHeight, rect.bottom)) / 2)) : innerHeight / 2;
-      const hit = document.elementFromPoint(x, y);
-      if (!hit || !(hit === element || element.contains(hit))) return reject("OBSCURED_TARGET", "Another page element covers the target.");
-      return { ok: true, result: { expectedUrl: location.href, viewport: { width: innerWidth, height: innerHeight }, point: { x, y } } };
+      const rect = rectangle(element);
+      const x = args.point?.x ?? (args.node ? Math.max(0, Math.min(innerWidth, (Math.max(0, rect.left) + Math.min(innerWidth, rect.right)) / 2)) : innerWidth / 2);
+      const y = args.point?.y ?? (args.node ? Math.max(0, Math.min(innerHeight, (Math.max(0, rect.top) + Math.min(innerHeight, rect.bottom)) / 2)) : innerHeight / 2);
+      const hit = hitAt(x, y);
+      if (!hit || !contains(element, hit)) return reject("OBSCURED_TARGET", "Another page element covers the target.");
+      let axisAligned = true;
+      if (args.frameBounds) for (let ancestor = element; ancestor; ancestor = ancestor.parentElement || ancestor.getRootNode?.().host) {
+        const transform = getComputedStyle(ancestor).transform;
+        if (transform && transform !== "none") {
+          const matrix = new DOMMatrixReadOnly(transform);
+          if (!matrix.is2D || matrix.b !== 0 || matrix.c !== 0 || matrix.a <= 0 || matrix.d <= 0) axisAligned = false;
+        }
+      }
+      const frame = args.frameBounds ? { left: rect.left, top: rect.top, width: rect.width, height: rect.height,
+        clientLeft: element.clientLeft, clientTop: element.clientTop, clientWidth: element.clientWidth, clientHeight: element.clientHeight,
+        offsetWidth: element.offsetWidth, offsetHeight: element.offsetHeight, axisAligned } : undefined;
+      return { ok: true, result: { expectedUrl: location.href, viewport: { width: innerWidth, height: innerHeight }, point: { x, y }, ...(frame ? { frame } : {}) } };
     })();
   }
 
   function createLive(api, environment = root) {
     let profileId, timer, stopped = false, polling = false;
     const sessionId = environment.crypto.randomUUID();
+    const frameResolutions = new Map(), fileInputObservations = new Map(), fileChoosers = new Map();
     const delay = ms => new Promise(resolve => environment.setTimeout(resolve, ms));
-    const send = command => api.runtime.sendNativeMessage("dev.jamie.chatgpt-safari", { operation: "companion", command });
+    const send = async command => {
+      const nativeInput = ["liveInput", "liveModal", "liveDialog"].includes(command.action);
+      let callbackTimer, response;
+      try {
+        if (nativeInput) callbackTimer = environment.setTimeout(() => {
+          // Only diagnose whether Safari can service a timer and another native
+          // message while this callback is pending. Never retry native input.
+          Promise.resolve().then(() => api.runtime.sendNativeMessage("dev.jamie.chatgpt-safari", { operation: "companion", command: {
+            action: "liveInputCallbackTimeout", id: command.id, profileId: command.profileId, sessionId: command.sessionId,
+          } })).catch(() => {});
+        }, 2000);
+        response = await api.runtime.sendNativeMessage("dev.jamie.chatgpt-safari", { operation: "companion", command });
+      } finally { if (callbackTimer !== undefined) (environment.clearTimeout || clearTimeout)(callbackTimer); }
+      const receipt = response?.inputReceiptSequence;
+      if (nativeInput && Number.isSafeInteger(receipt) && receipt > 0) {
+        // Record receipt before unwrapping a native success OR failure and
+        // before any page/selection API. This diagnostic has no input payload
+        // and cannot replay or change the delivered native operation.
+        try {
+          await api.runtime.sendNativeMessage("dev.jamie.chatgpt-safari", { operation: "companion", command: {
+            action: "liveInputAck", id: command.id, profileId: command.profileId, sessionId: command.sessionId, receiptSequence: receipt,
+          } });
+        } catch { /* Receipt telemetry must not hide the actual native outcome. */ }
+      }
+      return response;
+    };
     const unwrap = response => {
       if (response?.ok !== true) throw Object.assign(new Error(response?.error?.message || "Live Safari command failed."), response?.error || { code: "LIVE_FAILED" });
       return response.result;
@@ -705,29 +2024,66 @@ function m(t,o,e){if(location.origin!==t||o!=null&&location.href!==o)return{sele
     };
     const describe = tab => ({ handle: `live:${profileId}:${tab.id}`, profileId, tabId: tab.id, windowId: tab.windowId,
       title: tab.title || "", url: tab.url || "", active: !!tab.active, status: tab.status });
-    async function target(handle, expectedUrl) {
+    async function target(handle, expectedUrl, allowBlank = false) {
       const parts = String(handle).split(":");
       if (parts.length !== 3 || parts[0] !== "live" || parts[1] !== profileId || !/^\d+$/.test(parts[2])) throw fail("INVALID_HANDLE", "Use a handle from this profile's live_list_tabs result.");
       const tab = await api.tabs.get(Number(parts[2]));
       if (tab.incognito) throw fail("PRIVATE_TAB", "Private Safari tabs are not controlled by this backend.");
-      url(tab.url);
+      if (!(allowBlank && tab.url === "about:blank" && expectedUrl === "about:blank")) url(tab.url);
       if (expectedUrl !== undefined && tab.url !== expectedUrl) throw fail("STALE_TARGET", "The tab navigated. Read its current page before acting.");
       return tab;
     }
-    async function page(tab, operation, args) {
-      const [value] = await api.scripting.executeScript({ target: { tabId: tab.id, frameIds: [0] }, func: pageOperation, args: [operation, args] });
+    async function page(tab, operation, args, frameId = 0) {
+      const [value] = await api.scripting.executeScript({ target: { tabId: tab.id, frameIds: [frameId] }, func: pageOperation, args: [operation, args] });
       return unwrap(value?.result);
     }
-    async function read(tab, maxLength = 20000) {
+    api.runtime.onMessage?.addListener((message, sender) => {
+      if (message?.type === "chatgpt-safari:file-input") {
+        const pending = fileInputObservations.get(message.token);
+        if (!pending || sender.tab?.id !== pending.tabId || sender.frameId !== pending.frameId || sender.url !== pending.url
+          || message.url !== pending.url || message.documentId !== pending.documentId || message.snapshotId !== pending.snapshotId
+          || typeof message.node !== "string" || !/^u[a-f0-9]{32}$/.test(message.node) || typeof message.isMultiple !== "boolean") return;
+        if (pending.value) { pending.ambiguous = true; return; }
+        pending.value = { documentId: message.documentId, snapshotId: message.snapshotId, node: message.node, isMultiple: message.isMultiple };
+        return { ok: true };
+      }
+      if (message?.type !== "chatgpt-safari:frame-identity") return;
+      const pending = frameResolutions.get(message.nonce);
+      if (!pending || sender.tab?.id !== pending.tabId || !Number.isSafeInteger(sender.frameId) || sender.frameId <= 0
+        || !/^(?:[a-f0-9]{32}|[a-f0-9-]{36})$/.test(message.documentId || "")) return;
+      return (async () => {
+        const frames = await api.webNavigation.getAllFrames({ tabId: pending.tabId });
+        const frame = frames.find(frame => frame.frameId === sender.frameId && frame.parentFrameId === pending.parentFrameId && frame.url === sender.url);
+        if (!frame || frameResolutions.get(message.nonce) !== pending) return;
+        frameResolutions.delete(message.nonce); environment.clearTimeout?.(pending.timer);
+        pending.resolve({ frameId: frame.frameId, url: frame.url, documentId: message.documentId }); return { ok: true };
+      })();
+    });
+    async function resolveFrame(tab, parentFrameId, selector, expectedDocumentId) {
+      if (typeof api.webNavigation?.getAllFrames !== "function") throw fail("FRAME_API_UNAVAILABLE", "Safari does not expose native frame identities.");
+      const nonce = environment.crypto.randomUUID();
+      let pending;
+      const identity = new Promise((resolve, reject) => {
+        pending = { tabId: tab.id, parentFrameId, resolve,
+          timer: environment.setTimeout(() => { frameResolutions.delete(nonce); reject(fail("FRAME_DISCONNECTED", "The selected frame did not return its actual Safari frame identity.")); }, 2000) };
+        frameResolutions.set(nonce, pending);
+      });
+      identity.catch(() => {});
+      try {
+        const binding = await page(tab, "frame_resolve", { selector, nonce, expectedDocumentId }, parentFrameId);
+        const child = await identity; return { ...binding, frameId: parentFrameId, childFrameId: child.frameId, childUrl: child.url, childDocumentId: child.documentId };
+      } catch (error) { frameResolutions.delete(nonce); environment.clearTimeout?.(pending.timer); throw error; }
+    }
+    async function read(tab, maxLength = 20000, observe = operation => operation()) {
       if (!Number.isInteger(maxLength) || maxLength < 1000 || maxLength > 60000) throw fail("INVALID_ARGUMENT", "maxLength must be between 1000 and 60000.");
-      const value = await page(tab, "read", { maxLength });
-      await target(describe(tab).handle, value.url);
+      const value = await observe(() => page(tab, "read", { maxLength }));
+      await observe(() => target(describe(tab).handle, value.url));
       return { ...describe(tab), ...value };
     }
-    async function ready(tabId) {
+    async function ready(tabId, observe = operation => operation()) {
       let tab;
       for (let i = 0; i < 60; i++) {
-        tab = await api.tabs.get(tabId);
+        tab = await observe(() => api.tabs.get(tabId));
         if (tab.status === "complete") return tab;
         await delay(100);
       }
@@ -746,9 +2102,70 @@ function m(t,o,e){if(location.origin!==t||o!=null&&location.href!==o)return{sele
       if (!fresh.active) throw fail("FOCUS_CHANGED", "Safari did not select the requested tab.");
       return { left: window.left, top: window.top, width: window.width, height: window.height };
     }
+    async function capture(tab, args, request, bounds, selection, assertTime) {
+      const before = await page(tab, "capture_state", {});
+      const region = args.clip || (args.fullPage ? { x: 0, y: 0, width: before.width, height: before.height }
+        : { x: before.x, y: before.y, width: before.contentWidth, height: before.viewport.height });
+      if (![region.x, region.y, region.width, region.height].every(Number.isFinite) || region.x < 0 || region.y < 0
+        || region.width <= 0 || region.height <= 0 || region.width * region.height > 40000000
+        || region.x + region.width > before.width + 1 || region.y + region.height > before.height + 1) {
+        throw fail("INVALID_CAPTURE_REGION", "The screenshot region must fit the current document and contain at most 40 million pixels.");
+      }
+      const canvas = environment.document?.createElement("canvas");
+      if (!canvas) throw fail("CAPTURE_RENDERER_UNAVAILABLE", "Safari's background image compositor is unavailable.");
+      canvas.width = Math.ceil(region.width); canvas.height = Math.ceil(region.height);
+      const context = canvas.getContext("2d");
+      if (!context) throw fail("CAPTURE_RENDERER_UNAVAILABLE", "Safari could not create the screenshot compositor.");
+      const raw = async () => {
+        selection?.assertCurrent(); assertTime(); await target(describe(tab).handle, before.url);
+        const selected = await api.tabs.get(tab.id), window = await api.windows.get(tab.windowId);
+        if (!selected.active || !window.focused) throw fail("FOCUS_CHANGED", "The screenshot tab/window lost focus. Capture was stopped.");
+        let dataUrl;
+        if (typeof api.tabs.captureVisibleTab === "function") dataUrl = await api.tabs.captureVisibleTab(tab.windowId, { format: "png" });
+        else dataUrl = unwrap(await send({ action: "liveCapture", id: request.id, profileId, sessionId,
+          input: { expectedUrl: before.url, windowBounds: bounds, viewport: before.viewport, fullPage: false } })).dataUrl;
+        if (typeof dataUrl !== "string" || !/^data:image\/(png|jpeg);base64,/i.test(dataUrl)) throw fail("CAPTURE_FAILED", "Safari returned no valid screenshot bytes.");
+        await target(describe(tab).handle, before.url);
+        const image = new environment.Image();
+        await new Promise((resolve, reject) => { image.onload = resolve; image.onerror = () => reject(fail("CAPTURE_DECODE_FAILED", "Safari's captured image could not be decoded.")); image.src = dataUrl; });
+        return image;
+      };
+      let tiles = 0, changed = false, pendingError;
+      try {
+        for (let y = 0; y < region.height; y += before.viewport.height) {
+          for (let x = 0; x < region.width; x += before.contentWidth) {
+            if (++tiles > 256) throw fail("CAPTURE_LIMIT", "This full-page screenshot exceeds the 256-tile limit.");
+            const desired = { x: region.x + x, y: region.y + y };
+            const position = await page(tab, "capture_scroll", { ...before, ...desired }); changed = true;
+            const sourceX = desired.x - position.x, sourceY = desired.y - position.y;
+            const width = Math.min(before.contentWidth - sourceX, region.width - x);
+            const height = Math.min(before.viewport.height - sourceY, region.height - y);
+            if (width <= 0 || height <= 0) throw fail("CAPTURE_LAYOUT_CHANGED", "The document layout changed while capturing its tiles.");
+            const image = await raw();
+            const scaleX = image.naturalWidth / before.viewport.width, scaleY = image.naturalHeight / before.viewport.height;
+            if (!(scaleX > 0 && scaleY > 0)) throw fail("CAPTURE_FAILED", "Safari returned invalid image dimensions.");
+            context.drawImage(image, sourceX * scaleX, sourceY * scaleY, width * scaleX, height * scaleY, x, y, width, height);
+          }
+        }
+        return { dataUrl: canvas.toDataURL("image/png"), width: canvas.width, height: canvas.height };
+      } catch (error) { pendingError = error; throw error; }
+      finally {
+        canvas.width = 0; canvas.height = 0;
+        if (changed) {
+          try {
+            const restored = await page(tab, "capture_scroll", before);
+            if (Math.abs(restored.x - before.x) > 1 || Math.abs(restored.y - before.y) > 1) throw fail("CAPTURE_SCROLL_RESTORE_FAILED", "Safari did not restore the original screenshot scroll position.");
+          } catch (error) {
+            if (!pendingError) throw error;
+            pendingError.message += ` Scroll restoration failed: ${error.message}`;
+          }
+        }
+      }
+    }
     async function execute(request) {
       const action = request.command.action;
-      if (request.agentOwner !== undefined && ["interact", "organize", "select_tab"].includes(action)) {
+      if (request.agentOwner !== undefined && ["interact", "organize", "select_tab", "screenshot", "dialog", "filechooser", "viewport"].includes(action)
+        && !(action === "viewport" && request.command.arguments?.operation === "reset")) {
         if (typeof request.agentOwner !== "string" || !request.agentOwner
           || typeof environment.ChatGPTSafariSidebar?.withAgentSelection !== "function") {
           throw fail("INVALID_OWNER", "The original Safari agent selection owner is unavailable.");
@@ -758,10 +2175,12 @@ function m(t,o,e){if(location.origin!==t||o!=null&&location.href!==o)return{sele
           ? request.command.arguments.operation : undefined;
         const groupArgs = request.command.arguments || {};
         return environment.ChatGPTSafariSidebar.withAgentSelection(request.agentOwner, tab,
-          selection => executeCommand(request, selection), { nativeGroupMove,
+          selection => executeCommand(request, selection), { action, nativeGroupMove,
             destinationTitle: nativeGroupMove === "moveToUngrouped" ? null
               : nativeGroupMove === "createGroup" ? groupArgs.newTitle : groupArgs.groupTitle,
-            nativeWindowIdentifier: groupArgs.windowIdentifier });
+            nativeWindowIdentifier: groupArgs.windowIdentifier,
+            afterOwnerRestored: action === "viewport"
+              ? ownerTab => environment.ChatGPTSafariViewport.commitReturnPage({ ...request, sessionId }, ownerTab) : undefined });
       }
       return executeCommand(request);
     }
@@ -778,8 +2197,99 @@ function m(t,o,e){if(location.origin!==t||o!=null&&location.href!==o)return{sele
         const created = await api.tabs.create({ url: url(args.url), active: true, ...(args.windowId === undefined ? {} : { windowId: args.windowId }) });
         return describe(await ready(created.id));
       }
-      const tab = await target(args.handle, ["navigate", "history", "select_tab", "close_tab"].includes(action) ? args.expectedUrl : undefined);
+      const tab = await target(args.handle, ["navigate", "history", "select_tab", "close_tab"].includes(action) ? args.expectedUrl : undefined, action === "navigate");
+      if (action === "viewport") return environment.ChatGPTSafariViewport.run({ ...request, sessionId }, selection);
       if (action === "read_page") return read(tab, args.maxLength);
+      if (action === "dom_query") {
+        if (args.command?.type === "safari_downloads_probe") return { download: typeof api.downloads?.download,
+          search: typeof api.downloads?.search, onCreated: typeof api.downloads?.onCreated?.addListener, onChanged: typeof api.downloads?.onChanged?.addListener };
+        if (args.command?.type === "safari_webmcp_probe") return page(tab, "query", args);
+        if (args.command?.type === "safari_content_export_inspect") {
+          return environment.ChatGPTSafariDownloads.createExports({ api, target, send, profileId, sessionId, assertTime, unwrap }).inspect(tab, args.command);
+        }
+        if (["safari_assets_list", "safari_assets_inspect"].includes(args.command?.type)) {
+          const downloads = environment.ChatGPTSafariDownloads.createDownloads({ api, target, send, profileId, sessionId, assertTime, unwrap });
+          return args.command.type === "safari_assets_list" ? downloads.listAssets(tab, { ...args.command, handle: args.handle })
+            : downloads.inspectAssets(tab, { ...args.command, handle: args.handle });
+        }
+        if (args.command?.type === "safari_logs_start") {
+          const value = await page(tab, "logs_bind", { scope: args.command.scope });
+          await api.scripting.executeScript({ target: { tabId: tab.id, frameIds: [0] }, world: "MAIN", func: consoleCapture, args: ["start", value.token] });
+          return value;
+        }
+        if (args.command?.type === "safari_logs_read") return page(tab, "logs_read", args.command);
+        await api.scripting.executeScript({ target: { tabId: tab.id, allFrames: true }, files: ["safari/playwright-injected.js"], world: "ISOLATED" });
+        assertTime();
+        if (args.command?.type === "playwright_dom_snapshot") {
+          const snapshot = async (frameId, depth = 0, expectedDocumentId) => {
+            assertTime();
+            const value = await page(tab, "query", { ...args, expectedDocumentId }, frameId);
+            let text = value.dom_snapshot;
+            if (depth < 8) for (const ref of value.frameRefs || []) {
+              try {
+                const child = await resolveFrame(tab, frameId, "aria-ref=" + ref, expectedDocumentId);
+                const body = await snapshot(child.childFrameId, depth + 1, child.childDocumentId);
+                text = text.split("\n").flatMap(line => line.includes(`[ref=${ref}]`) && /^\s*- iframe\b/.test(line)
+                  ? [line + (line.endsWith(":") ? "" : ":"), ...body.split("\n").map(inner => (line.match(/^\s*/)?.[0] || "") + "  " + inner)] : [line]).join("\n");
+              } catch (error) {
+                if (!["FRAME_DISCONNECTED", "FRAME_API_UNAVAILABLE", "STRICT_FRAME"].includes(error.code)) throw error;
+                text += `\n- iframe content unavailable: ${error.code}`;
+              }
+            }
+            return text.slice(0, 60000);
+          };
+          return { dom_snapshot: await snapshot(0) };
+        }
+        let frameId = 0, expectedDocumentId; const framePath = [];
+        const parts = typeof args.command?.selector === "string" ? args.command.selector.split(" >> internal:control=enter-frame >> ") : [];
+        if (parts.length > 9) throw fail("FRAME_DEPTH", "A Safari frame locator is limited to eight nested frames.");
+        for (const part of parts.slice(0, -1)) {
+          assertTime(); const binding = await resolveFrame(tab, frameId, part, expectedDocumentId); framePath.push(binding); frameId = binding.childFrameId; expectedDocumentId = binding.childDocumentId;
+        }
+        const result = await page(tab, "query", { ...args, expectedDocumentId, command: { ...args.command, ...(parts.length ? { selector: parts.at(-1) } : {}) } }, frameId);
+        return { ...result, ...(frameId ? { frameId, framePath } : {}) };
+      }
+      if (action === "asset_bundle") {
+        const downloads = environment.ChatGPTSafariDownloads.createDownloads({ api, target, send, profileId, sessionId, assertTime, unwrap });
+        return downloads.bundle(request, tab, args);
+      }
+      if (action === "content_export") {
+        return environment.ChatGPTSafariDownloads.createExports({ api, target, send, profileId, sessionId, assertTime, unwrap }).execute(request, tab, args);
+      }
+      if (action === "filechooser") {
+        const chooser = fileChoosers.get(args.chooserId);
+        if (!chooser || chooser.tabId !== tab.id || chooser.ownerId !== request.agentOwner
+          || chooser.sessionId !== args.agentScope?.sessionId || chooser.turnId !== args.agentScope?.turnId
+          || args.agentScope?.ownerId !== request.agentOwner || !args.scope || Object.keys(args.scope).length !== 7
+          || Object.entries(chooser.scope).some(([name, value]) => args.scope[name] !== value)
+          || chooser.url !== tab.url || args.operation !== "setFiles") throw fail("STALE_FILE_CHOOSER", "This file chooser no longer belongs to the exact source tab, owner, session, and turn.");
+        const selectedBounds = await focus(tab, selection);
+        const sameBounds = ["left", "top", "width", "height"].every(name => Math.abs(selectedBounds[name] - chooser.windowBounds[name]) <= 1);
+        if (!sameBounds) throw fail("WINDOW_CHANGED", "The file chooser's source Safari window moved or resized.");
+        selection?.assertCurrent(); assertTime();
+        fileChoosers.delete(args.chooserId);
+        const result = unwrap(await send({ action: "liveFileChooser", id: request.id, profileId, sessionId,
+          input: { action: "fileChooser", operation: "setFiles", expectedUrl: chooser.url, windowBounds: selectedBounds,
+            scope: chooser.scope, isMultiple: chooser.isMultiple, chooserId: args.chooserId, files: args.files } }));
+        selection?.releaseDialog?.();
+        return result;
+      }
+      if (action === "screenshot" || action === "dialog") {
+        const selectedBounds = await focus(tab, selection);
+        assertTime();
+        const fresh = await target(args.handle, tab.url);
+        const input = { expectedUrl: fresh.url, windowBounds: selectedBounds };
+        if (action === "dialog") {
+          unwrap(await send({ action: "liveInput", id: request.id, profileId, sessionId,
+            input: { ...input, action: "focus", allowJavaScriptDialog: true } }));
+          const result = unwrap(await send({ action: "liveDialog", id: request.id, profileId, sessionId,
+            input: { ...input, action: args.operation, dialogId: args.dialogId, promptText: args.promptText } }));
+          if (args.operation === "inspect" && result.dialog) selection?.holdDialog?.();
+          else selection?.releaseDialog?.();
+          return args.operation === "inspect" ? { dialog: result.dialog } : {};
+        }
+        return capture(tab, args, request, selectedBounds, selection, assertTime);
+      }
       if (action === "download_link_inspect" || action === "download_link") {
         const downloads = environment.ChatGPTSafariDownloads.createDownloads({ api, target, send, profileId, sessionId, assertTime, unwrap });
         return action === "download_link_inspect" ? downloads.inspect(tab, args) : downloads.execute(request, tab, args);
@@ -812,10 +2322,35 @@ function m(t,o,e){if(location.origin!==t||o!=null&&location.href!==o)return{sele
       if (action !== "interact") throw fail("UNKNOWN_ACTION", "Unknown live Safari action.");
       if (typeof args.documentId !== "string" || typeof args.snapshotId !== "string" ||
           !Array.isArray(args.interactions) || args.interactions.length < 1 || args.interactions.length > 20) throw fail("INVALID_ARGUMENT", "A fresh page snapshot and 1–20 interactions are required.");
+      const frameId = args.frameId || 0;
+      const framePath = args.framePath || [];
+      if (!Number.isSafeInteger(frameId) || frameId < 0 || !Array.isArray(framePath) || framePath.length > 8
+        || (frameId > 0 && (!framePath.length || framePath.at(-1).childFrameId !== frameId))) throw fail("INVALID_FRAME", "A native frame-scoped input requires its observed parent frame chain.");
       const completed = [];
       const nativeSteps = [];
+      let inputDelivered = false, readbackExpired = false, lastDelivered, lastWindowBounds, lastCurrent = tab, activeFileChooserOpened;
+      const fileInputTokens = new Set();
+      const observe = async operation => {
+        assertTime();
+        if (readbackExpired) throw fail("POST_INPUT_READBACK_TIMEOUT", "The delivered input's page readback expired. No input was repeated.");
+        if (!inputDelivered) { const result = await operation(); assertTime(); return result; }
+        let timer;
+        try {
+          const result = await Promise.race([operation(), new Promise((_, reject) => {
+            timer = environment.setTimeout(() => {
+              readbackExpired = true;
+              reject(Object.assign(fail("POST_INPUT_READBACK_TIMEOUT", "Safari did not finish a page observation within two seconds after delivered native input. Do not repeat that input."),
+                { mayHavePostedInput: true, doNotReplay: true }));
+            }, 2000);
+          })]);
+          assertTime(); return result;
+        } finally { if (timer !== undefined) (environment.clearTimeout || clearTimeout)(timer); }
+      };
+      const observedPage = (operation, options, selectedFrame = frameId) => observe(() => page(tab, operation,
+        { ...options, ...(inputDelivered ? { _nativeObservationDeadline: Date.now() + 2000 } : {}) }, selectedFrame));
+      const scopedPage = (operation, options) => observedPage(operation, options);
       try {
-        await page(tab, "check", args);
+        await scopedPage("check", args);
         // Safari's windows.update selects its window but does not activate a
         // background/fullscreen app. One explicit native activation precedes
         // the batch; later user focus changes abort instead of being undone.
@@ -827,45 +2362,139 @@ function m(t,o,e){if(location.origin!==t||o!=null&&location.href!==o)return{sele
         for (const interaction of args.interactions) {
           selection?.assertCurrent();
           assertTime();
-          if (!["click", "type", "key", "scroll"].includes(interaction.type) ||
-              (interaction.type !== "scroll" && typeof interaction.node !== "string")) throw fail("INVALID_ARGUMENT", "Each interaction requires a supported type and page node.");
+          if (!["click", "type", "key", "scroll", "move", "drag", "select"].includes(interaction.type) ||
+              (!["scroll", "move", "drag", "click"].includes(interaction.type) && typeof interaction.node !== "string") ||
+              (interaction.type === "click" && typeof interaction.node !== "string" && !interaction.point)) throw fail("INVALID_ARGUMENT", "Each interaction requires a supported type and page node or viewport point.");
           if (interaction.type === "type" && (typeof interaction.value !== "string" || interaction.value.length > 12000)) throw fail("INVALID_ARGUMENT", "Type requires text of at most 12000 UTF-16 code units.");
-          if (interaction.type === "key" && !["Enter", "Tab", "Shift+Tab", "Escape", "Backspace", "Delete", "Space", "ArrowLeft", "ArrowRight", "ArrowUp", "ArrowDown", "Home", "End", "PageUp", "PageDown"].includes(interaction.key)) throw fail("UNSUPPORTED_KEY", "Use a supported page editing/navigation key, not an application shortcut.");
-          const current = await target(args.handle, tab.url);
-          const window = await api.windows.get(tab.windowId);
+          if (interaction.type === "key" && (typeof interaction.key !== "string" || interaction.key.length > 80)) throw fail("UNSUPPORTED_KEY", "Use a page key with optional Meta, Control, Alt, and Shift modifiers.");
+          const current = await observe(() => target(args.handle, tab.url));
+          const window = await observe(() => api.windows.get(tab.windowId));
           if (!current.active || !window.focused) throw fail("FOCUS_CHANGED", "The selected Safari tab/window lost focus. No input was replayed.");
           const windowBounds = { left: window.left, top: window.top, width: window.width, height: window.height };
-          const geometry = await page(tab, "prepare", { ...args, ...interaction });
+          lastCurrent = current; lastWindowBounds = windowBounds;
+          const frameGeometry = [];
+          for (const frame of framePath) {
+            await observedPage("check", frame, frame.frameId);
+            frameGeometry.push(await observedPage("prepare", { ...frame, type: "click", frameBounds: true }, frame.frameId));
+          }
+          const localGeometry = await scopedPage("prepare", { ...args, ...interaction });
+          for (const [index, frame] of framePath.entries()) frameGeometry[index] = await observedPage("prepare", { ...frame, type: "click", frameBounds: true, noScroll: true }, frame.frameId);
+          let point = { ...localGeometry.point };
+          const parentPoints = [];
+          for (const geometry of [...frameGeometry].reverse()) {
+            const { frame } = geometry;
+            const scaleX = frame.width / frame.offsetWidth, scaleY = frame.height / frame.offsetHeight;
+            if (!frame.axisAligned || ![scaleX, scaleY].every(value => Number.isFinite(value) && value > 0)) throw fail("FRAME_LAYOUT_CHANGED", "Safari could not map a rotated, detached, or invalid frame viewport.");
+            point = { x: frame.left + (frame.clientLeft + point.x) * scaleX, y: frame.top + (frame.clientTop + point.y) * scaleY };
+            parentPoints.unshift(point);
+          }
+          const geometry = framePath.length ? { expectedUrl: tab.url, viewport: frameGeometry[0].viewport, point } : localGeometry;
+          let openedFileInput, inputObservation;
           const native = async (kind, extra = {}) => {
             selection?.assertCurrent();
-            assertTime(); await target(args.handle, tab.url); await page(tab, "check", args);
-            await page(tab, "pointCheck", { ...args, node: interaction.node, point: geometry.point });
-            const result = unwrap(await send({ action: "liveInput", id: request.id, profileId, sessionId,
+            assertTime(); await observe(() => target(args.handle, tab.url)); await scopedPage("check", args);
+            for (const [index, frame] of framePath.entries()) {
+              await observedPage("check", frame, frame.frameId);
+              await observedPage("pointCheck", { ...frame, point: parentPoints[index], frameRect: frameGeometry[index].frame }, frame.frameId);
+            }
+            await scopedPage("pointCheck", { ...args, node: interaction.node, point: localGeometry.point });
+            let token, observation;
+            if (["click", "key"].includes(kind) && request.agentOwner !== undefined) {
+              token = environment.crypto.randomUUID();
+              observation = { tabId: tab.id, frameId, url: framePath.at(-1)?.childUrl || tab.url,
+                documentId: args.documentId, snapshotId: args.snapshotId };
+              inputObservation = observation;
+              fileInputObservations.set(token, observation);
+              fileInputTokens.add(token);
+              await scopedPage("filechooser_arm", { ...args, token, sourceNode: interaction.node, point: localGeometry.point });
+            }
+            let result;
+            assertTime();
+            result = unwrap(await send({ action: "liveInput", id: request.id, profileId, sessionId,
               input: { action: kind, ...geometry, windowBounds, ...extra } }));
+            if (observation?.value && !observation.ambiguous) openedFileInput = observation.value;
             nativeSteps.push({ action: kind, node: interaction.node, ...result });
+            if (result.eventsPosted > 0) { inputDelivered = true; lastDelivered = { type: kind, node: interaction.node, result, recorded: false }; }
             return result;
           };
+          const fileChooserOpened = async () => {
+            selection?.holdDialog?.("filechooser");
+            const observedInput = inputObservation?.ambiguous ? null : inputObservation?.value || openedFileInput;
+            if (!observedInput || args.agentScope?.ownerId !== request.agentOwner || typeof args.agentScope?.sessionId !== "string" || typeof args.agentScope?.turnId !== "string") {
+              return { completed, tab: describe(current), fileChooserOpen: true,
+                fileChooserError: "The native file chooser opened without a verified DOM file-input click. Cancel this chooser before continuing; custom showPicker-only controls are unsupported. The opening click was not repeated." };
+            }
+            const scope = { profileId, tabId: String(tab.id), documentId: observedInput.documentId, node: observedInput.node,
+              ownerId: request.agentOwner, sessionId: args.agentScope.sessionId, turnId: args.agentScope.turnId };
+            if (Object.entries(args.fileChooserScope || {}).length !== 6 || Object.entries(args.fileChooserScope).some(([key, value]) => scope[key] !== value)) throw fail("FILE_CHOOSER_SCOPE_CHANGED", "The observed file input no longer matches this original agent operation's source scope.");
+            assertTime(); selection?.assertCurrent();
+            const result = unwrap(await send({ action: "liveFileChooser", id: request.id, profileId, sessionId,
+              input: { action: "fileChooser", operation: "inspect", expectedUrl: tab.url, windowBounds,
+                scope, isMultiple: observedInput.isMultiple } }));
+            if (!result.fileChooser?.id || result.fileChooser.isMultiple !== observedInput.isMultiple) throw fail("FILE_CHOOSER_UNVERIFIABLE", "The native chooser did not retain its observed source file input. The opening click was not repeated.");
+            fileChoosers.set(result.fileChooser.id, { tabId: tab.id, url: tab.url, windowBounds, scope,
+              ownerId: request.agentOwner, sessionId: scope.sessionId, turnId: scope.turnId, isMultiple: observedInput.isMultiple });
+            return { completed, tab: describe(current), fileChooserOpen: true, fileChooser: { ...result.fileChooser, scope },
+              nextAction: "Use the registered original file chooser's setFiles after upload approval. No later input was delivered." };
+          };
+          activeFileChooserOpened = fileChooserOpened;
           if (interaction.type === "type" && interaction.requireFocused !== true) {
-            await native("click");
-            await page(tab, "focused", { ...args, node: interaction.node });
+            const clicked = await native("click");
+            if (clicked.fileChooserOpen === true) {
+              completed.push({ type: "click", node: interaction.node, result: clicked }); return fileChooserOpened();
+            }
+            if (clicked.dialogOpen === true) {
+              completed.push({ type: "click", node: interaction.node, result: clicked }); selection?.holdDialog?.();
+              return { completed, tab: describe(current), dialogOpen: true, nextAction: "Inspect the current JavaScript dialog before continuing. No text or later input was delivered." };
+            }
+            await scopedPage("focused", { ...args, node: interaction.node });
           }
           // A key must not implicitly click/activate a button or move a caret.
-          if (interaction.type === "key" || (interaction.type === "type" && interaction.requireFocused === true)) await page(tab, "focused", { ...args, node: interaction.node });
+          if (interaction.type === "key" || (interaction.type === "type" && interaction.requireFocused === true)) await scopedPage("focused", { ...args, node: interaction.node });
           const result = await native(interaction.type, { text: interaction.value, replaceAll: interaction.replaceAll === true,
-            key: interaction.key, deltaX: interaction.deltaX, deltaY: interaction.deltaY });
+            key: interaction.key, deltaX: interaction.deltaX, deltaY: interaction.deltaY,
+            clickCount: interaction.clickCount, button: interaction.button, modifiers: interaction.modifiers, path: interaction.path,
+            options: interaction.options, multiple: interaction.multiple });
           completed.push({ type: interaction.type, node: interaction.node, result });
+          if (lastDelivered?.result === result) lastDelivered.recorded = true;
+          if (result.fileChooserOpen === true) return fileChooserOpened();
+          if (result.dialogOpen === true) {
+            selection?.holdDialog?.();
+            return { completed, tab: describe(current), dialogOpen: true, nextAction: "Inspect the current JavaScript dialog before continuing. Later input was not delivered." };
+          }
           await delay(80);
         }
-        const after = await ready(tab.id);
+        const after = await ready(tab.id, observe);
         if (after.status !== "complete") return { completed, tab: describe(after), pagePending: true,
           nextAction: "Read this handle with live_read_page to inspect the loading document. Do not repeat the interaction." };
-        return { completed, page: await read(after) };
+        return { completed, page: await read(after, 20000, observe) };
       } catch (error) {
+        if (error.code === "POST_INPUT_READBACK_TIMEOUT" && inputDelivered && lastWindowBounds) {
+          // Safari can present a modal after native click observation finishes.
+          // A blocked read is not retried; inspect its actual native target once
+          // and free the serialized poll so a dialog response can be delivered.
+          try {
+            selection?.assertCurrent(); assertTime();
+            const modal = unwrap(await send({ action: "liveModal", id: request.id, profileId, sessionId,
+              input: { expectedUrl: tab.url, windowBounds: lastWindowBounds } }));
+            if (modal.dialogOpen === true || modal.fileChooserOpen === true) {
+              if (lastDelivered && !lastDelivered.recorded) { completed.push({ type: lastDelivered.type, node: lastDelivered.node, result: lastDelivered.result }); lastDelivered.recorded = true; }
+              if (modal.fileChooserOpen === true && activeFileChooserOpened) return await activeFileChooserOpened();
+              selection?.holdDialog?.();
+              return { completed, tab: describe(lastCurrent), dialogOpen: true,
+                nextAction: "Inspect the current JavaScript dialog before continuing. The delivered input and blocked page read were not repeated." };
+            }
+          } catch (nativeError) {
+            error.message += ` Native modal inspection failed: ${nativeError.message}`;
+          }
+        }
         const details = error.data;
         error.data = { completed, nativeSteps, eventsPosted: error.eventsPosted, mayHavePostedInput: error.mayHavePostedInput,
           ...(details ? { details } : {}),
           outcome: nativeSteps.some(step => step.eventsPosted > 0) || error.mayHavePostedInput ? "partial or uncertain; read current page before continuing" : "no native input confirmed" };
         throw error;
+      } finally {
+        for (const token of fileInputTokens) fileInputObservations.delete(token);
       }
     }
     async function poll() {
@@ -910,9 +2539,19 @@ function m(t,o,e){if(location.origin!==t||o!=null&&location.href!==o)return{sele
       timer = environment.setInterval(poll, 750);
       await poll();
     }
-    return { start, poll, execute, stop() { stopped = true; environment.clearInterval(timer); } };
+    async function releaseLogs(tabId, scope) {
+      const tab = await api.tabs.get(tabId).catch(() => null);
+      if (!tab || tab.incognito || !/^https?:\/\//i.test(tab.url || "")) return;
+      const value = await page(tab, "logs_release", { scope });
+      if (value.token) await api.scripting.executeScript({ target: { tabId, frameIds: [0] }, world: "MAIN", func: consoleCapture, args: ["stop", value.token] });
+    }
+    function releaseFileChoosers({ sessionId: originalSession, turnId }) {
+      for (const [id, chooser] of fileChoosers) if (chooser.sessionId === originalSession && (turnId == null || chooser.turnId === turnId)) fileChoosers.delete(id);
+    }
+    return { start, poll, execute, releaseLogs, releaseFileChoosers,
+      stop() { stopped = true; environment.clearInterval(timer); fileChoosers.clear(); fileInputObservations.clear(); } };
   }
-  if (typeof module === "object" && module.exports) module.exports = { createLive, pageOperation };
+  if (typeof module === "object" && module.exports) module.exports = { createLive, pageOperation, consoleCapture };
   const api = root.browser || root.chrome;
   if (api?.runtime?.id) {
     root.ChatGPTSafariLive = createLive(api);
@@ -940,6 +2579,57 @@ function m(t,o,e){if(location.origin!==t||o!=null&&location.href!==o)return{sele
     if (!result.length || result.length > 50) throw new Error("Organize between 1 and 50 explicitly selected tabs");
     return result;
   };
+  const auditKey = "safariManagementAuditTrail", auditLimit = 50, auditLifetime = 72 * 60 * 60 * 1000;
+  let auditQueue = Promise.resolve();
+  function auditScope(owner) {
+    if (typeof owner.accountScope !== "string" || !/^[a-z0-9_-]{1,128}$/iu.test(owner.accountScope)) {
+      throw new Error("The verified ChatGPT account scope is unavailable for Safari's management audit");
+    }
+    return { profileId: owner.profileId, accountScope: owner.accountScope };
+  }
+  const sameAuditScope = (left, right) => left.profileId === right.profileId && left.accountScope === right.accountScope;
+  function serializedAudit(operation) {
+    const result = auditQueue.then(operation);
+    auditQueue = result.catch(() => {});
+    return result;
+  }
+  async function readAuditEntries(api) {
+    if (typeof api.storage?.session?.get !== "function" || typeof api.storage.session.set !== "function") {
+      throw new Error("Safari's browser-session management audit storage is unavailable");
+    }
+    const stored = (await api.storage.session.get(auditKey))[auditKey];
+    const cutoff = Date.now() - auditLifetime;
+    return (Array.isArray(stored) ? stored : []).filter(entry => record(entry) && record(entry.change)
+      && typeof entry.profileId === "string" && typeof entry.accountScope === "string"
+      && Array.isArray(entry.change.args) && record(entry.change.before)
+      && typeof entry.change.namespace === "string" && typeof entry.change.method === "string"
+      && Number.isFinite(entry.change.createdAt) && entry.change.createdAt >= cutoff).slice(-auditLimit);
+  }
+  const windowState = value => ({ id: value.id, focused: value.focused, left: value.left,
+    top: value.top, width: value.width, height: value.height, state: value.state });
+  function windowCreationOptions(args) {
+    if (args.length > 1) throw new Error("windows.create accepts at most one argument");
+    const value = options(args.length ? args[0] : {}, ["focused", "height", "left", "state", "tabId", "top", "type", "width"], true);
+    if (value.type !== undefined && value.type !== "normal") throw new Error("windows.create supports only normal, non-private Safari windows");
+    if (value.focused !== undefined && typeof value.focused !== "boolean") throw new Error("focused must be a boolean");
+    if (value.state !== undefined && !["normal", "minimized", "maximized", "fullscreen"].includes(value.state)) throw new Error("Unsupported Safari window state");
+    for (const key of ["left", "top", "width", "height"]) {
+      if (value[key] !== undefined && (!Number.isSafeInteger(value[key]) || (["width", "height"].includes(key) && value[key] <= 0))) {
+        throw new Error("Safari window bounds require integer coordinates and positive dimensions");
+      }
+    }
+    if (value.state !== undefined && value.state !== "normal" && ["left", "top", "width", "height"].some(key => value[key] !== undefined)) {
+      throw new Error("Use state normal when setting Safari window bounds");
+    }
+    if (Object.hasOwn(value, "tabId")) id(value.tabId);
+    return { ...value, type: "normal" };
+  }
+  function uncertainWindowCreation(error) {
+    error.message += ". Safari window creation was delivered once and was not retried. Inspect current windows before continuing; do not repeat a possibly completed creation or tab move.";
+    error.doNotReplay = true;
+    error.data = { ...(record(error.data) ? error.data : {}), doNotReplay: true };
+    return error;
+  }
   function readableNativeFailure(error) {
     // The upstream kernel serializes only Error.message. Carry the bounded
     // native outcome through that boundary without copying private error data.
@@ -962,18 +2652,34 @@ function m(t,o,e){if(location.origin!==t||o!=null&&location.href!==o)return{sele
     if (Object.keys(safe).length) error.message += ` Native result: ${JSON.stringify(safe)}.`;
     return error;
   }
-  function createManagement(api, companion) {
+  function createManagement(api, companion, personalData = root.ChatGPTSafariPersonalData) {
     const sessions = new Map();
     let nextGroup = 1;
     let busy = false;
     async function execute(command, session, metadata, owner, assertCurrent) {
+      owner = { ...owner };
+      const authorize = assertCurrent;
+      assertCurrent = async () => {
+        const current = await authorize();
+        if (owner.accountScope !== undefined && (!current || !sameAuditScope(current, owner))) {
+          throw new Error("The ChatGPT account changed during this Safari management command");
+        }
+        return current;
+      };
+      await assertCurrent();
       let state = sessions.get(metadata.session_id);
-      if (!state || state.owner !== owner.instanceId || state.profile !== owner.profileId) {
-        state = { owner: owner.instanceId, profile: owner.profileId, groups: new Map(), changes: [] };
+      if (!state || state.owner !== owner.instanceId || state.profile !== owner.profileId || state.accountScope !== owner.accountScope) {
+        state = { owner: owner.instanceId, profile: owner.profileId, accountScope: owner.accountScope, groups: new Map() };
         sessions.set(metadata.session_id, state);
       }
-      await assertCurrent();
-      if (command.type === "browser_management_get_audit_trail") return { changes: state.changes.slice().reverse() };
+      if (command.type === "browser_management_get_audit_trail") {
+        const scope = auditScope(owner);
+        return serializedAudit(async () => {
+          const entries = await readAuditEntries(api);
+          await assertCurrent();
+          return { changes: entries.filter(entry => sameAuditScope(entry, scope)).map(entry => entry.change).reverse() };
+        });
+      }
       const { namespace, method, args } = command;
       if (!Array.isArray(args) || args.length > 2) throw new Error("Safari management requires explicit method arguments");
       const tab = async tabId => {
@@ -992,9 +2698,21 @@ function m(t,o,e){if(location.origin!==t||o!=null&&location.href!==o)return{sele
       const audit = async (before, operation) => {
         await assertCurrent();
         const value = await operation();
-        state.changes.push({ namespace, method, args, before, createdAt: Date.now(),
-          ...(typeof value === "number" ? { result: value } : {}) });
-        state.changes = state.changes.slice(-50);
+        const result = typeof value === "number" ? value
+          : namespace === "windows" && method === "create" && Number.isSafeInteger(value?.id) ? value.id
+          : namespace === "bookmarks" && typeof value?.id === "string" ? { id: value.id } : undefined;
+        // Like upstream, an unavailable audit store does not turn a completed
+        // mutation into a failure. Queries explicitly report unavailability.
+        try {
+          const scope = auditScope(owner);
+          await serializedAudit(async () => {
+            const entries = await readAuditEntries(api);
+            await assertCurrent();
+            entries.push({ ...scope, change: { namespace, method, args, before, createdAt: Date.now(),
+              ...(result === undefined ? {} : { result }) } });
+            await api.storage.session.set({ [auditKey]: entries.slice(-auditLimit) });
+          });
+        } catch { /* Never replay a completed mutation because audit storage failed. */ }
         return value;
       };
       // The upstream audit's tabLayout schema requires Chrome-only group/color
@@ -1048,7 +2766,61 @@ function m(t,o,e){if(location.origin!==t||o!=null&&location.href!==o)return{sele
       };
 
       let value;
-      if (namespace === "tabs" && method === "query") {
+      if (namespace === "bookmarks") {
+        if (typeof personalData?.bookmarks !== "function") throw new Error("Safari's native bookmark capability is unavailable");
+        const bookmark = async (operation, arguments_) => {
+          await assertCurrent();
+          return personalData.bookmarks(operation, arguments_, owner);
+        };
+        const handle = value => {
+          if (typeof value !== "string" || !value || value.length > 256) throw new Error("Use a current native Safari bookmark handle");
+          return value;
+        };
+        if (method === "getTree" && args.length === 0) value = await bookmark(method, []);
+        else if (method === "search" && args.length === 1) {
+          const query = typeof args[0] === "string" ? args[0] : options(args[0], ["query", "title", "url"], true);
+          if (record(query) && Object.values(query).some(item => typeof item !== "string")) throw new Error("Bookmark search fields must be strings");
+          value = await bookmark(method, [query]);
+        } else if (method === "get" && args.length === 1) {
+          const handles = Array.isArray(args[0]) ? args[0].map(handle) : handle(args[0]);
+          if (Array.isArray(handles) && (!handles.length || handles.length > 100)) throw new Error("Read between 1 and 100 explicit bookmark handles");
+          value = await bookmark(method, [handles]);
+        } else if (["getChildren", "getSubTree"].includes(method) && args.length === 1) value = await bookmark(method, [handle(args[0])]);
+        else if (method === "update" && args.length === 2) {
+          const identifier = handle(args[0]), changes = options(args[1], ["title", "url"]);
+          if (Object.values(changes).some(item => typeof item !== "string")) throw new Error("Bookmark changes must be strings");
+          const previous = await bookmark("get", [identifier]);
+          if (!Array.isArray(previous) || previous.length !== 1 || previous[0].id !== identifier) throw new Error("The current bookmark identity could not be read before updating it");
+          const before = Object.fromEntries(["id", "index", "parentId", "title", "url"].filter(key => previous[0][key] !== undefined).map(key => [key, previous[0][key]]));
+          value = await audit({ bookmarks: [before] }, () => bookmark("update", [identifier, changes]));
+        } else if (method === "create" && args.length === 1) {
+          const properties = options(args[0], ["title", "url", "parentId"]);
+          if (properties.title !== undefined && typeof properties.title !== "string") throw new Error("A bookmark title must be a string");
+          if (properties.parentId !== undefined) handle(properties.parentId);
+          if (Object.hasOwn(properties, "url")) {
+            let parsed;
+            try { parsed = new URL(properties.url); } catch { /* Report invalid input before opening Safari UI. */ }
+            if (typeof properties.url !== "string" || !parsed || !["http:", "https:"].includes(parsed.protocol)
+              || parsed.username || parsed.password) throw new Error("Bookmark URLs require HTTP or HTTPS without credentials");
+            value = await audit({}, () => bookmark("create", [properties]));
+          } else {
+            if (typeof properties.title !== "string" || !properties.title.trim()) throw new Error("A native bookmark folder needs a nonempty title");
+            value = await audit({}, () => bookmark("createFolder", [properties]));
+          }
+        } else if (method === "move" && args.length === 2) {
+          const identifier = handle(args[0]), properties = options(args[1], ["parentId"]);
+          handle(properties.parentId);
+          const previous = await bookmark("get", [identifier]);
+          if (!Array.isArray(previous) || previous.length !== 1 || previous[0].id !== identifier) throw new Error("The current bookmark identity could not be read before moving it");
+          const before = Object.fromEntries(["id", "index", "parentId", "title", "url"].filter(key => previous[0][key] !== undefined).map(key => [key, previous[0][key]]));
+          value = await audit({ bookmarks: [before] }, () => bookmark("move", [identifier, properties]));
+        } else if (["remove", "removeTree"].includes(method) && args.length === 1) {
+          const identifier = handle(args[0]), previous = await bookmark("get", [identifier]);
+          if (!Array.isArray(previous) || previous.length !== 1 || previous[0].id !== identifier) throw new Error("The current bookmark identity could not be read before deleting it");
+          const before = Object.fromEntries(["id", "index", "parentId", "title", "url"].filter(key => previous[0][key] !== undefined).map(key => [key, previous[0][key]]));
+          value = await audit({ bookmarks: [before] }, () => bookmark(method, [identifier]));
+        } else throw new Error(`Safari does not support management.bookmarks.${method} with these arguments. Native bookmark movement requires an explicit destination folder; insertion indices and root drops are unavailable`);
+      } else if (namespace === "tabs" && method === "query") {
         const query = options(args[0] ?? {}, ["windowId", "active", "pinned", "title", "url", "currentWindow", "lastFocusedWindow"], true);
         value = (await api.tabs.query(query)).filter(item => !item.incognito && /^https?:\/\//iu.test(item.url || ""));
       } else if (namespace === "tabs" && method === "get") value = await tab(args[0]);
@@ -1163,6 +2935,55 @@ function m(t,o,e){if(location.origin!==t||o!=null&&location.href!==o)return{sele
           options(args[0] ?? {}, ["populate", "windowTypes"], true);
           value = (await api.windows.getAll(args[0] ?? {})).filter(item => !item.incognito && item.type === "normal");
         } else value = await window((await tab(owner.tabId)).windowId);
+      } else if (namespace === "windows" && method === "create") {
+        const create = windowCreationOptions(args);
+        if (typeof api.windows.create !== "function") throw new Error("This Safari version does not expose native windows.create; no window or tab was changed");
+        // Even blank creation belongs to the current ordinary-profile owner.
+        await window((await tab(owner.tabId)).windowId);
+        let target, sourceTabs;
+        if (Object.hasOwn(create, "tabId")) {
+          target = await owned(create.tabId);
+          if (target.id === owner.tabId) throw new Error("Keep the active sidebar tab outside this window creation. Move only another explicitly claimed tab");
+          if (target.pinned) throw new Error("windows.create cannot move a pinned tab without changing its pinning");
+          await window(target.windowId);
+          const observed = await organize(target, "inspect");
+          if (observed.currentGroupTitle !== null && observed.currentGroupSharingState !== "unshared") {
+            throw new Error("Safari did not verify that the source tab collection is unshared. No window was created and no tab was moved");
+          }
+          sourceTabs = await api.tabs.query({ windowId: target.windowId });
+          const fresh = await owned(target.id);
+          if (fresh.windowId !== target.windowId || fresh.url !== target.url || fresh.title !== target.title || fresh.pinned) {
+            throw new Error("The claimed Safari tab changed before its requested window transfer");
+          }
+        }
+        const before = (await api.windows.getAll({ windowTypes: ["normal"] })).filter(item => !item.incognito && item.type === "normal");
+        value = await audit({ windows: before.map(windowState) }, async () => {
+          let delivered = false;
+          try {
+            await assertCurrent();
+            delivered = true;
+            const created = await api.windows.create(create);
+            await assertCurrent();
+            if (!Number.isSafeInteger(created?.id) || created.id <= 0 || before.some(item => item.id === created.id)) {
+              throw new Error("Safari did not return a unique newly created window ID");
+            }
+            const confirmed = await window(created.id);
+            if (target) {
+              const moved = await tab(target.id);
+              if (moved.windowId !== confirmed.id || moved.url !== target.url || moved.title !== target.title || moved.pinned) {
+                throw new Error("Safari did not confirm the exact claimed tab in its new window");
+              }
+              const expected = sourceTabs.filter(item => item.id !== target.id).sort((a, b) => a.index - b.index).map(item => item.id);
+              const sourceExists = (await api.windows.getAll({ windowTypes: ["normal"] })).some(item => item.id === target.windowId);
+              const remaining = sourceExists ? await api.tabs.query({ windowId: target.windowId }) : [];
+              if (!sourceExists && expected.length) throw new Error("Safari closed a source window that still had unrelated original tabs");
+              if (JSON.stringify(remaining.sort((a, b) => a.index - b.index).map(item => item.id)) !== JSON.stringify(expected)) {
+                throw new Error("Safari's source window no longer contains exactly its unrelated original tabs in their original order");
+              }
+            }
+            return confirmed;
+          } catch (error) { throw delivered ? uncertainWindowCreation(error) : error; }
+        });
       } else if (namespace === "windows" && method === "update") {
         const target = await window(args[0]), changes = options(args[1], ["focused", "left", "top", "width", "height", "state"]);
         if (changes.state !== undefined && !["normal", "minimized", "maximized", "fullscreen"].includes(changes.state)) throw new Error("Unsupported Safari window state");
@@ -1187,13 +3008,30 @@ function m(t,o,e){if(location.origin!==t||o!=null&&location.href!==o)return{sele
  * desktop control. This module has no MCP transport and never starts a driver. */
 (function (root) {
   "use strict";
-  const supported = new Set(["dom_cua_get_visible_dom", "dom_cua_click", "dom_cua_type", "dom_cua_keypress", "dom_cua_scroll",
+  const supported = new Set(["dom_cua_get_visible_dom", "dom_cua_click", "dom_cua_double_click", "dom_cua_type", "dom_cua_keypress", "dom_cua_scroll",
     "navigate_tab_url", "navigate_tab_back", "navigate_tab_forward", "navigate_tab_reload", "close_tab",
-    "browser_management_call", "browser_management_get_audit_trail", "safari_download_inspect", "dom_cua_download_media"]);
+    "browser_management_call", "browser_management_get_audit_trail", "safari_download_inspect", "dom_cua_download_media",
+    "browser_viewport_set", "browser_viewport_reset",
+    "tab_screenshot", "tab_get_js_dialog", "tab_handle_js_dialog", "tab_clipboard_read", "tab_clipboard_read_text", "tab_clipboard_write", "tab_clipboard_write_text",
+    "safari_logs_start", "tab_dev_logs",
+    "tab_page_assets_list", "tab_page_assets_bundle", "safari_assets_inspect",
+    "cua_click", "cua_double_click", "cua_drag", "cua_move", "cua_keypress", "cua_scroll", "cua_type", "cua_download_media",
+    "playwright_dom_snapshot", "playwright_locator_click", "playwright_locator_dblclick", "playwright_locator_fill",
+    "playwright_locator_count", "playwright_locator_is_enabled", "playwright_locator_is_visible", "playwright_locator_press",
+    "playwright_locator_get_attribute", "playwright_locator_inner_text", "playwright_locator_all_text_contents",
+    "playwright_locator_press_sequentially", "playwright_locator_set_checked", "playwright_locator_text_content",
+    "playwright_locator_read_all", "playwright_locator_wait_for", "playwright_locator_select_option", "playwright_wait_for_load_state",
+    "playwright_wait_for_timeout", "playwright_wait_for_url", "playwright_locator_download_media",
+    "playwright_wait_for_file_chooser", "playwright_file_chooser_set_files", "safari_file_chooser_inspect",
+    "tab_content_export_gsuite", "tab_content_export_youtube_transcript", "safari_content_export_inspect"]);
   function createAgent(api, companion) {
     const snapshots = new Map();
     const turnOwners = new Map();
+    const clipboards = new Map();
+    const logLeases = new Map();
+    const fileChooserWaiters = new Map(), fileChoosers = new Map();
     const management = root.ChatGPTSafariManagement?.createManagement(api, companion);
+    const viewport = root.ChatGPTSafariViewport?.createViewport(api, companion);
     let generation = 0;
     const scopeKey = (metadata, tabId) => JSON.stringify([metadata.session_id, metadata.turn_id, tabId]);
     const turnKey = metadata => JSON.stringify([metadata.session_id, metadata.turn_id]);
@@ -1208,25 +3046,40 @@ function m(t,o,e){if(location.origin!==t||o!=null&&location.href!==o)return{sele
     function keyboard(keys) {
       if (!Array.isArray(keys) || keys.some(key => typeof key !== "string")) throw new Error("A page key array is required");
       const names = { ENTER: "Enter", RETURN: "Enter", TAB: "Tab", ESC: "Escape", ESCAPE: "Escape", BACKSPACE: "Backspace",
-        DELETE: "Delete", SPACE: "Space", ARROWLEFT: "ArrowLeft", LEFT: "ArrowLeft", ARROWRIGHT: "ArrowRight", RIGHT: "ArrowRight",
+        DELETE: "Delete", INSERT: "Insert", SPACE: "Space", ARROWLEFT: "ArrowLeft", LEFT: "ArrowLeft", ARROWRIGHT: "ArrowRight", RIGHT: "ArrowRight",
         ARROWUP: "ArrowUp", UP: "ArrowUp", ARROWDOWN: "ArrowDown", DOWN: "ArrowDown", HOME: "Home", END: "End", PAGEUP: "PageUp", PAGEDOWN: "PageDown" };
-      const normalized = keys.map(key => key.toUpperCase());
-      if (normalized.length === 2 && normalized.includes("SHIFT") && normalized.includes("TAB")) return "Shift+Tab";
-      if (normalized.length === 1 && names[normalized[0]]) return names[normalized[0]];
-      throw new Error("Safari supports page editing/navigation keys here, not application shortcuts");
+      if (keys.length === 1 && keys[0].includes("+")) keys = keys[0].split("+");
+      const modifiers = { CMD: "Meta", COMMAND: "Meta", META: "Meta", SUPER: "Meta", CONTROLORMETA: "Meta",
+        CTRL: "Meta", CONTROL: "Control", ALT: "Alt", OPTION: "Alt", SHIFT: "Shift" };
+      const normalized = keys.map(key => modifiers[key.toUpperCase()] || names[key.toUpperCase()] ||
+        (/^F(?:[1-9]|1[0-9]|2[0-4])$/i.test(key) ? key.toUpperCase() : key.length === 1 ? key : null));
+      const regular = normalized.filter(key => key && !["Meta", "Control", "Alt", "Shift"].includes(key));
+      if (normalized.some(key => !key) || regular.length !== 1 || normalized.length > 5 || new Set(normalized).size !== normalized.length) {
+        throw new Error("A key combination requires one page key and optional Meta, Control, Alt, and Shift modifiers");
+      }
+      return [...normalized.filter(key => key !== regular[0]), regular[0]].join("+");
     }
     async function authorize(session, metadata) {
       if (typeof metadata?.session_id !== "string" || typeof metadata.turn_id !== "string"
         || session.currentTurnId !== metadata.turn_id) throw new Error("The Safari agent turn is no longer active");
       const owner = await companion.agentOwner();
+      if (![owner.instanceId, owner.profileId, owner.accountScope].every(value => typeof value === "string" && value.length > 0)) throw new Error("A current Safari sidebar, profile, and signed-in ChatGPT account scope are required");
       const key = turnKey(metadata), previous = turnOwners.get(key);
-      if (previous && previous !== owner.instanceId) throw new Error("The Safari sidebar owner changed during this agent turn. Start a new turn before using another sidebar owner");
-      turnOwners.set(key, owner.instanceId);
+      const identity = JSON.stringify([owner.instanceId, owner.profileId, owner.accountScope]);
+      if (previous && previous !== identity) {
+        await release(metadata.session_id, undefined, true);
+        throw new Error("The Safari sidebar owner changed, including its profile or ChatGPT account, during this agent turn. Start a new turn before using another sidebar owner");
+      }
+      turnOwners.set(key, identity);
       return owner;
     }
     async function execute(command, session, metadata) {
       if (!command || !supported.has(command.type)) throw new Error("This agent command is not implemented by the Safari native backend");
       const owner = await authorize(session, metadata);
+      if (command.type.startsWith("browser_viewport_")) {
+        if (!viewport) throw new Error("Safari's measured native viewport capability is unavailable");
+        return viewport.execute(command, session, metadata, owner, () => authorize(session, metadata));
+      }
       if (command.type.startsWith("browser_management_")) {
         if (!management) throw new Error("Safari browser management is unavailable");
         return management.execute(command, session, metadata, owner, () => authorize(session, metadata));
@@ -1247,6 +3100,230 @@ function m(t,o,e){if(location.origin!==t||o!=null&&location.href!==o)return{sele
           throw new Error(`${error.message}. Completed steps: ${completed}. Input was not retried. Read the current visible DOM before deciding the next action; do not repeat a possibly delivered input.`);
         }
       };
+      const query = type => run("dom_query", { command: { ...command, ...(type ? { type } : {}) } });
+      if (["tab_content_export_gsuite", "tab_content_export_youtube_transcript", "safari_content_export_inspect"].includes(command.type)) {
+        const type = command.type === "safari_content_export_inspect" ? command.exportType : command.type;
+        if (!["tab_content_export_gsuite", "tab_content_export_youtube_transcript"].includes(type)) throw new Error("This Safari content export is unsupported");
+        const args = { kind: type === "tab_content_export_gsuite" ? "gsuite" : "youtube", format: command.format,
+          scope: JSON.stringify([metadata.session_id, metadata.turn_id, owner.instanceId, owner.profileId, owner.accountScope]) };
+        if (command.type === "safari_content_export_inspect") return run("dom_query", { command: { type: command.type, ...args } });
+        if (!/^[a-f0-9]{32}$/.test(command.exportId || "")) throw new Error("Inspect and approve this exact content export before starting it");
+        return run("content_export", { ...args, exportId: command.exportId });
+      }
+      const agentScope = { ownerId: owner.instanceId, sessionId: metadata.session_id, turnId: metadata.turn_id };
+      const interact = async (target, interactions) => {
+        try {
+          const result = await run("interact", { documentId: target.documentId, snapshotId: target.snapshotId, interactions, agentScope,
+            fileChooserScope: { profileId: owner.profileId, tabId: String(tabId), documentId: target.documentId, ...agentScope },
+            ...(target.frameId ? { frameId: target.frameId, framePath: target.framePath } : {}) });
+          if (result.fileChooserOpen) {
+            const waiter = fileChooserWaiters.get(key);
+            if (result.fileChooser?.id && typeof result.fileChooser.isMultiple === "boolean") {
+              fileChoosers.set(key, { ...result.fileChooser, owner: owner.instanceId });
+              waiter?.resolve({ file_chooser_id: result.fileChooser.id, is_multiple: result.fileChooser.isMultiple });
+            } else waiter?.reject(new Error(result.fileChooserError || "Safari opened a file chooser without a verified source file input. Cancel that chooser; the click was not repeated"));
+          }
+          return result;
+        } catch (error) { fileChooserWaiters.get(key)?.reject(error); throw error; }
+      };
+      if (command.type === "playwright_wait_for_file_chooser") {
+        if (fileChooserWaiters.has(key)) throw new Error("A file chooser waiter is already registered for this claimed tab and turn");
+        const timeout = command.timeout_ms ?? 30000;
+        if (!Number.isInteger(timeout) || timeout <= 0 || timeout > 120000) throw new Error("File chooser timeout must be between 1 and 120000 milliseconds");
+        // Register locally before the click. Holding an ordinary live-broker
+        // command while waiting would prevent the opening click from running.
+        return new Promise((resolve, reject) => {
+          let timer;
+          const settle = callback => value => { clearTimeout(timer); fileChooserWaiters.delete(key); callback(value); };
+          const waiter = { owner: owner.instanceId, resolve: settle(resolve), reject: settle(reject) };
+          fileChooserWaiters.set(key, waiter);
+          timer = setTimeout(() => waiter.reject(new Error(`Timed out after ${timeout}ms waiting for a Safari file chooser`)), timeout);
+        });
+      }
+      if (["safari_file_chooser_inspect", "playwright_file_chooser_set_files"].includes(command.type)) {
+        const chooser = fileChoosers.get(key);
+        if (!chooser || chooser.owner !== owner.instanceId || chooser.id !== command.file_chooser_id) throw new Error("Unknown or stale Safari file chooser for this claimed tab and turn");
+        if (!Array.isArray(command.files) || !command.files.length || command.files.some(path => typeof path !== "string" || !path.startsWith("/") || path.includes("\0"))) throw new Error("fileChooser.setFiles requires at least one explicit absolute local file path");
+        if (!chooser.isMultiple && command.files.length > 1) throw new Error("File chooser does not accept multiple files");
+        if (command.type === "safari_file_chooser_inspect") return {};
+        fileChoosers.delete(key);
+        await run("filechooser", { operation: "setFiles", chooserId: chooser.id, scope: chooser.scope, files: command.files, agentScope }); return {};
+      }
+      const clipboardKey = JSON.stringify([metadata.session_id, owner.instanceId, owner.profileId, owner.accountScope]);
+      const pageKey = async (keypress, node) => {
+        const tokens = keypress.split("+"), base = tokens.pop(), modifiers = new Set(tokens);
+        let action;
+        if (modifiers.size === 1 && base === "Insert" && modifiers.has("Control")) action = "copy";
+        if (modifiers.size === 1 && base === "Insert" && modifiers.has("Shift")) action = "paste";
+        if (modifiers.size === 1 && base === "Delete" && modifiers.has("Shift")) action = "cut";
+        const primary = (modifiers.has("Meta") || modifiers.has("Control")) && !(modifiers.has("Meta") && modifiers.has("Control"));
+        if (primary && (modifiers.size === 1 || modifiers.size === 2 && modifiers.has("Shift"))) {
+          if (/^c$/i.test(base) && !modifiers.has("Shift")) action = "copy";
+          if (/^x$/i.test(base) && !modifiers.has("Shift")) action = "cut";
+          if (/^v$/i.test(base)) action = modifiers.has("Shift") ? "paste-plain-text" : "paste";
+        }
+        const permittedShiftShortcut = /^[cx]$/i.test(base) && modifiers.size === 2 && modifiers.has("Shift") && primary;
+        if (!action && !permittedShiftShortcut && ((/^[cxv]$/i.test(base) && (modifiers.has("Meta") || modifiers.has("Control")))
+          || base === "Insert" && (modifiers.has("Control") || modifiers.has("Shift")) || base === "Delete" && modifiers.has("Shift"))) {
+          throw new Error("Native clipboard shortcuts are disabled; use the browser session's virtual clipboard");
+        }
+        if (!action) return { type: "key", node, key: keypress };
+        if (action.startsWith("paste")) {
+          let items = clipboards.get(clipboardKey) || [];
+          if (action === "paste-plain-text") items = items.map(item => ({ ...item, entries: item.entries.filter(entry => entry.mime_type === "text/plain") })).filter(item => item.entries.length);
+          if (!items.length) return null;
+          if (items.some(item => item.entries.some(entry => entry.mime_type !== "text/plain"))) throw new Error("Trusted session paste supports plain text; rich-text or binary clipboard items cannot be pasted through native text input");
+          const text = items.flatMap(item => item.entries).find(entry => entry.mime_type === "text/plain")?.text;
+          if (typeof text !== "string") throw new Error("The session clipboard contains no plain-text payload to paste through native input");
+          return { type: "type", node, value: text, requireFocused: true };
+        }
+        const selection = await query("safari_selection_read");
+        clipboards.set(clipboardKey, [{ entries: [{ mime_type: "text/plain", text: selection.text }], presentation_style: "unspecified" }]);
+        return action === "copy" || !selection.text ? null : { type: "key", node, key: "Backspace" };
+      };
+      const logScope = JSON.stringify([metadata.session_id, owner.instanceId, metadata.turn_id]);
+      const startLogs = async () => {
+        const tab = await api.tabs.get(tabId);
+        if (!/^https?:\/\//i.test(tab.url || "")) return { capturing: false };
+        const lease = { sessionId: metadata.session_id, turnId: metadata.turn_id, tabId, scope: logScope };
+        logLeases.set(key, lease);
+        try { return await run("dom_query", { command: { type: "safari_logs_start", scope: logScope } }); }
+        catch (error) { lease.error = error.message; return { capturing: false }; }
+      };
+      if (command.type === "safari_logs_start") return startLogs();
+      if (command.type === "tab_dev_logs") {
+        if (!logLeases.has(key)) await startLogs();
+        const lease = logLeases.get(key);
+        if (!lease || lease.error) throw new Error(lease?.error || "Console capture requires a claimed HTTP/HTTPS page");
+        return run("dom_query", { command: { type: "safari_logs_read", scope: logScope,
+          levels: command.levels, filter: command.filter, limit: command.limit } });
+      }
+      if (["tab_page_assets_list", "tab_page_assets_bundle", "safari_assets_inspect"].includes(command.type)) {
+        const arguments_ = { scope: logScope, inventoryId: command.inventoryId, assetIds: command.assetIds, kinds: command.kinds };
+        return command.type === "tab_page_assets_bundle" ? run("asset_bundle", arguments_)
+          : run("dom_query", { command: { type: command.type === "tab_page_assets_list" ? "safari_assets_list" : "safari_assets_inspect", ...arguments_ } });
+      }
+      if (command.type.startsWith("tab_clipboard_")) {
+        const items = clipboards.get(clipboardKey) || [];
+        if (command.type === "tab_clipboard_read") return { items: structuredClone(items) };
+        if (command.type === "tab_clipboard_read_text") return { text: items.flatMap(x => x.entries).find(x => x.mime_type === "text/plain")?.text || "" };
+        const incoming = command.type === "tab_clipboard_write_text"
+          ? [{ entries: [{ mime_type: "text/plain", text: command.text }], presentation_style: "unspecified" }] : command.items;
+        if (!Array.isArray(incoming) || incoming.length > 32 || JSON.stringify(incoming).length > 8 * 1024 * 1024
+          || incoming.some(item => !Array.isArray(item.entries) || item.entries.some(entry => typeof entry.mime_type !== "string"
+            || (typeof entry.text === "string") === (typeof entry.base64 === "string")))) throw new Error("Invalid session clipboard items");
+        clipboards.set(clipboardKey, structuredClone(incoming)); return {};
+      }
+      if (command.type === "tab_screenshot") {
+        const image = await run("screenshot", { fullPage: command.fullPage === true,
+          ...(command.cropX === undefined ? {} : { clip: { x: command.cropX, y: command.cropY, width: command.cropWidth, height: command.cropHeight } }) });
+        const data = image.data || image.dataUrl?.replace(/^data:image\/[a-z0-9.+-]+;base64,/i, "");
+        if (typeof data !== "string" || !data) throw new Error("Safari returned no screenshot bytes");
+        return { data };
+      }
+      if (command.type === "tab_get_js_dialog" || command.type === "tab_handle_js_dialog") {
+        return run("dialog", { operation: command.type === "tab_get_js_dialog" ? "inspect" : command.action,
+          dialogId: command.dialog_id, promptText: command.prompt_text });
+      }
+      if (["playwright_wait_for_timeout", "playwright_wait_for_url", "playwright_wait_for_load_state"].includes(command.type)) {
+        const timeout = Math.min(command.timeout_ms ?? 10000, 30000);
+        if (command.type === "playwright_wait_for_timeout") {
+          if (!Number.isFinite(command.timeout_ms) || command.timeout_ms < 0 || command.timeout_ms > 30000) throw new Error("A Safari wait must be between 0 and 30000 milliseconds");
+          await new Promise(resolve => setTimeout(resolve, command.timeout_ms)); await authorize(session, metadata); return {};
+        }
+        if (command.wait_until === "networkidle" || command.state === "networkidle") throw new Error("Safari cannot prove networkidle; use a DOM locator or URL condition instead");
+        const deadline = Date.now() + timeout;
+        do {
+          await authorize(session, metadata); await session.requireOwnedTab(tabId);
+          const tab = await api.tabs.get(tabId);
+          const urlMatched = command.type !== "playwright_wait_for_url" || tab.url === command.url;
+          const loaded = command.wait_until === "commit" || command.state === "commit" || tab.status === "complete";
+          if (urlMatched && loaded) return { url: tab.url };
+          await new Promise(resolve => setTimeout(resolve, 50));
+        } while (Date.now() < deadline);
+        throw new Error("Safari did not reach the requested page URL/load state before the timeout");
+      }
+      if (command.type.startsWith("playwright_") && !["playwright_locator_download_media"].includes(command.type)) {
+        if (["playwright_dom_snapshot", "playwright_locator_count", "playwright_locator_is_enabled", "playwright_locator_is_visible",
+          "playwright_locator_get_attribute", "playwright_locator_inner_text", "playwright_locator_all_text_contents", "playwright_locator_text_content",
+          "playwright_locator_read_all"].includes(command.type)) return query();
+        if (command.type === "playwright_locator_wait_for") {
+          const deadline = Date.now() + Math.min(command.timeout_ms ?? 10000, 30000);
+          do {
+            if ((await query()).matched) return {};
+            await new Promise(resolve => setTimeout(resolve, 50));
+          } while (Date.now() < deadline);
+          throw new Error(`Safari locator did not become ${command.state || "visible"} before the timeout`);
+        }
+        if (command.type === "playwright_locator_set_checked") {
+          const before = await query("safari_checked_read");
+          if (before.checked === command.checked) return {};
+          if (before.isRadio && !command.checked) throw new Error("Cannot uncheck a radio button");
+        }
+        let selectedOptions;
+        if (command.type === "playwright_locator_select_option") {
+          const observed = await query("safari_select_read");
+          if (!Array.isArray(command.selections) || !command.selections.length || (!observed.multiple && command.selections.length !== 1)) throw new Error("A single-select requires exactly one option");
+          const options = command.selections.map(selection => {
+            const matches = observed.options.filter(option => (selection.index === undefined || selection.index === option.index)
+              && (selection.label === undefined || selection.label === option.label) && (selection.value === undefined || selection.value === option.value));
+            if (matches.length !== 1 || matches[0].disabled) throw new Error("The requested native option is unavailable, disabled, or ambiguous");
+            return { index: matches[0].index, label: matches[0].nativeLabel };
+          });
+          selectedOptions = { options, multiple: observed.multiple };
+        }
+        let target = await query(["playwright_locator_press", "playwright_locator_press_sequentially"].includes(command.type) ? "safari_locator_focus" : "safari_locator_prepare");
+        if (command.type === "playwright_locator_press_sequentially") {
+          if (typeof command.value !== "string") throw new Error("A string input value is required");
+          const characters = Array.from(command.value), deadline = Date.now() + Math.min(command.timeout_ms ?? 5000, 5000);
+          let completed = 0;
+          while (completed < characters.length) {
+            if (Date.now() >= deadline) throw new Error(`Sequential typing timed out after ${completed} delivered characters. Input was not repeated`);
+            const batch = characters.slice(completed, completed + 20).map(value => ({ type: "type", node: target.node, value, requireFocused: true }));
+            const result = await interact(target, batch);
+            snapshots.delete(key);
+            if (!Array.isArray(result?.completed) || result.completed.length > batch.length
+              || result.completed.some(step => step.type !== "type")) {
+              throw new Error("Sequential typing delivery is uncertain because the native completion record is invalid. Input was not repeated; do not repeat possibly delivered characters");
+            }
+            completed += result.completed.length;
+            if (result.dialogOpen || result.fileChooserOpen) return {};
+            if (result.pagePending) throw new Error(`Sequential typing delivered ${completed} characters and the page started loading. Do not repeat the input`);
+            if (result.completed.length !== batch.length) throw new Error(`Sequential typing stopped after ${completed} confirmed characters because the native batch was incomplete. Do not repeat possibly delivered input`);
+            if (completed < characters.length) target = await query("safari_locator_focus");
+          }
+          snapshots.delete(key); return {};
+        }
+        const modifierNames = command.modifiers || [];
+        let interactions;
+        if (["playwright_locator_click", "playwright_locator_dblclick", "playwright_locator_set_checked"].includes(command.type)) {
+          interactions = [{ type: "click", node: target.node, clickCount: command.type === "playwright_locator_dblclick" ? 2 : 1,
+            button: command.button || "left", modifiers: modifierNames }];
+        } else if (command.type === "playwright_locator_select_option") {
+          interactions = [{ type: "select", node: target.node, ...selectedOptions }];
+        } else if (command.type === "playwright_locator_fill") {
+          const text = command.value;
+          if (typeof text !== "string") throw new Error("A string input value is required");
+          interactions = [{ type: "type", node: target.node, value: text,
+            replaceAll: command.type === "playwright_locator_fill" && command.replace !== false }];
+        } else if (command.type === "playwright_locator_press") {
+          const interaction = await pageKey(keyboard([command.value]), target.node);
+          if (!interaction) return {};
+          interactions = [interaction];
+        } else throw new Error(`Safari does not implement ${command.type}`);
+        const outcome = await interact(target, interactions); snapshots.delete(key);
+        if (outcome.dialogOpen || outcome.fileChooserOpen) return {};
+        if (command.type === "playwright_locator_set_checked" && (await query("safari_checked_read")).checked !== command.checked) {
+          throw new Error(`Native click did not change checked state to ${command.checked}; it was not repeated`);
+        }
+        if (selectedOptions) {
+          const after = await query("safari_select_read");
+          const selected = after.options.filter(option => option.selected).map(option => option.index).sort((a, b) => a - b);
+          const wanted = [...new Set(selectedOptions.options.map(option => option.index))].sort((a, b) => a - b);
+          if (JSON.stringify(selected) !== JSON.stringify(wanted)) throw new Error("The native select result did not match the requested options; selection was not repeated");
+        }
+        return {};
+      }
       if (command.type === "dom_cua_get_visible_dom") {
         const page = await run("read_page", { maxLength: 60000 });
         const snapshot = retain(key, page, owner, true);
@@ -1261,50 +3338,106 @@ function m(t,o,e){if(location.origin!==t||o!=null&&location.href!==o)return{sele
           : command.type === "close_tab" ? await run("close_tab", args)
           : await run("history", { ...args, direction: command.type.slice("navigate_tab_".length) });
         if (result?.status === "loading") throw new Error("Safari accepted the navigation and the page is still loading. Read the current page; do not repeat the navigation");
+        if (command.type !== "close_tab") await startLogs();
         return {};
       }
+      if (command.type.startsWith("cua_") && command.type !== "cua_download_media") {
+        const page = await run("read_page", { maxLength: 1000 });
+        const modifiers = command.keys || [];
+        let interaction;
+        if (["cua_click", "cua_double_click", "cua_move", "cua_scroll"].includes(command.type)) {
+          if (!Number.isFinite(command.x) || !Number.isFinite(command.y)) throw new Error("A finite viewport point is required");
+          interaction = { type: command.type === "cua_move" ? "move" : command.type === "cua_scroll" ? "scroll" : "click",
+            point: { x: command.x, y: command.y }, modifiers,
+            ...(command.type === "cua_scroll" ? { deltaX: command.scroll_x, deltaY: command.scroll_y }
+              : command.type === "cua_move" ? {} : { clickCount: command.type === "cua_double_click" ? 2 : 1,
+                button: command.button === 2 ? "right" : command.button === 1 ? "middle" : "left" }) };
+        } else if (command.type === "cua_drag") {
+          if (!Array.isArray(command.path) || command.path.length < 2 || command.path.length > 500
+            || command.path.some(point => !Number.isFinite(point.x) || !Number.isFinite(point.y))) throw new Error("A drag requires 2–500 finite viewport points");
+          interaction = { type: "drag", point: command.path[0], path: command.path, modifiers };
+        } else {
+          if (!page.focusedNode) throw new Error("Click a page control before keyboard input");
+          interaction = command.type === "cua_type" ? { type: "type", node: page.focusedNode, value: command.text, requireFocused: true }
+            : await pageKey(keyboard(command.keys), page.focusedNode);
+          if (!interaction) return {};
+        }
+        const result = await interact(page, [interaction]); retain(key, result.page, owner); return {};
+      }
       const snapshot = snapshots.get(key);
-      if (!snapshot || snapshot.owner !== owner.instanceId) throw new Error("Read the current visible DOM before interacting with this Safari tab");
-      const { page } = snapshot;
-      if (command.type === "safari_download_inspect" || command.type === "dom_cua_download_media") {
-        const node = snapshot.nodes.get(command.node_id);
+      const page = snapshot?.owner === owner.instanceId ? snapshot.page : undefined;
+      if (["safari_download_inspect", "dom_cua_download_media", "playwright_locator_download_media", "cua_download_media"].includes(command.type)) {
+        let target = page, node;
+        if (command.sourceType === "playwright_locator_download_media" || command.type === "playwright_locator_download_media") {
+          target = await query("safari_locator_prepare"); node = target.node;
+        } else if (command.sourceType === "cua_download_media" || command.type === "cua_download_media") {
+          target = await run("dom_query", { command: { type: "safari_point_prepare", x: command.x, y: command.y } }); node = target.node;
+        } else node = snapshot?.owner === owner.instanceId ? snapshot.nodes.get(command.node_id) : undefined;
         if (!node) throw new Error("Read the current visible DOM before choosing a download link");
         const result = await run(command.type === "safari_download_inspect" ? "download_link_inspect" : "download_link", {
-          expectedUrl: page.url, documentId: page.documentId, snapshotId: page.snapshotId, node,
-          ...(command.type === "dom_cua_download_media" ? { href: command.href } : {}),
+          expectedUrl: target.url, documentId: target.documentId, snapshotId: target.snapshotId, node,
+          ...(command.type !== "safari_download_inspect" ? { href: command.href } : {}),
         });
-        return command.type === "safari_download_inspect" ? result : {};
+        return command.type === "safari_download_inspect" ? result : command.type === "playwright_locator_download_media" ? { path: result.path } : {};
       }
+      if (!page) throw new Error("Read the current visible DOM before interacting with this Safari tab");
       let interaction;
-      if (command.type === "dom_cua_click" || (command.type === "dom_cua_scroll" && command.node_id != null)) {
+      if (["dom_cua_click", "dom_cua_double_click"].includes(command.type) || (command.type === "dom_cua_scroll" && command.node_id != null)) {
         const node = snapshot.nodes.get(command.node_id);
         if (!node) throw new Error("This visible DOM node belongs to an earlier snapshot. Read the visible DOM again before clicking or scrolling");
-        interaction = command.type === "dom_cua_click" ? { type: "click", node }
+        interaction = ["dom_cua_click", "dom_cua_double_click"].includes(command.type) ? { type: "click", node, ...(command.type === "dom_cua_double_click" ? { clickCount: 2 } : {}) }
           : { type: "scroll", node, deltaX: command.scroll_x, deltaY: command.scroll_y };
       } else if (command.type === "dom_cua_scroll") {
         interaction = { type: "scroll", deltaX: command.scroll_x, deltaY: command.scroll_y };
       } else {
         if (!page.focusedNode) throw new Error("No page control has keyboard focus. Click the intended control before typing or pressing a key");
-        interaction = command.type === "dom_cua_type" ? { type: "type", node: page.focusedNode, value: command.text, requireFocused: true }
-          : { type: "key", node: page.focusedNode, key: keyboard(command.keys) };
+        if (command.type === "dom_cua_type") interaction = { type: "type", node: page.focusedNode, value: command.text, requireFocused: true };
+        else {
+          interaction = await pageKey(keyboard(command.keys), page.focusedNode);
+          if (!interaction) return {};
+        }
       }
-      const result = await run("interact", { documentId: page.documentId, snapshotId: page.snapshotId, interactions: [interaction] });
+      const result = await interact(page, [interaction]);
       retain(key, result.page, owner);
       if (result.pagePending) throw new Error("The native input was delivered and the page is loading. Read the current page; do not repeat the input");
       return {};
     }
-    function release(sessionId, turnId) {
-      if (turnId == null) management?.release(sessionId);
+    function release(sessionId, turnId, keepOwnerGuards = false) {
+      root.ChatGPTSafariLive?.releaseFileChoosers({ sessionId, turnId });
+      for (const [key, waiter] of fileChooserWaiters) {
+        const [session, turn] = JSON.parse(key);
+        if (session === sessionId && (turnId == null || turn === turnId)) waiter.reject(new Error("The file chooser waiter ended with its original sidebar session or turn"));
+      }
+      for (const key of fileChoosers.keys()) {
+        const [session, turn] = JSON.parse(key);
+        if (session === sessionId && (turnId == null || turn === turnId)) fileChoosers.delete(key);
+      }
+      if (turnId == null) {
+        management?.release(sessionId);
+        for (const key of clipboards.keys()) if (JSON.parse(key)[0] === sessionId) clipboards.delete(key);
+      }
       for (const key of snapshots.keys()) {
         const [session, turn] = JSON.parse(key);
         if (session === sessionId && (turnId == null || turn === turnId)) snapshots.delete(key);
       }
       for (const key of turnOwners.keys()) {
         const [session, turn] = JSON.parse(key);
-        if (session === sessionId && (turnId == null || turn === turnId)) turnOwners.delete(key);
+        if (!keepOwnerGuards && session === sessionId && (turnId == null || turn === turnId)) turnOwners.delete(key);
       }
+      const cleanup = [];
+      if (viewport) cleanup.push(viewport.release(sessionId, turnId));
+      for (const [key, lease] of logLeases) if (lease.sessionId === sessionId && (turnId == null || lease.turnId === turnId)) {
+        logLeases.delete(key);
+        cleanup.push(root.ChatGPTSafariLive?.releaseLogs(lease.tabId, lease.scope).catch(() => {}));
+      }
+      return Promise.all(cleanup);
     }
-    return { execute, authorize, release, supported };
+    async function invalidateAll() {
+      const sessions = new Set([...turnOwners.keys()].map(key => JSON.parse(key)[0]));
+      await Promise.all([...sessions].map(session => release(session)));
+      clipboards.clear(); snapshots.clear();
+    }
+    return { execute, authorize, release, invalidateAll, supported };
   }
   if (typeof module === "object" && module.exports) module.exports = { createAgent, supported };
   const api = root.browser || root.chrome;
@@ -1525,7 +3658,11 @@ function m(t,o,e){if(location.origin!==t||o!=null&&location.href!==o)return{sele
     }
 
     async function closeState(state, reason, alreadyUnmounted = false) {
-      if (agentSelection?.owner === state) agentSelection.cancelled = true;
+      if (agentSelection?.owner === state) {
+        agentSelection.cancelled = true;
+        clearTimeout(agentSelection.dialogTimer);
+        if (!agentSelection.inUse) agentSelection = undefined;
+      }
       if (usesContent && !alreadyUnmounted) await unmountContent(state);
       if (options.companion) await options.companion.close(state);
       const created = mediaTabs.get(state.instanceId);
@@ -1583,6 +3720,21 @@ function m(t,o,e){if(location.origin!==t||o!=null&&location.href!==o)return{sele
       const selection = await serialize(async () => {
         const owner = Array.from(openByWindow.values()).find(state => state.instanceId === ownerToken);
         if (!embedded || !owner) throw new Error("The Safari agent no longer owns its inline sidebar");
+        if (agentSelection?.dialogHeld && !agentSelection.inUse) {
+          const pending = agentSelection;
+          if (pending.cancelled || Date.now() >= pending.dialogDeadline) {
+            clearTimeout(pending.dialogTimer);
+            agentSelection = undefined;
+            throw Object.assign(new Error("The dialog selection expired or changed. Inspect the current page; no input was repeated."), { code: "FOCUS_CHANGED" });
+          }
+          if (scope.action !== pending.dialogKind || pending.owner !== owner || pending.targetTab.id !== targetTab.id
+            || pending.targetTab.windowId !== targetTab.windowId || pending.targetTab.url !== targetTab.url) {
+            throw new Error("Respond to the current JavaScript dialog before selecting another agent target");
+          }
+          pending.assertCurrent();
+          pending.inUse = true;
+          return pending;
+        }
         if (agentSelection) throw new Error("Another Safari agent selection is in progress");
         const nativeGroupMove = NATIVE_GROUP_MOVES.has(scope.nativeGroupMove) ? scope.nativeGroupMove : undefined;
         if (owner.tabId === targetTab.id && !nativeGroupMove) return null;
@@ -1590,7 +3742,7 @@ function m(t,o,e){if(location.origin!==t||o!=null&&location.href!==o)return{sele
         if (current.windowId !== owner.windowId || current.incognito || !/^https?:\/\//iu.test(current.url || "")) {
           throw new Error("The Safari agent sidebar owner is no longer available");
         }
-        const value = { owner, ownerTab: current, targetTab, expected: [], cancelled: false, expectedWindow: targetTab.windowId };
+        const value = { owner, ownerTab: current, targetTab, expected: [], cancelled: false, expectedWindow: targetTab.windowId, inUse: true };
         value.assertCurrent = () => {
           if (value.cancelled || agentSelection !== value || openByWindow.get(owner.windowId) !== owner) {
             const error = new Error("Safari selection changed during the agent command. Read the current page before continuing; do not repeat input.");
@@ -1608,6 +3760,25 @@ function m(t,o,e){if(location.origin!==t||o!=null&&location.href!==o)return{sele
           }
           await api.windows.update(tab.windowId, { focused: true });
           value.assertCurrent();
+        };
+        value.holdDialog = (kind = "dialog") => {
+          value.assertCurrent();
+          if (!["dialog", "filechooser"].includes(kind)) throw new Error("Unsupported native modal selection");
+          if (value.dialogHeld) return;
+          value.dialogHeld = true;
+          value.dialogKind = kind;
+          value.dialogDeadline = Date.now() + 5 * 60 * 1000;
+          value.dialogTimer = setTimeout(() => {
+            // Expiry never answers a modal or steals focus back to its owner.
+            value.cancelled = true;
+            if (!value.inUse && agentSelection === value) agentSelection = undefined;
+          }, 5 * 60 * 1000);
+          value.dialogTimer?.unref?.();
+        };
+        value.releaseDialog = () => {
+          value.assertCurrent();
+          value.dialogHeld = false;
+          clearTimeout(value.dialogTimer);
         };
         value.runNativeGroupMove = async (action, perform) => {
           value.assertCurrent();
@@ -1797,7 +3968,7 @@ function m(t,o,e){if(location.origin!==t||o!=null&&location.href!==o)return{sele
         // Do not attempt to switch native groups for an owner that was moved.
         const movedOwner = selection.verifiedNativeSelection && selection.owner.tabId === targetTab.id;
         const restoredOwner = selection.verifiedNativeSelection?.tabId === selection.owner.tabId;
-        if (!selection.cancelled && !movedOwner && !restoredOwner && openByWindow.get(selection.owner.windowId) === selection.owner) {
+        if (!selection.dialogHeld && !selection.cancelled && !movedOwner && !restoredOwner && openByWindow.get(selection.owner.windowId) === selection.owner) {
           const verified = selection.owner.tabId !== targetTab.id ? selection.verifiedNativeSelection : undefined;
           try {
             const current = await api.tabs.get(verified?.tabId ?? targetTab.id);
@@ -1806,7 +3977,14 @@ function m(t,o,e){if(location.origin!==t||o!=null&&location.href!==o)return{sele
               && current.title === verified.title && current.url === verified.url);
             if (current.active && window.focused && unchanged) {
               const owner = await api.tabs.get(selection.owner.tabId);
-              if (owner.windowId === selection.owner.windowId) await selection.select(owner);
+              if (owner.windowId === selection.owner.windowId) {
+                await selection.select(owner);
+                selection.assertCurrent();
+                if (typeof scope.afterOwnerRestored === "function") {
+                  await scope.afterOwnerRestored(owner);
+                  selection.assertCurrent();
+                }
+              }
             }
           } catch (error) {
             if (verified) {
@@ -1818,7 +3996,11 @@ function m(t,o,e){if(location.origin!==t||o!=null&&location.href!==o)return{sele
         }
         return result;
       } finally {
-        if (agentSelection === selection) agentSelection = undefined;
+        selection.inUse = false;
+        if (!selection.dialogHeld || selection.cancelled) {
+          clearTimeout(selection.dialogTimer);
+          if (agentSelection === selection) agentSelection = undefined;
+        }
       }
     }
 
@@ -2279,13 +4461,27 @@ function m(t,o,e){if(location.origin!==t||o!=null&&location.href!==o)return{sele
 (function (root) {
   "use strict";
   const nativeCommands = new Set([
-    "dom_cua_get_visible_dom", "dom_cua_click", "dom_cua_type",
+    "dom_cua_get_visible_dom", "dom_cua_click", "dom_cua_double_click", "dom_cua_type",
     "dom_cua_keypress", "dom_cua_scroll", "dom_cua_download_media", "navigate_tab_url",
     "navigate_tab_back", "navigate_tab_forward", "navigate_tab_reload", "close_tab",
     "browser_management_call", "browser_management_get_audit_trail",
+    "browser_viewport_set", "browser_viewport_reset",
+    "tab_screenshot", "tab_get_js_dialog", "tab_handle_js_dialog",
+    "cua_click", "cua_double_click", "cua_drag", "cua_move", "cua_keypress", "cua_scroll", "cua_type", "cua_download_media",
+    "tab_clipboard_read", "tab_clipboard_read_text", "tab_clipboard_write", "tab_clipboard_write_text",
+    "tab_dev_logs",
+    "tab_page_assets_list", "tab_page_assets_bundle",
+    "playwright_dom_snapshot", "playwright_locator_click", "playwright_locator_dblclick", "playwright_locator_fill",
+    "playwright_locator_count", "playwright_locator_is_enabled", "playwright_locator_is_visible", "playwright_locator_press",
+    "playwright_locator_get_attribute", "playwright_locator_inner_text", "playwright_locator_all_text_contents",
+    "playwright_locator_press_sequentially", "playwright_locator_set_checked", "playwright_locator_text_content",
+    "playwright_locator_read_all", "playwright_locator_wait_for", "playwright_locator_select_option", "playwright_wait_for_load_state",
+    "playwright_wait_for_timeout", "playwright_wait_for_url", "playwright_locator_download_media",
+    "playwright_wait_for_file_chooser", "playwright_file_chooser_set_files",
+    "tab_content_export_gsuite", "tab_content_export_youtube_transcript",
   ]);
   const originalCommands = new Set([
-    "browser_user_open_tabs", "browser_user_claim_tab", "browser_user_get_tab_context",
+    "browser_user_open_tabs", "browser_user_claim_tab", "browser_user_get_tab_context", "browser_user_history",
     "get_tab", "list_tabs", "create_tab", "selected_tab", "mark_tab", "name_session",
   ]);
   let hostDocument;
@@ -2300,20 +4496,44 @@ function m(t,o,e){if(location.origin!==t||o!=null&&location.href!==o)return{sele
       // Original inventory/claim handlers do not call the live executor. Bind
       // these reads and leases to the same real sidebar owner as native input.
       await context.api.executeUnhandledCommand({ type: "browser_safari_context" });
-      return original();
+      const result = await original();
+      if (["browser_user_claim_tab", "create_tab"].includes(command.type) && typeof result?.id === "string") {
+        await context.api.executeUnhandledCommand({ type: "browser_safari_command", command: { type: "safari_logs_start", browser_id: command.browser_id, tab_id: result.id } });
+      }
+      return result;
     }
     if (!nativeCommands.has(command.type)) throw new Error(`Safari does not support agent command "${command.type}".`);
-    if (typeof command.browser_id !== "string" || (!command.type.startsWith("browser_management_")
+    if (typeof command.browser_id !== "string" || (!command.type.startsWith("browser_management_") && !command.type.startsWith("browser_viewport_")
       && (!/^[1-9]\d*$/u.test(command.tab_id || "") || !Number.isSafeInteger(Number(command.tab_id))))) {
       throw new Error("A Safari agent command requires its browser and claimed tab IDs.");
     }
-    if (command.type === "dom_cua_download_media") {
+    if (["dom_cua_download_media", "playwright_locator_download_media", "cua_download_media"].includes(command.type)) {
       const link = await context.api.executeUnhandledCommand({ type: "browser_safari_command",
-        command: { ...command, type: "safari_download_inspect" } });
+        command: { ...command, type: "safari_download_inspect", sourceType: command.type } });
       // Keep original source/destination download consent and policy. Only the
       // inspected href, never a model-supplied override, reaches the transfer.
       await context.security.ensureDownloadAllowed(Number(command.tab_id), link.href);
       return context.api.executeUnhandledCommand({ type: "browser_safari_command", command: { ...command, href: link.href } });
+    }
+    if (command.type === "tab_page_assets_bundle") {
+      const selected = await context.api.executeUnhandledCommand({ type: "browser_safari_command", command: { ...command, type: "safari_assets_inspect" } });
+      await context.security.ensurePageAssetDownloadAllowed(selected.pageUrl);
+      const approved = new Set();
+      for (const asset of selected.assets) if (!asset.inline && !approved.has(new URL(asset.url).origin)) {
+        await context.security.ensurePageAssetFallbackFetchAllowed(selected.pageUrl, asset.url); approved.add(new URL(asset.url).origin);
+      }
+      return context.api.executeUnhandledCommand({ type: "browser_safari_command", command });
+    }
+    if (command.type === "playwright_file_chooser_set_files") {
+      await context.api.executeUnhandledCommand({ type: "browser_safari_command", command: { ...command, type: "safari_file_chooser_inspect" } });
+      await context.security.ensureFileUploadAllowed(Number(command.tab_id));
+      return context.api.executeUnhandledCommand({ type: "browser_safari_command", command });
+    }
+    if (["tab_content_export_gsuite", "tab_content_export_youtube_transcript"].includes(command.type)) {
+      const selected = await context.api.executeUnhandledCommand({ type: "browser_safari_command",
+        command: { ...command, type: "safari_content_export_inspect", exportType: command.type } });
+      await context.security.ensureDownloadAllowed(Number(command.tab_id), selected.href);
+      return context.api.executeUnhandledCommand({ type: "browser_safari_command", command: { ...command, exportId: selected.exportId } });
     }
     return context.api.executeUnhandledCommand({ type: "browser_safari_command", command });
   }
@@ -2531,4 +4751,4 @@ ${e.stack}`),n}function op(e,t){const r=e instanceof Error?e.message:String(e);r
 return (${e});`}if(typeof e=="function")return[`const arg = ${n};`,`const __playwrightEvaluate = (${e.toString()});`,`return await __playwrightEvaluate(${r==="all"?"elements":"element"}, arg);`].join(`
 `);throw new Error(`${i} requires a string or function`)}function lp(e){if(e===void 0)return"undefined";try{const t=JSON.stringify(e);if(t!==void 0)return t}catch(t){throw Ii(t,"playwright.evaluate arg must be JSON-serializable")}throw new Error("playwright.evaluate arg must be JSON-serializable")}function cp(e){const t=Array.isArray(e)?e:[e];if(!t.length)throw new Error("locator.selectOption requires at least one value");return t.map(r=>{if(typeof r=="string")return{value:r};if(!r||typeof r!="object")throw new Error("locator.selectOption requires a string or { value?, label?, index? }");const n={};if(r.value!==void 0){if(typeof r.value!="string")throw new Error("locator.selectOption value must be a string");n.value=r.value}if(r.label!==void 0){if(typeof r.label!="string")throw new Error("locator.selectOption label must be a string");n.label=r.label}if(r.index!==void 0){if(!Number.isInteger(r.index)||r.index<0)throw new Error("locator.selectOption index must be a non-negative integer");n.index=r.index}if(n.value===void 0&&n.label===void 0&&n.index===void 0)throw new Error("locator.selectOption requires value, label, or index for each selection");return n})}var mo=Symbol("browserAuthSelectorDetails"),go=class se{#t;#r;#e;#n;#i;#a;#s;constructor({browserId:t,tabId:r,selector:n,transport:i,collectionReadCache:a,collectionReadIndex:s,collectionRelativeSelector:o}){this.#t=t,this.#r=r,this.#e=n,this.#n=i,this.#i=a,this.#a=s,this.#s=o}static browserAuthSelector(t){return t[mo]()}[mo](){return{browserId:this.#t,selector:this.#e,tabId:this.#r}}async click(t={}){try{await this.#n.send({command:sf({browser_id:this.#t,tab_id:this.#r,selector:this.#e,modifiers:t.modifiers,button:t.button,force:t.force,timeout_ms:t.timeoutMs}),timeoutMs:t.timeoutMs}),this.#i?.clear()}catch(r){throw await this.actionError(r,"click",`waiting on click for selector ${this.#e}`)}}async dblclick(t={}){try{await this.#n.send({command:cf({browser_id:this.#t,tab_id:this.#r,selector:this.#e,modifiers:t.modifiers,button:t.button,force:t.force,timeout_ms:t.timeoutMs}),timeoutMs:t.timeoutMs}),this.#i?.clear()}catch(r){throw await this.actionError(r,"dblclick",`waiting on dblclick for selector ${this.#e}`)}}async selectOption(t,{timeoutMs:r}={}){const n=cp(t);try{await this.#n.send({command:Of({browser_id:this.#t,tab_id:this.#r,selector:this.#e,selections:n,timeout_ms:r}),timeoutMs:r}),this.#i?.clear()}catch(i){throw await this.actionError(i,"selectOption",`locator.selectOption failed for selector ${this.#e}`)}}async fill(t,{timeoutMs:r}={}){if(t==null)throw new Error("locator.fill requires a value");try{await this.#n.send({command:ho({browser_id:this.#t,tab_id:this.#r,selector:this.#e,value:t,replace:!0,timeout_ms:r}),timeoutMs:r}),this.#i?.clear()}catch(n){throw await this.actionError(n,"fill",`locator.fill failed for selector ${this.#e}`)}}async type(t,{timeoutMs:r}={}){if(t==null)throw new Error("locator.type requires a value");try{await this.#n.send({command:ho({browser_id:this.#t,tab_id:this.#r,selector:this.#e,value:t,replace:!1,timeout_ms:r}),timeoutMs:r}),this.#i?.clear()}catch(n){throw await this.actionError(n,"type",`locator.type failed for selector ${this.#e}`)}}async pressSequentially(t,r={}){if(t==null)throw new Error("locator.pressSequentially requires a value");try{await this.#n.send({command:bf({browser_id:this.#t,tab_id:this.#r,selector:this.#e,value:t,...r.timeoutMs==null?{}:{timeout_ms:r.timeoutMs}}),timeoutMs:r.timeoutMs}),this.#i?.clear()}catch(n){throw await this.actionError(n,"pressSequentially",`locator.pressSequentially failed for selector ${this.#e}`)}}async press(t,{timeoutMs:r}={}){if(t==null)throw new Error("locator.press requires a value");try{await this.#n.send({command:_f({browser_id:this.#t,tab_id:this.#r,selector:this.#e,value:t,timeout_ms:r}),timeoutMs:r}),this.#i?.clear()}catch(n){throw await this.actionError(n,"press",`locator.press failed for selector ${this.#e}`)}}async setChecked(t,r={}){if(typeof t!="boolean")throw new Error("locator.setChecked requires a boolean");try{await this.#n.send({command:Lf({browser_id:this.#t,tab_id:this.#r,selector:this.#e,checked:t,force:r.force,timeout_ms:r.timeoutMs}),timeoutMs:r.timeoutMs}),this.#i?.clear()}catch(n){throw await this.actionError(n,"setChecked",`locator.setChecked(${t}) failed for selector ${this.#e}`)}}async check(t={}){await this.setChecked(!0,t)}async uncheck(t={}){await this.setChecked(!1,t)}async waitFor({state:t,timeoutMs:r}){if(!t)throw new Error("locator.waitFor requires a state");try{await this.#n.send({command:Tf({browser_id:this.#t,tab_id:this.#r,selector:this.#e,state:t,timeout_ms:r}),timeoutMs:r})}catch(n){throw await this.actionError(n,"waitFor",`locator.waitFor(${t}) timed out for selector ${this.#e}`)}}async count(){return(await this.#n.send({command:Af({browser_id:this.#t,tab_id:this.#r,selector:this.#e})})).count}async all(){const t=await this.count(),r=new up({browserId:this.#t,tabId:this.#r,selector:this.#e,transport:this.#n});return Array.from({length:t},(n,i)=>new se({browserId:this.#t,tabId:this.#r,selector:`${this.#e} >> nth=${i}`,transport:this.#n,collectionReadCache:r,collectionReadIndex:i}))}async textContent({timeoutMs:t}={}){const r=await this.cachedRead(t);return r?r.text_content:(await this.#n.send({command:Vf({browser_id:this.#t,tab_id:this.#r,selector:this.#e,timeout_ms:t}),timeoutMs:t})).value}async innerText({timeoutMs:t}={}){const r=await this.cachedRead(t);return r?r.inner_text:(await this.#n.send({command:Kf({browser_id:this.#t,tab_id:this.#r,selector:this.#e,timeout_ms:t}),timeoutMs:t})).value}async getAttribute(t,{timeoutMs:r}={}){if(!t)throw new Error("locator.getAttribute requires a name");const n=await this.cachedRead(r);return n?Object.prototype.hasOwnProperty.call(n.attributes,t)?n.attributes[t]??null:null:(await this.#n.send({command:Xf({browser_id:this.#t,tab_id:this.#r,selector:this.#e,name:t,timeout_ms:r}),timeoutMs:r})).value}async isVisible(){return(await this.#n.send({command:Nf({browser_id:this.#t,tab_id:this.#r,selector:this.#e})})).value}async isEnabled(){return(await this.#n.send({command:Bf({browser_id:this.#t,tab_id:this.#r,selector:this.#e})})).value}async allTextContents({timeoutMs:t}={}){return(await this.#n.send({command:qf({browser_id:this.#t,tab_id:this.#r,selector:this.#e,timeout_ms:t}),timeoutMs:t})).values}async evaluate(t,r,n){return(await this.#n.send({command:uo({browser_id:this.#t,script:po(t,r),selector:this.#e,tab_id:this.#r,timeout_ms:n?.timeoutMs}),timeoutMs:n?.timeoutMs})).value}async evaluateAll(t,r,n){return(await this.#n.send({command:uo({browser_id:this.#t,script:po(t,r,"all"),selector:this.#e,selector_mode:"all",tab_id:this.#r,timeout_ms:n?.timeoutMs}),timeoutMs:n?.timeoutMs})).value}async actionError(t,r,n){try{const i=await this.evaluateAll(a=>({matchCount:a.length,visibleCount:a.reduce((s,o)=>s+ +(o.getClientRects().length>0),0),matches:a.slice(0,5).map(s=>({tag:s.tagName.toLowerCase(),role:s.getAttribute("role"),type:s.getAttribute("type"),ariaLabel:s.getAttribute("aria-label"),text:s.textContent?.trim().slice(0,120)??"",visible:s.getClientRects().length>0,disabled:"disabled"in s&&!!s.disabled}))}),void 0,{timeoutMs:1e3});return Ii(t,`${n}
 Locator diagnostics: ${JSON.stringify({kind:op(t,i),action:r,locator:this.#e,...i,truncated:i.matchCount>i.matches.length})}`)}catch{return Ii(t,n)}}async downloadMedia({timeoutMs:t=12e4}={}){try{const r=await this.#n.send({command:hf({browser_id:this.#t,tab_id:this.#r,selector:this.#e,timeout_ms:t}),timeoutMs:t});return this.#i?.clear(),r.path}catch(r){throw await this.actionError(r,"downloadMedia",`locator.downloadMedia failed for selector ${this.#e}`)}}locator(t,r={}){if(!t)throw new Error("locator.locator requires a selector");return new se({browserId:this.#t,tabId:this.#r,selector:`${this.#e} >> ${t}`,transport:this.#n,collectionReadCache:this.#i,collectionReadIndex:this.#a,collectionRelativeSelector:this.#i&&this.#a!==void 0?Ne(this.#s,t):void 0}).filter(r)}first(){return new se({browserId:this.#t,tabId:this.#r,selector:`${this.#e} >> nth=0`,transport:this.#n,collectionReadCache:this.#i,collectionReadIndex:this.#a,collectionRelativeSelector:this.#i&&this.#a!==void 0?Ne(this.#s,"nth=0"):void 0})}last(){return new se({browserId:this.#t,tabId:this.#r,selector:`${this.#e} >> nth=-1`,transport:this.#n,collectionReadCache:this.#i,collectionReadIndex:this.#a,collectionRelativeSelector:this.#i&&this.#a!==void 0?Ne(this.#s,"nth=-1"):void 0})}nth(t){if(typeof t!="number")throw new Error("locator.nth requires a numeric index");return new se({browserId:this.#t,tabId:this.#r,selector:`${this.#e} >> nth=${t}`,transport:this.#n,collectionReadCache:this.#i,collectionReadIndex:this.#a,collectionRelativeSelector:this.#i&&this.#a!==void 0?Ne(this.#s,`nth=${t}`):void 0})}and(t){if(!(t instanceof se))throw new Error("locator.and requires a PlaywrightLocator");if(t.#t!==this.#t||t.#r!==this.#r)throw new Error("Locators must belong to the same tab");return new se({browserId:this.#t,tabId:this.#r,selector:`${this.#e} >> internal:and=${JSON.stringify(t.#e)}`,transport:this.#n})}or(t){if(!(t instanceof se))throw new Error("locator.or requires a PlaywrightLocator");if(t.#t!==this.#t||t.#r!==this.#r)throw new Error("Locators must belong to the same tab");return new se({browserId:this.#t,tabId:this.#r,selector:`${this.#e} >> internal:or=${JSON.stringify(t.#e)}`,transport:this.#n})}filter(t={}){const r=[this.#e];if(t.hasText!==void 0&&r.push(`internal:has-text=${Xr(t.hasText,!1)}`),t.hasNotText!==void 0&&r.push(`internal:has-not-text=${Xr(t.hasNotText,!1)}`),t.has!==void 0&&(this.assertCompatibleLocator(t.has,"locator.filter has"),r.push(`internal:has=${JSON.stringify(t.has.#e)}`)),t.hasNot!==void 0&&(this.assertCompatibleLocator(t.hasNot,"locator.filter hasNot"),r.push(`internal:has-not=${JSON.stringify(t.hasNot.#e)}`)),t.visible!==void 0){if(typeof t.visible!="boolean")throw new Error("locator.filter visible must be a boolean");r.push(`visible=${t.visible}`)}const n=r.slice(1).join(" >> "),i=this.#i&&this.#a!==void 0&&(!n||this.#s!==void 0);return new se({browserId:this.#t,tabId:this.#r,selector:r.join(" >> "),transport:this.#n,collectionReadCache:i?this.#i:void 0,collectionReadIndex:i?this.#a:void 0,collectionRelativeSelector:i?Ne(this.#s,n):void 0})}getByRole(t,r={}){const n=dp(t,r);return new se({browserId:this.#t,tabId:this.#r,selector:`${this.#e} >> ${n}`,transport:this.#n,collectionReadCache:this.#i,collectionReadIndex:this.#a,collectionRelativeSelector:this.#i&&this.#a!==void 0?Ne(this.#s,n):void 0})}getByText(t,r={}){const n=hp(t,r);return new se({browserId:this.#t,tabId:this.#r,selector:`${this.#e} >> ${n}`,transport:this.#n,collectionReadCache:this.#i,collectionReadIndex:this.#a,collectionRelativeSelector:this.#i&&this.#a!==void 0?Ne(this.#s,n):void 0})}getByLabel(t,r={}){const n=fp(t,r);return new se({browserId:this.#t,tabId:this.#r,selector:`${this.#e} >> ${n}`,transport:this.#n,collectionReadCache:this.#i,collectionReadIndex:this.#a,collectionRelativeSelector:this.#i&&this.#a!==void 0?Ne(this.#s,n):void 0})}getByPlaceholder(t,r={}){const n=pp(t,r);return new se({browserId:this.#t,tabId:this.#r,selector:`${this.#e} >> ${n}`,transport:this.#n,collectionReadCache:this.#i,collectionReadIndex:this.#a,collectionRelativeSelector:this.#i&&this.#a!==void 0?Ne(this.#s,n):void 0})}getByTestId(t){const r=mp(t);return new se({browserId:this.#t,tabId:this.#r,selector:`${this.#e} >> ${r}`,transport:this.#n,collectionReadCache:this.#i,collectionReadIndex:this.#a,collectionRelativeSelector:this.#i&&this.#a!==void 0?Ne(this.#s,r):void 0})}async cachedRead(t){return!this.#i||this.#a===void 0?null:await this.#i.read({index:this.#a,relativeSelector:this.#s,timeoutMs:t})}assertCompatibleLocator(t,r){if(!(t instanceof se))throw new Error(`${r} requires a PlaywrightLocator`);if(t.#t!==this.#t||t.#r!==this.#r)throw new Error("Locators must belong to the same tab")}},up=class{#t;#r;#e;#n;#i=new Map;constructor({browserId:e,tabId:t,selector:r,transport:n}){this.#t=e,this.#r=t,this.#e=r,this.#n=n}clear(){this.#i.clear()}async read({index:e,relativeSelector:t,timeoutMs:r}){const n=t??"";let i=this.#i.get(n);return i||(i=this.#a(t,r).catch(a=>{throw this.#i.delete(n),a}),this.#i.set(n,i)),(await i)[e]??null}async#a(e,t){return(await this.#n.send({command:tp({browser_id:this.#t,tab_id:this.#r,selector:this.#e,relative_selector:e,timeout_ms:t}),timeoutMs:t})).values}};function Ne(e,t){return e?t?`${e} >> ${t}`:e:t||void 0}function _o(e){const t=e;return e.unicode||t.unicodeSets?String(e):String(e).replace(/(^|[^\\])(\\\\)*(["'`])/g,"$1$2\\\\$3").replace(/>>/g,"\\>\\>")}function Xr(e,t){return typeof e!="string"?_o(e):`${JSON.stringify(e)}${t?"s":"i"}`}function Ai(e,t){return typeof e!="string"?_o(e):`"${e.replace(/\\/g,"\\\\").replace(/["]/g,'\\"')}"${t?"s":"i"}`}function dp(e,t){if(!e)throw new Error("getByRole requires a role");const r=[];return t.name!==void 0&&r.push(`[name=${Ai(t.name,!!t.exact)}]`),`internal:role=${e}${r.join("")}`}function hp(e,t){if(typeof e!="string"&&!Ei(e))throw new Error("getByText requires a string or RegExp");return`internal:text=${Xr(e,!!t.exact)}`}function fp(e,t){if(typeof e!="string"&&!Ei(e))throw new Error("getByLabel requires a string or RegExp");return`internal:label=${Xr(e,!!t.exact)}`}function pp(e,t){if(typeof e!="string"&&!Ei(e))throw new Error("getByPlaceholder requires a string or RegExp");return`internal:attr=[placeholder=${Ai(e,!!t.exact)}]`}function mp(e){if(!e)throw new Error("getByTestId requires a testId");return`internal:testid=[data-testid=${Ai(e,!0)}]`}var Ci=class{constructor(e,t,r,n){this.transport=e,this.browserId=t,this.documentationApi=r,this.info=n}get id(){return this.info.id}async documentation(){return await this.documentationApi.get(`capabilities/browser/${this.id}`)}},Ht=class{constructor(e,t,r,n,i){this.transport=e,this.browserId=t,this.tabId=r,this.documentationApi=n,this.info=i}get id(){return this.info.id}async documentation(){return await this.documentationApi.get(`capabilities/tab/${this.id}`)}};function ki({capability:e,info:t,internalOnly:r}){return{capability:e,create:n=>new e({...n,info:t}),id:t.id,info:t,...r==null?{}:{internalOnly:r}}}function Wt({capability:e,info:t,internalOnly:r}){return{capability:e,create:n=>new e({...n,info:t}),id:t.id,info:t,...r==null?{}:{internalOnly:r}}}var gp=z(["captcha_failed","access_denied","challenge_loop","unexpected_bot_error"]),_p=b({reason:gp}),vp="tab_bot_detection_report",vo=_p.extend({browser_id:_(),tab_id:_()}),wp=b({status:re("reported"),hostname:_().nullable()});function bp(e){return new K(vp,vo,e)}var yp={id:"botDetection",description:"Use when the current tab is blocked by bot detection, a failed CAPTCHA, a hard access denial, or a repeated challenge/login loop."},Sp=class extends Ht{constructor({browserId:e,documentation:t,info:r,tabId:n,transport:i}){super(i,e,n,t,r)}async report(e){const t=vo.parse({...e,browser_id:this.browserId,tab_id:this.tabId}),r=await this.transport.send({command:bp(t)});return wp.parse(r)}},Tp=Wt({capability:Sp,info:yp}),wo=b({session_id:_().min(1).optional(),target_id:_().min(1).optional()}).refine(e=>e.session_id==null!=(e.target_id==null),"CDP target must provide exactly one of session_id or target_id."),Ep=b({extensionId:_().optional(),sessionId:_().optional(),tabId:k().int().optional(),targetId:_().optional()}),Ip=b({sequence:k().int().positive(),source:Ep,method:_().min(1),params:zt(_(),xe()).optional()}),Ap="tab_cdp_call",Cp=b({browser_id:_(),tab_id:_(),method:_().min(1),params:zt(_(),xe()).optional(),target:wo.optional(),timeout_ms:k().int().positive().optional()}),kp=xe();function Rp(e){return new K(Ap,Cp,e)}var Op="tab_cdp_events",Pp=b({after_sequence:k().int().nonnegative().optional(),browser_id:_(),limit:k().int().positive().max(1e3).optional(),methods:N(_().min(1)).min(1).optional(),tab_id:_(),target:wo.optional(),timeout_ms:k().int().nonnegative().optional()}),Mp=b({cursor:k().int().nonnegative(),events:N(Ip),hasMore:J(),truncated:J()});function Lp(e){return new K(Op,Pp,e)}var Dp={id:"cdp",description:"Send raw Chrome DevTools Protocol commands and read debugger events through a supported tab for developer use cases."},xp=2e3,Np=class extends Ht{constructor({browserId:e,documentation:t,info:r,tabId:n,transport:i}){super(i,e,n,t,r)}async send(e,t,r){const n=await this.transport.send({command:Rp({browser_id:this.browserId,method:e,params:t,tab_id:this.tabId,target:bo(r?.target),timeout_ms:r?.timeoutMs}),timeoutMs:r?.timeoutMs});return kp.parse(n)}async readEvents(e){const t=await this.transport.send({command:Lp({after_sequence:e?.afterSequence,browser_id:this.browserId,limit:e?.limit,methods:e?.methods,tab_id:this.tabId,target:bo(e?.target),timeout_ms:e?.timeoutMs}),timeoutMs:Fp(e?.timeoutMs)});return Mp.parse(t)}},Up=Wt({capability:Np,info:Dp});function bo(e){if(e!=null)return{session_id:e.sessionId,target_id:e.targetId}}function Fp(e){return e!=null&&e>0?e+xp:void 0}var yo=/^[A-Za-z0-9_-]{1,48}$/,So=new Set(["__proto__","constructor","prototype"]),Bp=b({id:_().regex(yo).refine(e=>!So.has(e)),label:_(),type:_().min(1),autocomplete:_().nullable().optional(),required:J(),selector:_()}),$p=b({selector:_(),action:z(["click","press_enter"])}),jp=b({id:_().regex(yo).refine(e=>!So.has(e)),label:_().trim().min(1).max(120),selector:_().optional(),field_ids:N(_()).max(6).optional()}).refine(e=>e.selector!=null!=(e.field_ids?.length??0)>0,"browser auth options require either a selector or credential fields"),qp=b({origin:_(),fields:N(Bp).max(6),options:N(jp).min(2).max(10).optional(),qr_code:re(!0).optional(),submit:$p.optional(),otpHandle:_().min(1).max(16384).optional()}).refine(e=>e.fields.length>0||e.options!=null||e.qr_code===!0,"browser auth requests require credential fields, sign-in options, or a QR code"),Gp="tab_browser_auth_handoff",zp=qp.and(b({browser_id:_(),tab_id:_()})),To=b({outcome:z(["origin_changed","submission_failed"]),reason:z(["request_url_invalid","request_scheme","request_origin","paused_iframe","iframe_origin","child_frame_origin","other"]),request_class:z(["main_document","background","other"]),submission_phase:z(["pending","settled","not_applicable"])}),Vp=b({sequence:k().int().min(0).max(65535),kind:z(["prompt_completed","field_fill_started","field_fill_completed","field_fill_uncertain","url_changed","document_changed","frame_changed","reinspection_started","reinspection_succeeded","reinspection_failed","site_request","site_navigation","site_submission_verified","submit_started","attempt_completed"]),phase:z(["prompt","filling","before_submit","submitting","settled"]),field_index:k().int().min(0).max(63).optional(),reinspection:k().int().min(1).max(3).optional(),outcome:z(["submitted","unavailable","origin_changed","page_changed","locator_invalid","submission_failed","prompt_changed"]).optional(),request_class:z(["main_document","background"]).optional(),method:z(["get","post","other"]).optional(),origin_relation:z(["same","cross","other"]).optional()}),Hp=b({schema_version:re(1),request_id:_().uuid(),submission_mode:z(["ordinary","private"]),first_rejection:To.optional(),terminal_rejection:To.optional(),attempt_events:N(Vp).max(64).optional(),dropped_attempt_events:k().int().min(0).max(65535).optional()}),Wp=b({status:z(["submitted","declined","cancelled","unavailable","expired","origin_changed","page_changed","locator_invalid","submission_failed"]),locator_error:b({field_id:_(),reason:re("not_user_visible")}).optional(),selected_option:_().optional(),reason:re("user_took_over").optional(),submission_diagnostics:Hp.optional()});function Kp(e){return new K(Gp,zp,e)}var Zp={id:"browserAuth",description:"MUST read its documentation before the first interaction with any authentication or sign-in flow required for the task. Covers method selection, secure user-provided credentials, and post-authentication verification and recovery."},Jp=class extends Ht{constructor({browserId:e,documentation:t,info:r,tabId:n,transport:i}){super(i,e,n,t,r)}async request(e){const t=Yp(e,{browserId:this.browserId,tabId:this.tabId}),r=Kp({...t,browser_id:this.browserId,tab_id:this.tabId});r.parse();const n=await this.transport.send({command:r});return Wp.parse(n)}},Xp=Wt({capability:Jp,info:Zp});function Yp(e,t){const r={origin:e.origin,otpHandle:e.otpHandle,fields:e.fields.map(n=>{const i={id:n.id,label:n.label,type:n.type,required:n.required,selector:Ri(n.selector,t)};return n.autocomplete!==void 0&&(i.autocomplete=n.autocomplete),i}),...e.qr_code===!0?{qr_code:!0}:{}};return e.options!=null&&(r.options=e.options.map(n=>({id:n.id,label:n.label,...n.field_ids==null?{}:{field_ids:n.field_ids},...n.selector==null?{}:{selector:Ri(n.selector,t)}}))),e.submit!=null&&(r.submit={action:e.submit.action,selector:Ri(e.submit.selector,t)}),r}function Ri(e,t){if(typeof e=="string")return e;if(!(e instanceof go))throw new Error("browserAuth selector must be a string or PlaywrightLocator");const r=go.browserAuthSelector(e);if(r.browserId!==t.browserId||r.tabId!==t.tabId)throw new Error("browserAuth selector locator must belong to this tab");return r.selector}var Eo=z(["font","image","script","stylesheet","video","other"]),Io=z(["font","image","stylesheet","video"]),Qp=b({kind:z(["attribute","computedStyle","resource"]),nodeId:k().int().positive().optional(),property:_().optional()}),em=b({id:_(),kind:Eo,name:_(),sources:N(Qp),url:_()}),tm=b({id:_(),markup:_(),name:_()}),rm=b({assets:N(em),id:_(),inlineSvgs:N(tm),pageUrl:_().nullable(),summary:b({byKind:zt(Eo,k().int().nonnegative()),inlineSvgCount:k().int().nonnegative(),totalCount:k().int().nonnegative()})}),nm=b({assetIds:N(_()).optional(),inventoryId:_(),kinds:N(Io).optional()}),im=b({contentType:_().nullable(),id:_(),kind:Io,name:_(),path:_(),url:_()}),am=b({contentType:_().nullable(),id:_(),name:_(),reason:_(),url:_()}),sm=b({assets:N(im),directoryPath:_(),failures:N(am),manifestPath:_(),summary:b({downloadedCount:k().int().nonnegative(),elapsedMs:k().nonnegative(),failedCount:k().int().nonnegative(),requestedCount:k().int().nonnegative()})}),om="tab_page_assets_bundle",lm=nm.extend({browser_id:_(),tab_id:_()}),cm=sm;function um(e){return new K(om,lm,e)}var dm="tab_page_assets_list",hm=b({browser_id:_(),tab_id:_()}),fm=rm;function pm(e){return new K(dm,hm,e)}var mm={id:"pageAssets",description:"List assets already observed in the current page state and bundle selected assets into a temporary local artifact."},gm=class extends Ht{constructor({browserId:e,documentation:t,info:r,tabId:n,transport:i}){super(i,e,n,t,r)}async list(){const e=await this.transport.send({command:pm({browser_id:this.browserId,tab_id:this.tabId})});return fm.parse(e)}async bundle(e){const t=await this.transport.send({command:um({...e,browser_id:this.browserId,tab_id:this.tabId})});return cm.parse(t)}},_m=Wt({capability:gm,info:mm}),Ao={id:"webmcp",description:"Fetch page-defined WebMCP tools bound to the current document, then call them through the returned object."};function vm(e){return{name:e.name,call_name:e.call_name,...e.title==null?{}:{title:e.title},...e.description==null?{}:{description:e.description},inputSchema:e.input_schema,...e.annotations==null?{}:{annotations:e.annotations},...e.origin==null?{}:{origin:e.origin},...e.pageUrl==null?{}:{pageUrl:e.pageUrl}}}var wm=class extends Ht{constructor({browserId:e,documentation:t,info:r,tabId:n,transport:i}){super(i,e,n,t,r)}async fetchTools(){const e=jh.parse(await this.transport.send({command:Gh({browser_id:this.browserId,tab_id:this.tabId})})),t=e.tools.map(vm),r=new Map(e.tools.map(i=>[i.call_name,i])),n=bm(t);return Object.freeze({description:()=>n,call:async(i,a,s)=>{const o=i.trim(),l=r.get(o);if(l==null)throw new Error(`WebMCP tool ${JSON.stringify(o)} is not available in this snapshot. Call fetchTools() again.`);return(await this.transport.send({command:Hh({browser_id:this.browserId,tab_id:this.tabId,tool_name:l.name,tool_description:l.description,tool_title:l.title,registration_id:l.registration_id,input:a,...s?.timeoutMs==null?{}:{timeout_ms:s.timeoutMs}})})).result}})}};function bm(e){return e.length===0?"No WebMCP tools are available in this document.":["WebMCP tools available in this document:",JSON.stringify(e.map(({call_name:t,...r})=>({...r,name:t})),null,2),"Call tools.call(name, input) to invoke one."].join(`
-`)}var ym=Wt({capability:wm,info:Ao}),Sm=[Up,Tp,Xp,_m,ym],QS=Tm(Sm);function Tm(e){return new Map(e.map(t=>[t.id,t.create]))}var Co=We({PayloadSchema:()=>Kt,ResultSchema:()=>Oi,commandType:()=>Yr,create:()=>ko}),Yr="browser_management_call",Kt=b({args:N(xe()),browser_id:_(),method:_(),namespace:_()}),Oi=b({value:xe()});function ko(e){return new K(Yr,Kt,e)}var Ro=We({AuditChangeSchema:()=>Oo,PayloadSchema:()=>Pi,ResultSchema:()=>Mi,commandType:()=>Qr,create:()=>Po}),Qr="browser_management_get_audit_trail",Pi=Kt.pick({browser_id:!0}),Oo=Kt.omit({browser_id:!0}).extend({before:b({bookmarks:N(b({id:_(),index:k().optional(),parentId:_().optional(),title:_(),url:_().optional()})),tabLayout:b({groups:N(b({collapsed:J(),color:_(),id:k(),title:_().optional(),windowId:k()})),tabs:N(b({autoDiscardable:J(),groupId:k(),id:k(),index:k(),pinned:J(),url:_().optional(),windowId:k()}))}),windows:N(b({focused:J(),height:k().optional(),id:k(),left:k().optional(),state:_().optional(),top:k().optional(),width:k().optional()}))}).partial(),createdAt:k(),result:io([k(),b({id:_()})]).optional()}),Mi=b({changes:N(Oo)});function Po(e){return new K(Qr,Pi,e)}var Em=We({Call:()=>Co,GetAuditTrail:()=>Ro,commands:()=>Im}),Im={[Yr]:Co,[Qr]:Ro},Am={id:"management",description:"Organize windows, tabs, tab groups, and bookmarks. Use only for user-requested browser organization."},Cm=class extends Ci{constructor({browserId:e,documentation:t,info:r,transport:n}){super(n,e,t,r),this.windows=this.createNamespace("windows"),this.tabs=this.createNamespace("tabs"),this.tabGroups=this.createNamespace("tabGroups"),this.bookmarks=this.createNamespace("bookmarks")}async getAuditTrail(){const e=await this.transport.send({command:Po({browser_id:this.browserId})});return Mi.parse(e)}async invoke(e,t,...r){const n=await this.transport.send({command:ko({args:r,browser_id:this.browserId,method:t,namespace:e})});return Oi.parse(n).value}createNamespace(e){return new Proxy({},{get:(t,r)=>{if(!(typeof r!="string"||r==="then"||r==="toJSON"||r in Object.prototype))return(...n)=>this.invoke(e,r,...n)}})}},Mo=ki({capability:Cm,info:Am}),km=We({PayloadSchema:()=>Lo,ResultSchema:()=>Do,commandType:()=>Li,create:()=>xo}),Li="browser_visibility_get",Lo=b({browser_id:_()}),Do=b({visible:J()});function xo(e){return new K(Li,Lo,e)}var Rm=We({PayloadSchema:()=>No,ResultSchema:()=>Uo,commandType:()=>Di,create:()=>Fo}),Di="browser_visibility_set",No=b({browser_id:_(),visible:J()}),Uo=b({});function Fo(e){return new K(Di,No,e)}var eT={[Li]:km,[Di]:Rm},Om={id:"visibility",description:"Use to show or hide the browser to the user, and to determine the browser's current visibility. Keep browser work in the background unless the user asks to see it or live viewing is useful. When the browser should be visible, call set(true)."},Pm=class extends Ci{constructor({browserId:e,documentation:t,info:r,transport:n}){super(n,e,t,r)}async set(e){const t=await this.transport.send({command:Fo({browser_id:this.browserId,visible:e})});Uo.parse(t)}async get(){const e=await this.transport.send({command:xo({browser_id:this.browserId})});return Do.parse(e).visible}},Mm=ki({capability:Pm,info:Om}),Bo=We({PayloadSchema:()=>xi,ResultSchema:()=>Ni,commandType:()=>en,create:()=>$o}),en="browser_viewport_reset",xi=b({browser_id:_()}),Ni=b({});function $o(e){return new K(en,xi,e)}var jo=We({PayloadSchema:()=>Ui,ResultSchema:()=>Fi,commandType:()=>tn,create:()=>qo}),tn="browser_viewport_set",Ui=b({browser_id:_(),height:k().int().positive(),width:k().int().positive()}),Fi=b({});function qo(e){return new K(tn,Ui,e)}var Lm=We({Reset:()=>Bo,Set:()=>jo,commands:()=>Dm}),Dm={[en]:Bo,[tn]:jo},xm={id:"viewport",description:"Controls an explicit browser viewport override for responsive or device-size testing. Use it when a task calls for specific dimensions or breakpoint validation; otherwise leave it unset so the browser uses its normal viewport. Reset temporary overrides before finishing unless the user asked to keep them."},Nm=class extends Ci{constructor({browserId:e,documentation:t,info:r,transport:n}){super(n,e,t,r)}async set(e){const t=await this.transport.send({command:qo({browser_id:this.browserId,...e})});Fi.parse(t)}async reset(){const e=await this.transport.send({command:$o({browser_id:this.browserId})});Ni.parse(e)}},Go=ki({capability:Nm,info:xm}),Um=[Mo,Mm,Go],tT=Fm(Um);function Fm(e){return new Map(e.map(t=>[t.id,t.create]))}var rT=b({side_effects:N(_())}).passthrough();async function Bm({expectedUrl:e,read:t,tabId:r}){const n=new URL(e);if(n.protocol!=="https:"&&n.protocol!=="http:")throw new Error("Tab reads require an HTTP or HTTPS URL");const i=await chrome.tabs.get(r);if(i.incognito===!0||i.url!==e)throw new Error(it);const a=await Zu(e,t,async(o,l,h)=>{const[m]=await chrome.scripting.executeScript({args:l,func:o,target:{tabId:r},world:h});return m?.result}),s=await chrome.tabs.get(r);if(s.incognito===!0||s.url!==e)throw new Error(it);return a??null}var Bi=new Map,$m=1e3;async function zo(e){if(await $i(e))return!0;let t=Bi.get(e);return t||(t=jm(e),Bi.set(e,t),t.finally(()=>{Bi.delete(e)})),await t}async function $i(e){try{return(await ie(chrome.tabs.sendMessage(e,{type:"CONTENT_PING"})))?.ok===!0}catch{return!1}}async function ie(e,t=$m){let r;const n=new Promise(i=>{r=setTimeout(()=>i(null),t)});try{return await Promise.race([e,n])}finally{r!==void 0&&clearTimeout(r)}}async function jm(e){try{if(await ie(chrome.scripting.executeScript({files:["content-scripts/codex.js"],injectImmediately:!0,target:{tabId:e}}))==null)return!1}catch{return!1}return await $i(e)}var ji=1e6,qm=ji+4999,Gm=class{appliedRules;failureReported=!1;async synchronize(e,t=!1){const r=chrome.declarativeNetRequest;let n="check DNR permission";try{if(r==null){if(e.size>0)throw new Error("The declarativeNetRequest permission is missing");return null}let i;t&&e.size>0&&(n="query existing tabs",i=new Set((await chrome.tabs.query({})).map(l=>l.id)));const a=new Map;for(const[l,h]of e){if(!Number.isSafeInteger(l)||l<0||i!=null&&!i.has(l))continue;const m=a.get(h);m?m.push(l):a.set(h,[l])}const s=[];for(const[l,h]of[...a].sort(([m],[d])=>m.localeCompare(d)))h.sort((m,d)=>m-d),s.push(...[{tabIds:h,resourceTypes:[r.ResourceType.MAIN_FRAME,r.ResourceType.SUB_FRAME,r.ResourceType.OBJECT]},{tabIds:h,excludedInitiatorDomains:[chrome.runtime.id],excludedResourceTypes:[r.ResourceType.MAIN_FRAME,r.ResourceType.SUB_FRAME,r.ResourceType.OBJECT]}].map((m,d)=>({id:ji+s.length+d,priority:1,action:{type:r.RuleActionType.MODIFY_HEADERS,requestHeaders:[{header:"x-browser-agent",value:`ChatGPT/${l}`,operation:r.HeaderOperation.SET}]},condition:m})));const o=JSON.stringify(s);return!t&&this.appliedRules===o||(n=s.length===0?"remove session rules":"update session rules",await r.updateSessionRules({removeRuleIds:await this.readOwnedRuleIds(),addRules:s}),this.appliedRules=o,this.failureReported=!1),null}catch{return this.appliedRules=void 0,this.failureReported||(console.error("Controlled-tab request headers failed. Check the DNR permission. Retrying on the next lease change or heartbeat.",{operation:n}),this.failureReported=!0),new Error(`Unable to ${n} for agent request headers. Retry the browser command.`)}}async readOwnedRuleIds(){return(await chrome.declarativeNetRequest.getSessionRules()).filter(({id:e})=>e>=ji&&e<=qm).map(({id:e})=>e)}};function zm(e){return e==="agent"||e==="user"}function Vm(e){return e==="active"||e==="handoff"}function Hm(e){return e==="handoff"||e==="deliverable"}function Vo(e){if(e===null)return null;if(!e||typeof e!="object")return;const t=e;if(!(typeof t.width!="number"||!Number.isInteger(t.width)||t.width<=0||typeof t.height!="number"||!Number.isInteger(t.height)||t.height<=0))return{height:t.height,width:t.width}}function Wm(e){if(!e||typeof e!="object")return null;const t=e;if(typeof t.tabId!="number"||!Number.isInteger(t.tabId)||typeof t.sessionId!="string"||typeof t.turnId!="string"||!zm(t.origin)||typeof t.claimedAt!="number"||!Number.isFinite(t.claimedAt)||t.instanceId!==null&&typeof t.instanceId!="string"||!Vm(t.state))return null;const r=Vo(t.viewportSize);return{tabId:t.tabId,sessionId:t.sessionId,turnId:t.turnId,origin:t.origin,claimedAt:t.claimedAt,instanceId:t.instanceId,state:t.state,requestHeaderEnabled:typeof t.requestHeaderEnabled=="boolean"?t.requestHeaderEnabled:void 0,...Hm(t.mark)?{mark:t.mark}:{},...typeof t.isActiveHandoff=="boolean"?{isActiveHandoff:t.isActiveHandoff}:{},...r!==void 0?{viewportSize:r}:{}}}function Km(e){if(!e||typeof e!="object"||!("leases"in e)||!e.leases||typeof e.leases!="object"||Array.isArray(e.leases))return new Map;const t=new Map;for(const[r,n]of Object.entries(e.leases)){const i=Number(r),a=Wm(n);!Number.isInteger(i)||a==null||a.tabId!==i||t.set(i,a)}return t}function Zm(e){if(!e||typeof e!="object"||!("pendingViewportSizes"in e)||!e.pendingViewportSizes||typeof e.pendingViewportSizes!="object"||Array.isArray(e.pendingViewportSizes))return new Map;const t=new Map;for(const[r,n]of Object.entries(e.pendingViewportSizes)){if(!n||typeof n!="object")continue;const i=n,a=Vo(i.viewportSize);typeof i.turnId!="string"||a===void 0||t.set(r,{turnId:i.turnId,viewportSize:a})}return t}function Jm(e,t){return e!=null&&e.tabId===t.tabId&&e.sessionId===t.sessionId&&e.turnId===t.turnId&&e.origin===t.origin&&e.claimedAt===t.claimedAt&&e.instanceId===t.instanceId&&e.state===t.state&&e.isActiveHandoff===t.isActiveHandoff}var ze=class mr{static instance=null;leases=new Map;pendingViewportSizes=new Map;storageKey="TAB_LEASES";storage;requestHeaders=new Gm;initializePromise=null;mutationQueue=Promise.resolve();storageLoaded=!1;listenersRegistered=!1;activeTabLeaseChangeHandlers=new Set;handleTabRemoved=t=>{this.removeTab(t)};handleTabReplaced=(t,r)=>{this.replaceTab(t,r)};static getInstance(){return mr.instance||(mr.instance=new mr),mr.instance}constructor(t=chrome.storage.session){this.storage=t,this.registerEventListeners()}async ensureInit(){this.initializePromise||(this.initializePromise=this.loadFromStorage()),await this.initializePromise}async reconcileRequestHeaders(){await this.ensureInit();const t=await this.mutate(()=>!1,!0);if(t!=null)throw t}async getOwningSessionId(t){await this.ensureInit(),await this.waitForPendingMutations();const r=this.leases.get(t);return r?.state==="active"?r.sessionId:null}async getActiveLease(t){await this.ensureInit(),await this.waitForPendingMutations();const r=this.leases.get(t);return r?.state==="active"?{...r}:null}async claimTabIfSourceLeaseMatches(t,r){await this.ensureInit();const n=await Ce();let i=!1,a;const s=await this.mutate(()=>{const o=this.leases.get(t.tabId);return t.state!=="active"||o==null||!Jm(o,t)||this.leases.has(r)?!1:(a=o.requestHeaderEnabled,this.leases.set(r,{tabId:r,sessionId:t.sessionId,turnId:t.turnId,origin:"agent",claimedAt:Date.now(),instanceId:n,state:"active",requestHeaderEnabled:a,...Object.hasOwn(o,"viewportSize")?{viewportSize:o.viewportSize}:{}}),i=!0,!0)});if(s!=null&&a!==void 0)throw s;return i}subscribeActiveTabLeaseChanges(t){return this.activeTabLeaseChangeHandlers.add(t),()=>{this.activeTabLeaseChangeHandlers.delete(t)}}mightHaveActiveTabLease(t){return!this.storageLoaded||this.leases.get(t)?.state==="active"}async claimTab(t,r,n,i,a){await this.ensureInit();const s=await Ce(),o=await this.mutate(()=>{const l=this.leases.get(n);if(l?.state==="active"){if(l.sessionId!==t)throw new Error(`Tab ${n} is already part of browser session ${l.sessionId}`);return l.turnId===r&&l.instanceId===s?!1:(this.leases.set(n,{...l,turnId:r,instanceId:s}),!0)}return this.leases.set(n,{tabId:n,sessionId:t,turnId:r,origin:i,claimedAt:Date.now(),instanceId:s,state:"active",requestHeaderEnabled:a}),!0});if(o!=null&&a!==void 0)throw o}async setSessionRequestHeaderEnabled(t,r){await this.ensureInit();const n=await this.mutate(()=>{let i=!1;for(const[a,s]of this.leases)s.sessionId!==t||s.requestHeaderEnabled===r||(this.leases.set(a,{...s,requestHeaderEnabled:r}),i=!0);return i});if(n!=null)throw n}async isClaimedBySession(t,r){await this.ensureInit(),await this.waitForPendingMutations();const n=this.leases.get(r);return n?.state==="active"&&n.sessionId===t}async getSessionActiveLeases(t){return await this.getSessionLeases(t,"active")}async getSessionHandoffLeases(t){return await this.getSessionLeases(t,"handoff")}async setViewportSize(t,r,n,i){await this.ensureInit(),await this.mutate(()=>{if(n==null)return this.pendingViewportSizes.set(t,{turnId:r,viewportSize:i}),!0;const a=this.leases.get(n);if(a?.state!=="active"||a.sessionId!==t||a.turnId!==r)throw new Error(`Tab ${n} is not part of browser session ${t}`);return this.leases.set(n,{...a,viewportSize:i}),this.pendingViewportSizes.delete(t),!0})}async takeViewportSizeForAttach(t,r,n){await this.ensureInit();let i;return await this.mutate(()=>{const a=this.leases.get(n);if(a?.state!=="active"||a.sessionId!==t)throw new Error(`Tab ${n} is not part of browser session ${t}`);if(Object.hasOwn(a,"viewportSize"))return i=a.viewportSize,!1;const s=this.pendingViewportSizes.get(t);return s?.turnId!==r?!1:(i=s.viewportSize,this.pendingViewportSizes.delete(t),this.leases.set(n,{...a,viewportSize:i}),!0)}),i}async clearPendingViewportSize(t,r){await this.ensureInit(),await this.mutate(()=>this.pendingViewportSizes.get(t)?.turnId!==r?!1:this.pendingViewportSizes.delete(t))}async setTabMark(t,r,n,i){await this.ensureInit(),await this.mutate(()=>{const a=this.leases.get(n);if(a?.state!=="active"||a.sessionId!==t||a.turnId!==r)throw new Error(`Tab ${n} is not part of browser session ${t}`);return a.mark===i?!1:(this.leases.set(n,{...a,mark:i}),!0)})}async replaceTurnMarks(t,r,n){await this.ensureInit(),await this.mutate(()=>{let i=!1;for(const[a,s]of this.leases){if(s.state!=="active"||s.sessionId!==t||s.turnId!==r)continue;const o=n.get(a);if(s.mark===o)continue;const l={...s};delete l.mark,this.leases.set(a,o==null?l:{...l,mark:o}),i=!0}return i})}async getSessionTabs(t){const r=await this.getSessionActiveLeases(t),n=await Promise.all([...r.keys()].map(async s=>{try{return{tab:await chrome.tabs.get(s),tabId:s,state:"found"}}catch{return{tabId:s,state:"stale"}}})),i=[],a=[];for(const s of n)s.state==="found"?i.push(s.tab):a.push(s.tabId);return a.length>0&&await this.releaseTabs(t,a),i}async updateActiveSessionTurn(t,r){await this.ensureInit();const n=await Ce();await this.mutate(()=>{let i=!1;for(const[a,s]of this.leases.entries()){if(s.sessionId!==t||s.state!=="active"||s.turnId===r&&s.instanceId===n)continue;const o={...s};delete o.mark,this.leases.set(a,{...s.turnId===r?s:o,turnId:r,instanceId:n}),i=!0}return i})}async handoffTabs(t,r,n,i){await this.ensureInit();const a=await Ce(),s=new Set(n);s.size!==0&&await this.mutate(()=>{let o=!1;for(const l of s){const h=this.leases.get(l);if(h?.state!=="active"||h.sessionId!==t)continue;const m={...h};delete m.mark,this.leases.set(l,{...m,turnId:r,instanceId:a,state:"handoff",...i.activeTabId===l?{isActiveHandoff:!0}:{}}),o=!0}return o})}async resumeHandoffTabs(t,r,n){await this.ensureInit();const i=await Ce(),a=new Set(n);if(a.size===0)return[];const s=[];let o=!1;const l=await this.mutate(()=>{let h=!1;for(const m of a){const d=this.leases.get(m);d?.state!=="handoff"||d.sessionId!==t||(this.leases.set(m,{tabId:m,sessionId:t,turnId:r,origin:d.origin,claimedAt:d.claimedAt,instanceId:i,state:"active",requestHeaderEnabled:d.requestHeaderEnabled,...Object.hasOwn(d,"viewportSize")?{viewportSize:d.viewportSize}:{}}),s.push(m),o||=d.requestHeaderEnabled!==void 0,h=!0)}return h});if(l!=null&&o)throw l;return s}async releaseTabs(t,r){await this.ensureInit();const n=new Set(r);n.size!==0&&await this.mutate(()=>{let i=!1;for(const a of n)this.leases.get(a)?.sessionId===t&&(this.leases.delete(a),i=!0);return i})}async releaseActiveTurn(t,r){await this.ensureInit(),await this.mutate(()=>{let n=!1;for(const[i,a]of this.leases.entries())a.sessionId!==t||a.turnId!==r||a.state!=="active"||(this.leases.delete(i),n=!0);return n})}async getSessionLeases(t,r){return await this.ensureInit(),await this.waitForPendingMutations(),new Map([...this.leases.entries()].filter(([,n])=>n.sessionId===t&&n.state===r))}registerEventListeners(){this.listenersRegistered||(this.listenersRegistered=!0,chrome.tabs.onRemoved?.addListener(this.handleTabRemoved),chrome.tabs.onReplaced?.addListener(this.handleTabReplaced))}async removeTab(t){await this.ensureInit(),await this.mutate(()=>this.leases.delete(t))}async replaceTab(t,r){await this.ensureInit(),await this.mutate(()=>{const n=this.leases.get(r);return n==null?!1:(this.leases.delete(r),this.leases.set(t,{...n,tabId:t}),!0)})}async loadFromStorage(){const t=this.readActiveTabIds();let r;try{r=await this.storage.get(this.storageKey)}catch(n){throw await this.requestHeaders.synchronize(new Map,!0),n}for(const[n,i]of Km(r[this.storageKey]))this.leases.set(n,i);for(const[n,i]of Zm(r[this.storageKey]))this.pendingViewportSizes.set(n,i);this.storageLoaded=!0,await this.requestHeaders.synchronize(this.readActiveRequestHeaders(),!0),this.publishActiveTabLeaseChanges(t)}async mutate(t,r=!1){const n=async()=>{const a=this.readActiveTabIds(),s=new Map(this.leases),o=new Map(this.pendingViewportSizes);try{await t()&&await this.saveToStorage()}catch(h){this.leases.clear();for(const[m,d]of s)this.leases.set(m,d);this.pendingViewportSizes.clear();for(const[m,d]of o)this.pendingViewportSizes.set(m,d);throw h}const l=await this.requestHeaders.synchronize(this.readActiveRequestHeaders(),r);return this.publishActiveTabLeaseChanges(a),l},i=this.mutationQueue.then(n,n);return this.mutationQueue=i.then(()=>{},()=>{}),await i}async waitForPendingMutations(){await this.mutationQueue}async saveToStorage(){const t=Object.fromEntries(this.pendingViewportSizes.entries()),r={leases:Object.fromEntries(this.leases.entries()),...Object.keys(t).length>0?{pendingViewportSizes:t}:{}};await this.storage.set({[this.storageKey]:r})}readActiveTabIds(){return new Set([...this.leases.entries()].filter(([,t])=>t.state==="active").map(([t])=>t))}readActiveRequestHeaders(){const t=new Map;for(const[r,n]of this.leases)n.state==="active"&&n.requestHeaderEnabled===!0&&t.set(r,n.sessionId);return t}publishActiveTabLeaseChanges(t){const r=Xm(t,this.readActiveTabIds());if(r.length!==0)for(const n of this.activeTabLeaseChangeHandlers)Promise.resolve(n(r)).catch(()=>{})}};function Xm(e,t){const r=new Set;for(const n of e)t.has(n)||r.add(n);for(const n of t)e.has(n)||r.add(n);return[...r]}var nT="CODEX_OPEN_AGENT_BACKGROUND_POPUP",Zt="__codexAgentPopupInterceptor",Ho="__codexAgentBackgroundPopupRequest",be=new Set,Xe=new Map,Wo=!1;function Ym(){Wo||(Wo=!0,chrome.tabs.onRemoved?.addListener(sg),chrome.tabs.onReplaced?.addListener(ag),chrome.webNavigation?.onCommitted?.addListener(ng))}function Qm(e){be.add(e)}async function Ko(e){if(!be.has(e))return!1;let t=Xe.get(e);return t==null&&(t=rg(e),Xe.set(e,t),t.finally(()=>{Xe.get(e)===t&&Xe.delete(e)})),await t}async function eg(e){const t=be.delete(e),r=Xe.get(e);!t&&r==null||(r!=null&&await r.catch(()=>{}),Xe.delete(e),await Promise.allSettled([ie(chrome.scripting.executeScript({args:[Zt],func:ug,injectImmediately:!0,target:{allFrames:!0,tabId:e},world:"MAIN"})),ie(chrome.scripting.executeScript({args:[Zt],func:dg,injectImmediately:!0,target:{allFrames:!0,tabId:e}}))]))}function tg(e){return e!=null&&typeof e=="object"&&"type"in e&&e.type==="CODEX_OPEN_AGENT_BACKGROUND_POPUP"&&"url"in e&&typeof e.url=="string"}async function rg(e){if(!be.has(e))return!1;try{const t=await ie(chrome.scripting.executeScript({args:[Zt],func:og,injectImmediately:!0,target:{allFrames:!0,tabId:e},world:"MAIN"}));return t!=null&&t.length>0&&t.every(r=>r.result===!0)?be.has(e):!(await ie(chrome.scripting.executeScript({args:[Zt,Ho,"CODEX_OPEN_AGENT_BACKGROUND_POPUP"],func:lg,injectImmediately:!0,target:{allFrames:!0,tabId:e}}))==null||!be.has(e)||await ie(chrome.scripting.executeScript({args:[Zt,Ho],func:cg,injectImmediately:!0,target:{allFrames:!0,tabId:e},world:"MAIN"}))==null||!be.has(e))}catch{return!1}}function ng(e){be.has(e.tabId)&&ig(e.tabId)}function ig(e){const t=ze.getInstance();t.mightHaveActiveTabLease(e)&&t.getActiveLease(e).then(async r=>{r==null||!be.has(e)||await Ko(e)}).catch(()=>{})}function ag(e,t){be.delete(t)&&(be.add(e),Xe.delete(t))}function sg(e){be.delete(e),Xe.delete(e)}function og(e){return globalThis[e]!=null}function lg(e,t,r){const n=globalThis;if(n[e]!=null)return;let i=!1;const a=o=>{o.isTrusted&&(i=!1)},s=o=>{if(!(o instanceof CustomEvent)||navigator.userActivation?.isActive===!1)return;if(i){o.preventDefault();return}const l=o.detail;typeof l=="string"&&(i=!0,chrome.runtime.sendMessage({type:r,url:l}).catch(()=>{}))};document.addEventListener("click",a,!0),document.addEventListener("keydown",a,!0),document.addEventListener(t,s),n[e]={listener:s,requestEvent:t,resetPopupAllowance:a}}function cg(e,t){const r=globalThis;if(r[e]!=null)return;const n=window.open,i=h=>{if(navigator.userActivation?.isActive===!1)return;let m;try{m=new URL(h,document.baseURI)}catch{return}if(!(m.protocol!=="http:"&&m.protocol!=="https:"))return document.dispatchEvent(new CustomEvent(t,{cancelable:!0,detail:m.href}))},a=h=>["_self","_parent","_top","_unfencedtop"].includes(h.toLowerCase())||Array.from(document.querySelectorAll("iframe, frame")).some(m=>m.getAttribute("name")===h),s=(h,m,d)=>{if(h==null||h===""||a(String(m??"")))return n.call(window,h,m,d);const f=i(String(h));return f==null?n.call(window,h,m,d):!f||d?.split(",").some(c=>/^(?:noopener|noreferrer)(?:\s*=\s*(?:1|yes|true))?$/i.test(c.trim()))?null:{closed:!1,focus:()=>{}}},o=h=>{if(h.defaultPrevented||h.button!==0)return;const m=h.composedPath().find(f=>f instanceof HTMLAnchorElement);if(m==null||m.hasAttribute("download")&&m.origin===window.location.origin)return;const d=m.target;d===""||a(d)||i(m.href)!=null&&h.preventDefault()},l=()=>{window.removeEventListener("click",o),window.addEventListener("click",o,{once:!0})};window.open=s,window.addEventListener("click",l,!0),r[e]={captureClickListener:l,clickListener:o,interceptedOpen:s,originalOpen:n}}function ug(e){const t=globalThis,r=t[e];if(r==null||typeof r!="object")return;const n=r;window.removeEventListener("click",n.captureClickListener,!0),window.removeEventListener("click",n.clickListener),window.open===n.interceptedOpen&&(window.open=n.originalOpen),Reflect.deleteProperty(t,e)}function dg(e){const t=globalThis,r=t[e];if(r==null||typeof r!="object")return;const n=r;document.removeEventListener("click",n.resetPopupAllowance,!0),document.removeEventListener("keydown",n.resetPopupAllowance,!0),document.removeEventListener(n.requestEvent,n.listener),Reflect.deleteProperty(t,e)}var qi="__codexForeignExtensionFrameMonitor";function hg(e=qi){const t=globalThis;if(t[e]!=null)return!0;const r=chrome.dom?.openOrClosedShadowRoot,n=new WeakSet,i=d=>{if(d==null||!d.startsWith("chrome-extension://"))return null;try{const f=new URL(d).host;return f.length>0&&f!==chrome.runtime.id?f:null}catch{return null}},a=d=>{const f=d.getAttribute("src")?.trim()??"";return d instanceof HTMLIFrameElement?{attrSrc:f,propertySrc:d.src?.trim()??""}:{attrSrc:f,propertySrc:""}},s=d=>{if(!(d instanceof HTMLElement))return null;if(typeof r=="function")try{return r(d)}catch{}return d.shadowRoot},o=d=>{const f=s(d);if(d.tagName==="IFRAME"||d.tagName==="FRAME"){const c=a(d);if((i(c.attrSrc)??i(c.propertySrc))!=null){if(d instanceof HTMLIFrameElement){if(d.getAttribute("srcdoc")==="")return;d.setAttribute("srcdoc","");return}d.setAttribute("src","about:blank")}}f!=null&&m(f)},l=d=>{if(!(d instanceof Document||d instanceof ShadowRoot||d instanceof Element))return;const f=u=>{o(u);const g=s(u);g!=null&&l(g)};d instanceof Element&&f(d);const c=document.createTreeWalker(d,NodeFilter.SHOW_ELEMENT);let p=c.nextNode();for(;p!=null;)f(p),p=c.nextNode()},h=new MutationObserver(d=>{for(const f of d){f.type==="attributes"&&f.target instanceof Element&&o(f.target);for(const c of f.addedNodes)l(c)}}),m=d=>{n.has(d)||(n.add(d),h.observe(d,{attributeFilter:["src"],attributes:!0,childList:!0,subtree:!0}),l(d))};t[e]={observer:h,observedRoots:n};try{m(document)}catch(d){throw h.disconnect(),Reflect.deleteProperty(t,e),d}return!0}var le=new Set,Ve=new Map,He=new Map,rn=new Map,Zo=!1,Jo=!1;function fg(){Zo||(Zo=!0,chrome.tabs.onUpdated?.addListener(Tg),chrome.tabs.onRemoved?.addListener(Ig),chrome.webNavigation?.onCommitted?.addListener(e=>{Vi(e.tabId,e.frameId!==0)}),chrome.debugger?.onDetach?.addListener(e=>{e.tabId!=null&&Vi(e.tabId)}),pg(),ze.getInstance().ensureInit().catch(()=>{}))}function pg(){Jo||(Jo=!0,chrome.tabs.onReplaced?.addListener(Eg))}function mg(e){le.add(e)}async function Xo(e){if(!le.has(e))return!1;const t=await Gi(e);if(t==null||!le.has(e))return!1;let r=He.get(e);r?.leaseKey!==t&&(r={leaseKey:t,installedDocumentIds:new Set},He.set(e,r));const n=r;return n.pending??=_g(e,n).finally(()=>{delete n.pending}),await n.pending}async function gg(e){le.delete(e),He.delete(e);const t=Ve.get(e);await Promise.allSettled([...t==null?[]:[t],...Array.from(rn.get(e)??[])]),Ve.get(e)===t&&Ve.delete(e),le.has(e)||await Yo(e)}async function Gi(e){const t=await ze.getInstance().getActiveLease(e);return t==null?null:JSON.stringify([t.sessionId,t.turnId,t.claimedAt,t.instanceId])}function Jt(e,t){return le.has(e)&&He.get(e)===t}async function _g(e,t){try{const r=await chrome.webNavigation.getAllFrames({tabId:e});if(!Jt(e,t))return!1;if(r==null||!r.some(a=>a.frameId===0)||r.some(a=>!a.documentId||a.errorOccurred||a.documentLifecycle!=="active"))return await zi(e,t);const n=new Set(r.map(a=>a.documentId));for(const a of t.installedDocumentIds)n.has(a)||t.installedDocumentIds.delete(a);const i=[...n].filter(a=>!t.installedDocumentIds.has(a));if(i.length>0){const a=ie(chrome.scripting.executeScript({args:[qi],func:hg,injectImmediately:!0,target:{tabId:e,documentIds:i}}));let s=rn.get(e);s==null&&(s=new Set,rn.set(e,s)),s.add(a);let o;try{o=await a}finally{s.delete(a),s.size===0&&rn.delete(e)}if(!Jt(e,t))return!1;for(const l of o??[])l.result===!0&&i.includes(l.documentId)&&t.installedDocumentIds.add(l.documentId);if(i.some(l=>!t.installedDocumentIds.has(l)))return await zi(e,t)}return await Gi(e)===t.leaseKey&&Jt(e,t)}catch{return await zi(e,t)}}async function zi(e,t){return Jt(e,t)?await vg(e)&&await Gi(e)===t.leaseKey&&Jt(e,t):!1}function Vi(e,t=!1){const r=He.get(e);r!=null&&He.set(e,{leaseKey:r.leaseKey,installedDocumentIds:t?new Set(r.installedDocumentIds):new Set})}async function vg(e){if(!le.has(e))return!1;if(await wg(e))return le.has(e);let t=Ve.get(e);return t||(t=yg(e),Ve.set(e,t),t.finally(()=>{Ve.get(e)===t&&Ve.delete(e)})),await t}async function wg(e){try{return(await ie(chrome.scripting.executeScript({args:["__codexForeignExtensionFrameMonitor"],func:Sg,injectImmediately:!0,target:{allFrames:!0,tabId:e}})))?.every(t=>t.result===!0)??!1}catch{return!1}}async function bg(e){try{if(await ie(chrome.scripting.executeScript({files:["content-scripts/foreign-frame-monitor.js"],injectImmediately:!0,target:{allFrames:!0,tabId:e}}))==null)return!1}catch{return!1}return!0}async function yg(e){if(!le.has(e))return!1;const t=await bg(e);return le.has(e)?t:(await Yo(e),!1)}function Sg(e){return globalThis[e]!=null}function Tg(e,t,r){if(t.status!=="loading"||(Vi(e),br(Ot(navigator.userAgent),r.url)))return;const n=ze.getInstance();le.has(e)&&n.mightHaveActiveTabLease(e)&&n.getOwningSessionId(e).then(async i=>{i==null||!le.has(e)||await Xo(e)}).catch(()=>{})}function Eg(e,t){He.delete(t),He.delete(e),le.delete(t)&&(le.add(e),Ve.delete(t))}function Ig(e){le.delete(e),He.delete(e),Ve.delete(e)}async function Yo(e){try{await ie(chrome.scripting.executeScript({args:[qi],func:Ag,injectImmediately:!0,target:{allFrames:!0,tabId:e}}))}catch{}}function Ag(e){const t=globalThis,r=t[e];if(r==null||typeof r!="object")return;const n="observer"in r?r.observer:void 0;(n!=null&&typeof n=="object"&&"disconnect"in n&&typeof n.disconnect=="function"?n.disconnect:null)?.call(n),Reflect.deleteProperty(t,e)}var Cg="codex-favicon-badge",Qo={cursor:null,isVisible:!1,sessionId:null,turnId:null};function el(e){if(e==null||!e.startsWith("data:image/svg+xml,"))return!1;try{return decodeURIComponent(e.slice(19)).includes(`data-codex-favicon-badge="${Cg}"`)}catch{return!1}}var kg=class extends Error{constructor(e){super(e),this.name="AtlasCommandError"}},Rg=()=>{};function Og(){return new kg("Codex is not running for this browser session.")}var Pg=class{sessions=new Map;tabSessions=new Map;observedTabs;onBrowserControlActivityChanged;lastBrowserControlActive=!1;constructor(e={}){this.observedTabs=e.observedTabs??{isObserved:()=>!1},this.onBrowserControlActivityChanged=e.onBrowserControlActivityChanged??Rg}async startSession(e,t=null,r={}){const n=this.ensureSession(e);t!=null&&n.currentTurnId!==t&&n.cursorByTabId.clear(),n.currentTurnId=t??n.currentTurnId,n.isRunning=!0,r.publishTabs!==!1&&await this.publishSessionTabs(e),this.updateBrowserControlActivity()}async finishSession(e){const t=this.sessions.get(e);t&&(await this.publishTabs(this.detachSession(e,t)),this.updateBrowserControlActivity())}isBrowserControlActive(){for(const e of this.sessions.values())if(e.isRunning||e.activeRequests>0)return!0;return!1}setBrowserControlActivityChangeHandler(e){this.onBrowserControlActivityChanged=e,this.updateBrowserControlActivity()}requireRunningSession(e){if(!this.sessions.get(e)?.isRunning)throw Og()}throwIfAgentNotRunning(e){this.requireRunningSession(e)}async trackTab(e,t,r={}){this.linkTabToSession(e,t),r.publish!==!1&&await this.publishTabState(t)}async untrackTab(e,t){const r=this.sessions.get(e);r?.tabIds.delete(t),r?.cursorByTabId.delete(t),r?.tabIds.size===0&&this.sessions.delete(e);const n=this.tabSessions.get(t);n&&(n.delete(e),n.size===0&&this.tabSessions.delete(t)),await this.publishTabState(t),this.updateBrowserControlActivity()}async startRequest(e,t){this.throwIfAgentNotRunning(e);const r=this.linkTabToSession(e,t);return r.activeRequests+=1,(!r.abortController||r.abortController.signal.aborted)&&(r.abortController=new AbortController),await this.publishSessionTabs(e),this.updateBrowserControlActivity(),r.abortController.signal}async finishRequest(e){const t=this.sessions.get(e);t&&(t.activeRequests=Math.max(0,t.activeRequests-1),t.activeRequests===0&&(t.abortController=null),await this.publishSessionTabs(e),this.updateBrowserControlActivity())}async stopActiveSessions(){const e=Array.from(this.sessions.entries()).filter(([,t])=>t.isRunning).map(([t])=>t);return await this.stopSessions(e),e}async stopSessions(e){for(const t of e)await this.stopSession(t)}async setCursorState(e,t,r,n,i={}){const a=this.sessions.get(e);return!a?.isRunning||(a.currentTurnId=r,a.cursorByTabId.set(t,n),i.publish===!1)?!1:await this.publishTabCursorState(t)}isObserved(e){return this.observedTabs.isObserved(e)}readCursorOverlayState(e){const t=this.getHighestPrioritySessionIdForTab(e);if(t==null)return Qo;const r=this.sessions.get(t);if(!r?.isRunning)return Qo;const n=r.cursorByTabId.get(e)??null,i=this.observedTabs.isObserved(e);return{cursor:!i&&n!=null?{visible:!1,x:n.x,y:n.y}:n,isVisible:i,sessionId:t,turnId:r.currentTurnId}}async republishTabState(e){await this.publishTabState(e)}async republishTabStates(e){await this.publishTabs(e)}async stopSession(e){const t=this.sessions.get(e);t?.isRunning&&(t.isRunning=!1,t.abortController?.abort(),await this.publishSessionTabs(e),this.updateBrowserControlActivity())}ensureSession(e){let t=this.sessions.get(e);return t||(t={tabIds:new Set,isRunning:!1,currentTurnId:null,cursorByTabId:new Map,activeRequests:0,abortController:null},this.sessions.set(e,t)),t}linkTabToSession(e,t){const r=this.ensureSession(e);return r.tabIds.add(t),this.attachTabSession(t,e),r}attachTabSession(e,t){const r=this.tabSessions.get(e);if(r){r.add(t);return}this.tabSessions.set(e,new Set([t]))}detachSession(e,t){const r=Array.from(t.tabIds);this.sessions.delete(e);for(const n of r){const i=this.tabSessions.get(n);i&&(i.delete(e),i.size===0&&this.tabSessions.delete(n))}return r}async publishSessionTabs(e){const t=this.sessions.get(e);t&&await this.publishTabs(t.tabIds)}async publishTabs(e){await Promise.all(Array.from(e,async t=>this.publishTabState(t)))}async publishTabState(e){await this.publishTabCursorState(e)}async publishTabCursorState(e){if(!await this.prepareContentScript(e))return!1;const t={type:"AGENT_CURSOR_STATE",state:this.readCursorOverlayState(e)};try{return(await ie(chrome.tabs.sendMessage(e,t)))?.ok===!0}catch{return!1}}async prepareContentScript(e){return this.tabSessions.has(e)?await zo(e):await $i(e)}getHighestPrioritySessionIdForTab(e){const t=this.tabSessions.get(e);if(!t||t.size===0)return null;for(const r of t)if(this.sessions.get(r)?.isRunning)return r;return null}updateBrowserControlActivity(){const e=this.isBrowserControlActive();e!==this.lastBrowserControlActive&&(this.lastBrowserControlActive=e,this.onBrowserControlActivityChanged(e))}},Mg=class{activeTabIds=new Set;activeTabIdByWindowId=new Map;listenersRegistered=!1;onChanged;handleTabActivated=e=>{this.setWindowActiveTab(e.windowId,e.tabId)};handleTabCreated=e=>{if(e.active!==!0)return;const t=tl(e);t!=null&&this.setWindowActiveTab(t.windowId,t.tabId)};handleTabRemoved=()=>{this.refreshActiveTabs()};handleTabReplaced=()=>{this.refreshActiveTabs()};handleTabWindowChanged=()=>{this.refreshActiveTabs()};handleWindowCreated=()=>{this.refreshActiveTabs()};handleWindowFocusChanged=()=>{this.refreshActiveTabs()};handleWindowRemoved=()=>{this.refreshActiveTabs()};constructor(e={}){this.onChanged=e.onChanged??(()=>{})}setChangeHandler(e){this.onChanged=e}async initialize(){this.registerEventListeners(),await this.refreshActiveTabs()}dispose(){this.listenersRegistered&&(this.listenersRegistered=!1,chrome.tabs.onActivated?.removeListener(this.handleTabActivated),chrome.tabs.onCreated?.removeListener(this.handleTabCreated),chrome.tabs.onRemoved?.removeListener(this.handleTabRemoved),chrome.tabs.onReplaced?.removeListener(this.handleTabReplaced),chrome.tabs.onAttached?.removeListener(this.handleTabWindowChanged),chrome.tabs.onDetached?.removeListener(this.handleTabWindowChanged),chrome.windows?.onCreated?.removeListener(this.handleWindowCreated),chrome.windows?.onFocusChanged?.removeListener(this.handleWindowFocusChanged),chrome.windows?.onRemoved?.removeListener(this.handleWindowRemoved))}isObserved(e){return this.activeTabIds.has(e)}registerEventListeners(){this.listenersRegistered||(this.listenersRegistered=!0,chrome.tabs.onActivated?.addListener(this.handleTabActivated),chrome.tabs.onCreated?.addListener(this.handleTabCreated),chrome.tabs.onRemoved?.addListener(this.handleTabRemoved),chrome.tabs.onReplaced?.addListener(this.handleTabReplaced),chrome.tabs.onAttached?.addListener(this.handleTabWindowChanged),chrome.tabs.onDetached?.addListener(this.handleTabWindowChanged),chrome.windows?.onCreated?.addListener(this.handleWindowCreated),chrome.windows?.onFocusChanged?.addListener(this.handleWindowFocusChanged),chrome.windows?.onRemoved?.addListener(this.handleWindowRemoved))}async refreshActiveTabs(){const e=await chrome.tabs.query({active:!0});this.setActiveTabs(e.flatMap(t=>tl(t)??[]))}setActiveTabs(e){const t=new Set,r=new Map;for(const i of e)t.add(i.tabId),r.set(i.windowId,i.tabId);const n=Lg(this.activeTabIds,t);this.activeTabIds=t,this.activeTabIdByWindowId=r,this.publishChangedTabs(n)}setWindowActiveTab(e,t){const r=new Set,n=this.activeTabIdByWindowId.get(e);n!==void 0&&n!==t&&(this.activeTabIds.delete(n),r.add(n)),this.activeTabIdByWindowId.set(e,t),this.activeTabIds.has(t)||(this.activeTabIds.add(t),r.add(t)),this.publishChangedTabs(r)}publishChangedTabs(e){const t=Array.from(e);t.length!==0&&Promise.resolve(this.onChanged(t)).catch(()=>{})}};function tl(e){return typeof e.id!="number"||typeof e.windowId!="number"?null:{tabId:e.id,windowId:e.windowId}}function Lg(e,t){const r=new Set;for(const n of e)t.has(n)||r.add(n);for(const n of t)e.has(n)||r.add(n);return r}var nn=new Mg,he=new Pg({observedTabs:nn}),Hi=new Set,Wi=new Set;nn.setChangeHandler(async e=>{const t=e.filter(r=>nn.isObserved(r));for(const r of t)Hi.has(r)&&Wi.add(r);await Promise.all([he.republishTabStates(e),Dg(t)])});async function rl(e){Hi.add(e);try{const t=await il(e);if(!t||t.active===!0||t.mutedInfo?.muted===!0)return;try{await chrome.tabs.update(e,{muted:!0})}catch{return}Wi.has(e)&&await nl(e)}finally{Hi.delete(e),Wi.delete(e)}}async function Dg(e){await Promise.allSettled(e.map(async t=>nl(t)))}async function nl(e){const t=await il(e);if(!(!t||t.mutedInfo?.muted!==!0||t.mutedInfo.reason!=="extension"||t.mutedInfo.extensionId!==chrome.runtime.id))try{await chrome.tabs.update(e,{muted:!1})}catch{}}async function il(e){try{return await chrome.tabs.get(e)}catch{return null}}var Ki="AGENT_REQUEST_HEADER_ENABLED",xg=class{enabled=!1;async isEnabled(){if(this.enabled)return!0;const e=await chrome.storage.local.get(Ki);return this.enabled||=e[Ki]===!0,this.enabled}async applyDecision(e){return await this.isEnabled()||!e?this.enabled:(await chrome.storage.local.set({[Ki]:!0}),this.enabled=!0,!0)}},Ng=2e3,Ug=250,Zi=64*1024,al={type:"TAB_FAVICON_BADGE",badge:null,faviconDataUrl:null},Ji=class _t{static instance=null;unseenFinalizedBadges=new Map;storageKey="TAB_FAVICON_BADGES";storage;tabLeases=ze.getInstance();faviconDataUrls=new Map;closingTabIds=new Set;initializePromise=null;stateOperationQueue=Promise.resolve();publicationQueue=Promise.resolve();listenersRegistered=!1;unsubscribeActiveTabLeaseChanges=null;handleTabActivated=t=>{this.clearFinalizedBadge(t.tabId)};handleWindowFocused=t=>{t!==chrome.windows.WINDOW_ID_NONE&&this.clearFocusedWindowFinalizedBadge(t)};handleTabUpdated=(t,r)=>{const n=r.favIconUrl,i=n!=null,a=typeof n=="string"&&el(n);if((r.url!=null||i&&!a)&&this.faviconDataUrls.delete(t),r.status==="complete"||i&&!a){if(this.closingTabIds.has(t)||!this.mightHaveBadge(t))return;this.republishBadge(t)}};handleTabRemoved=t=>{this.closingTabIds.delete(t),this.faviconDataUrls.delete(t),this.forgetFinalizedBadge(t)};handleTabReplaced=(t,r)=>{this.closingTabIds.delete(r),this.faviconDataUrls.delete(r),this.faviconDataUrls.delete(t),this.replaceFinalizedBadge(t,r)};handleActiveTabLeaseChanges=t=>{this.reconcileActiveTabLeaseChanges(t)};static getInstance(){return _t.instance||(_t.instance=new _t),_t.instance}constructor(t=chrome.storage.session){this.storage=t,this.unsubscribeActiveTabLeaseChanges=this.tabLeases.subscribeActiveTabLeaseChanges(this.handleActiveTabLeaseChanges),this.registerEventListeners(),this.ensureInit().catch(()=>{}),this.tabLeases.ensureInit().catch(()=>{})}async ensureInit(){this.initializePromise||(this.initializePromise=this.loadFromStorage()),await this.initializePromise}async markFinalized(t,r){await this.ensureInit(),await this.runStateOperation(async()=>{const n=!await this.tabIsVisible(t);await this.updateUnseenFinalizedBadges(()=>n?this.unseenFinalizedBadges.get(t)===r?!1:(this.unseenFinalizedBadges.set(t,r),!0):this.unseenFinalizedBadges.delete(t))}),this.scheduleReconcileTab(t)}async restoreTabFaviconsBestEffort(t){await ie(Promise.allSettled(t.map(async r=>{await chrome.tabs.sendMessage(r,al)})),Ug)}async closeTabsWithFaviconRestore(t,r){for(const n of t)this.closingTabIds.add(n);await this.restoreTabFaviconsBestEffort(t);try{return await r()}catch(n){for(const i of t)this.closingTabIds.delete(i);throw n}}dispose(){this.listenersRegistered&&(this.listenersRegistered=!1,chrome.tabs.onActivated?.removeListener(this.handleTabActivated),chrome.tabs.onUpdated?.removeListener(this.handleTabUpdated),chrome.tabs.onRemoved?.removeListener(this.handleTabRemoved),chrome.tabs.onReplaced?.removeListener(this.handleTabReplaced),chrome.windows.onFocusChanged?.removeListener(this.handleWindowFocused)),this.unsubscribeActiveTabLeaseChanges?.(),this.unsubscribeActiveTabLeaseChanges=null,this.closingTabIds.clear(),_t.instance===this&&(_t.instance=null)}registerEventListeners(){this.listenersRegistered||(this.listenersRegistered=!0,chrome.tabs.onActivated?.addListener(this.handleTabActivated),chrome.tabs.onUpdated?.addListener(this.handleTabUpdated),chrome.tabs.onRemoved?.addListener(this.handleTabRemoved),chrome.tabs.onReplaced?.addListener(this.handleTabReplaced),chrome.windows.onFocusChanged?.addListener(this.handleWindowFocused))}async clearFinalizedBadge(t){await this.ensureInit();let r=!1;await this.runStateOperation(async()=>{this.unseenFinalizedBadges.has(t)&&await this.updateUnseenFinalizedBadges(()=>r=this.unseenFinalizedBadges.delete(t))}),r&&this.scheduleReconcileTab(t)}async clearFocusedWindowFinalizedBadge(t){if(!await this.hasUnseenFinalizedBadges())return;let r;try{r=await chrome.tabs.query({active:!0,windowId:t})}catch{return}const n=r.find(i=>typeof i.id=="number")?.id;n!=null&&await this.clearFinalizedBadge(n)}async hasUnseenFinalizedBadges(){await this.ensureInit();let t=!1;return await this.runStateOperation(async()=>{t=this.unseenFinalizedBadges.size>0}),t}async forgetFinalizedBadge(t){await this.ensureInit(),await this.runStateOperation(async()=>{await this.updateUnseenFinalizedBadges(()=>this.unseenFinalizedBadges.delete(t))})}async replaceFinalizedBadge(t,r){await this.ensureInit();let n=null;await this.runStateOperation(async()=>{await this.updateUnseenFinalizedBadges(()=>{const i=this.unseenFinalizedBadges.get(r);return i==null?!1:(this.unseenFinalizedBadges.delete(r),this.unseenFinalizedBadges.set(t,i),n=i,!0)})}),n!=null&&this.scheduleReconcileTab(t)}async republishBadge(t){await this.ensureInit(),await this.waitForStateOperations();const r=await this.readEffectiveBadge(t);r!=null&&this.schedulePublishBadge(t,r)}async reconcileActiveTabLeaseChanges(t){await this.ensureInit();const r=[...t];await this.runStateOperation(async()=>{let n=!1;for(const i of r)await this.tabLeases.getOwningSessionId(i)!=null&&(n=this.unseenFinalizedBadges.delete(i)||n);n&&await this.saveToStorage()});for(const n of r)this.scheduleReconcileTab(n)}async reconcileTab(t){await this.publishBadge(t,await this.readEffectiveBadge(t))}async readEffectiveBadge(t){return await this.tabLeases.getOwningSessionId(t)!=null?"active":this.unseenFinalizedBadges.get(t)??null}mightHaveBadge(t){return this.unseenFinalizedBadges.has(t)||this.tabLeases.mightHaveActiveTabLease(t)}async tabIsVisible(t){try{const r=await chrome.tabs.get(t);return r.active!==!0||typeof r.windowId!="number"?!1:(await chrome.windows.get(r.windowId)).focused===!0}catch{return!1}}async loadFromStorage(){const t=(await this.storage.get(this.storageKey))[this.storageKey];if(!t||typeof t!="object"||!("badges"in t)||!t.badges||typeof t.badges!="object"||Array.isArray(t.badges))return;const r=[];for(const[n,i]of Object.entries(t.badges)){const a=Number(n);!Number.isInteger(a)||!Fg(i)||(this.unseenFinalizedBadges.set(a,i),r.push(a))}for(const n of r)this.scheduleReconcileTab(n)}async runStateOperation(t){const r=this.stateOperationQueue.then(t,t);this.stateOperationQueue=r.then(()=>{},()=>{}),await r}async waitForStateOperations(){await this.stateOperationQueue}scheduleReconcileTab(t){this.schedulePublication(async()=>{await this.reconcileTab(t)})}schedulePublishBadge(t,r){this.schedulePublication(async()=>{await this.publishBadge(t,r)})}schedulePublication(t){const r=this.publicationQueue.then(t,t);this.publicationQueue=r.then(()=>{},()=>{}),r.catch(()=>{})}async updateUnseenFinalizedBadges(t){t()&&await this.saveToStorage()}async saveToStorage(){const t={badges:Object.fromEntries(this.unseenFinalizedBadges.entries())};await this.storage.set({[this.storageKey]:t})}async publishBadge(t,r){if(this.closingTabIds.has(t))return;const[n,i]=await Promise.all([zo(t),r==null?Promise.resolve(null):this.readFaviconDataUrl(t)]);if(!n||this.closingTabIds.has(t))return;const a=r==null||i==null?al:{type:"TAB_FAVICON_BADGE",badge:r,faviconDataUrl:i};try{await ie(chrome.tabs.sendMessage(t,a))}catch{}}getCachedFaviconDataUrl(t,r){const n=this.faviconDataUrls.get(t);return n?.pageUrl===r?n.dataUrl:null}async readFaviconDataUrl(t,r){let n;try{n=await chrome.tabs.get(t)}catch{return null}if(typeof n.url!="string"||n.url.length===0||r!=null&&n.url!==r)return null;const i=n.url,a=n.favIconUrl,s=this.getCachedFaviconDataUrl(t,i);if(s!=null)return s;if(typeof a!="string"||a.length===0||el(a))return null;const o=await Bg(i);if(o==null)return null;let l;try{l=await chrome.tabs.get(t)}catch{return null}return l.url!==i||l.favIconUrl!==a?null:(this.faviconDataUrls.set(t,{dataUrl:o,pageUrl:i}),o)}};function Fg(e){return e==="deliverable"||e==="handoff"}async function Bg(e){const t=new URL(chrome.runtime.getURL("/_favicon/"));return t.searchParams.set("pageUrl",e),t.searchParams.set("size","32"),await $g(t.toString(),"image/bmp")}async function $g(e,t){const r=new AbortController,n=setTimeout(()=>r.abort(),Ng);try{const i=await fetch(e,{credentials:"omit",signal:r.signal});if(!i.ok)return null;const a=i.headers.get("content-type")??t;if(a==null||!a.startsWith("image/"))return null;const s=await jg(i);return s==null||s.length===0?null:`data:${a};base64,${qg(s)}`}catch{return null}finally{clearTimeout(n)}}async function jg(e){const t=e.headers.get("content-length"),r=t==null?null:Number(t);if(r!=null&&Number.isFinite(r)&&r>Zi)return await e.body?.cancel(),null;if(e.body==null){const l=new Uint8Array(await e.arrayBuffer());return l.length<=Zi?l:null}const n=e.body.getReader(),i=[];let a=0;for(;;){const{done:l,value:h}=await n.read();if(l)break;if(!(h==null||h.length===0)){if(a+=h.length,a>Zi)return await n.cancel(),null;i.push(h)}}const s=new Uint8Array(a);let o=0;for(const l of i)s.set(l,o),o+=l.length;return s}function qg(e){let t="";for(let n=0;n<e.length;n+=32768)t+=String.fromCharCode(...e.subarray(n,n+32768));return btoa(t)}var Xi=["grey","blue","red","yellow","green","pink","purple","cyan","orange"];function Gg(){return Xi[Math.floor(Math.random()*Xi.length)]??Xi[0]}function Yi(e){if(typeof e!="string")return;const t=e.trim();return t.length>0?t:void 0}var zg=class gr{static instance=null;defaultSessionGroupTitle="ChatGPT";managedGroupIds=new Set;sessionGroupTitles=new Map;initializePromise=null;listenersRegistered=!1;storageKey="TAB_GROUPS";static getInstance(){return gr.instance||(gr.instance=new gr),gr.instance}async ensureInit(){this.initializePromise||(this.registerEventListeners(),this.initializePromise=this.loadFromStorage()),await this.initializePromise}async ensureAgentTabGroup(t,r,n){await this.ensureInit();const i=await this.findManagedGroupContainingTabs(n);if(i!=null){await this.addTabToGroup(i,r);return}await this.createGroup(r,this.sessionGroupTitles.get(t)),await this.saveToStorage()}async releaseTabsFromManagedGroups(t){await this.ensureInit();const r=new Set(t);if(r.size===0)return;const n=await Promise.all([...r].map(async o=>{try{const l=await chrome.tabs.get(o);return typeof l.groupId!="number"||!this.managedGroupIds.has(l.groupId)?null:{groupId:l.groupId,tabId:o}}catch{return null}})),i=[],a=new Set;for(const o of n)o!=null&&(i.push(o.tabId),a.add(o.groupId));i.length>0&&chrome.tabs.ungroup&&await Promise.allSettled(i.map(async o=>await chrome.tabs.ungroup(o)));let s=!1;for(const o of a)s=await this.removeManagedGroupIfEmpty(o)||s;s&&await this.saveToStorage()}async refreshManagedGroupsFromChrome(){await this.ensureInit();let t=!1;for(const r of Array.from(this.managedGroupIds))t=await this.removeManagedGroupIfEmpty(r)||t;t&&await this.saveToStorage()}async setSessionGroupTitle(t,r,n){await this.ensureInit();const i=Yi(r),a=this.sessionGroupTitles.get(t)!==i;i?this.sessionGroupTitles.set(t,i):this.sessionGroupTitles.delete(t);const s=await this.findManagedGroupContainingTabs(n);if(s!=null&&chrome.tabGroups?.update)try{await chrome.tabGroups.update(s,{title:i??this.defaultSessionGroupTitle})}catch{}a&&await this.saveToStorage()}async loadFromStorage(){const t=(await chrome.storage.local.get(this.storageKey))[this.storageKey];if(t){if(Array.isArray(t)){for(const r of t)!r||typeof r.chromeGroupId!="number"||this.managedGroupIds.add(r.chromeGroupId);return}for(const r of t.groups??[])!r||typeof r.chromeGroupId!="number"||this.managedGroupIds.add(r.chromeGroupId);for(const[r,n]of Object.entries(t.sessionGroupTitles??{})){const i=Yi(n);i&&this.sessionGroupTitles.set(r,i)}}}async saveToStorage(){const t={groups:Array.from(this.managedGroupIds,r=>({chromeGroupId:r})),sessionGroupTitles:Object.fromEntries(this.sessionGroupTitles.entries())};await chrome.storage.local.set({[this.storageKey]:t})}async createGroup(t,r){const{windowId:n}=await chrome.tabs.get(t),i=await chrome.tabs.group({createProperties:{windowId:n},tabIds:[t]});if(this.managedGroupIds.add(i),chrome.tabGroups?.update)try{await chrome.tabGroups.update(i,{color:Gg(),title:Yi(r)??this.defaultSessionGroupTitle})}catch{}}async addTabToGroup(t,r){(await chrome.tabs.get(r)).groupId!==t&&await chrome.tabs.group({groupId:t,tabIds:r})}registerEventListeners(){this.listenersRegistered||!chrome.tabGroups||(this.listenersRegistered=!0,chrome.tabGroups.onRemoved?.addListener(t=>{this.handleRemovedGroup(t.id)}))}handleRemovedGroup(t){this.managedGroupIds.delete(t)&&this.saveToStorage()}async readGroup(t){if(!chrome.tabGroups?.get)return null;try{return await chrome.tabGroups.get(t)}catch{return null}}async removeManagedGroupIfEmpty(t){return(await this.groupTabIds(t)).length>0?!1:(this.managedGroupIds.delete(t),!0)}async groupTabIds(t){return(await chrome.tabs.query({groupId:t})).map(r=>r.id).filter(r=>typeof r=="number")}async findManagedGroupContainingTabs(t){for(const r of t)try{const n=await chrome.tabs.get(r);if(typeof n.groupId!="number")continue;if(this.managedGroupIds.has(n.groupId)&&await this.readGroup(n.groupId))return n.groupId}catch{}return null}},Vg=1e3;async function sl(e){const t=e.urlProtocols==null?null:new Set(e.urlProtocols),r=(await chrome.tabs.query({})).filter(Hg).filter(s=>e.includeIncognito!==!1||!s.incognito).filter(s=>e.browserTabMentionsOnly!==!0||Qi(s)).filter(s=>Kg(s,e.query,t)).sort(Zg),n=new Set,i=[],a=e.limit??Vg;for(const s of r)if(!n.has(s.id)&&(n.add(s.id),i.push({faviconUrl:e.includeFavicons===!0&&e.getFaviconDataUrl!=null&&typeof s.url=="string"?e.getFaviconDataUrl({...s,url:s.url}):null,tab:s}),i.length===a))break;return i}function an(e){const t=e.lastAccessed;return typeof t=="number"&&Number.isFinite(t)&&t>=0?t:0}function Hg(e){return Number.isSafeInteger(e.id)&&(e.id??-1)>=0}function Qi(e){if(!Wg(e)||!(Number.isSafeInteger(e.windowId)&&e.windowId>=0&&Number.isSafeInteger(e.index)&&e.index>=0&&(e.title==null||e.title.length<=4096&&Ln(e.title))))return!1;const t=new URL(e.url).hostname.replace(/\.$/,"");return t!=="chatgpt.com"&&!t.endsWith(".chatgpt.com")}function Wg(e){if(e.incognito||!(Number.isSafeInteger(e.id)&&(e.id??-1)>=0&&typeof e.url=="string"&&e.url.length<=16384&&Ln(e.url)))return!1;try{const t=new URL(e.url).protocol;return t==="http:"||t==="https:"}catch{return!1}}function Kg(e,t,r){if(r!=null){if(typeof e.url!="string")return!1;try{const n=new URL(e.url).protocol;if(n!=="http:"&&n!=="https:"||!r.has(n))return!1}catch{return!1}}return Pc({title:e.title??"",url:e.url??""},t??"")}function Zg(e,t){return an(t)-an(e)||(e.windowId??0)-(t.windowId??0)||(e.index??0)-(t.index??0)||(e.id??Number.MAX_SAFE_INTEGER)-(t.id??Number.MAX_SAFE_INTEGER)}var ea="browserTabMentionGeneration",Jg=4,Xg=50,Yg={getCachedFaviconDataUrl:()=>null,readFaviconDataUrl:async()=>null},ol=class{invalidationListeners=new Set;faviconListeners=new Set;pendingFaviconReads=new Set;faviconWarmupQueue=[];activeFaviconWarmupCount=0;faviconWarmupSucceeded=!1;identityPromise=null;constructor(e,t=Yg,r){this.buildChannel=e,this.faviconProvider=t,this.startInvalidationObservation=r}async getCapabilityInfo(){const{generation:e}=await this.getIdentity();return{protocolVersion:1,buildChannel:this.buildChannel,generation:e}}async getUserTabs(e){this.ensureInvalidationObservationStarted();const t=Ha({limit:e.limit,query:e.query});if(t==null)throw new Error("Invalid Chrome tab mention search query");const r=await this.getIdentity(),n=Math.min(t.limit,100);return n===0?[]:(await sl({browserTabMentionsOnly:!0,getFaviconDataUrl:i=>this.getFaviconDataUrl(i),includeFavicons:e.includeFavicons!==!1,includeIncognito:!1,limit:n,query:t.query,urlProtocols:["http:","https:"]})).flatMap(({faviconUrl:i,tab:a})=>Qi(a)?[t_(a,r,i)]:[])}async getProviderTabId(e){return ll(await this.getIdentity(),e)}subscribeInvalidations(e){return this.invalidationListeners.add(e),()=>{this.invalidationListeners.delete(e)}}subscribeCandidateUpdates(e,t){const r=new Map(e.filter(a=>a.faviconUrl==null).map(a=>[a.id,a.url])),n=({tabId:a,pageUrl:s,faviconUrl:o})=>{r.get(a)===s&&(r.delete(a),e=e.map(l=>l.id===a?{...l,faviconUrl:o}:l),t(e))},i=(a,s,o)=>{if(s.favIconUrl===void 0||!Qi(o)||r.get(o.id)!==o.url)return;const l=this.getFaviconDataUrl(o);l!=null&&n({tabId:o.id,pageUrl:o.url,faviconUrl:l})};return this.faviconListeners.add(n),chrome.tabs.onUpdated.addListener(i),queueMicrotask(()=>{for(const[a,s]of r){const o=this.getCachedFaviconDataUrl(a,s);o!=null&&n({tabId:a,pageUrl:s,faviconUrl:o})}}),()=>{r.clear(),this.faviconListeners.delete(n),chrome.tabs.onUpdated.removeListener(i)}}getFaviconDataUrl(e){const t=this.getCachedFaviconDataUrl(e.id,e.url);return this.loadFaviconDataUrl(e,t),t}getCachedFaviconDataUrl(e,t){try{return za(this.faviconProvider.getCachedFaviconDataUrl(e,t))}catch{return null}}loadFaviconDataUrl(e,t){const r=JSON.stringify([e.id,e.url]);t!=null||typeof e.favIconUrl!="string"||e.favIconUrl.length===0||this.pendingFaviconReads.has(r)||(this.pendingFaviconReads.add(r),this.faviconWarmupQueue.push({pageUrl:e.url,pendingKey:r,tabId:e.id}),this.startQueuedFaviconWarmups())}startQueuedFaviconWarmups(){for(;this.activeFaviconWarmupCount<Jg&&this.faviconWarmupQueue.length>0;){const e=this.faviconWarmupQueue.shift();if(e==null)continue;this.activeFaviconWarmupCount+=1;let t;try{t=this.faviconProvider.readFaviconDataUrl(e.tabId,e.pageUrl)}catch{t=Promise.resolve(null)}t.then(r=>{const n=za(r);if(n!=null){this.faviconWarmupSucceeded=!0;for(const i of this.faviconListeners)i({tabId:e.tabId,pageUrl:e.pageUrl,faviconUrl:n})}}).catch(()=>{}).finally(()=>{if(this.pendingFaviconReads.delete(e.pendingKey),this.activeFaviconWarmupCount-=1,this.startQueuedFaviconWarmups(),this.activeFaviconWarmupCount===0&&this.faviconWarmupQueue.length===0&&this.faviconWarmupSucceeded){this.faviconWarmupSucceeded=!1;for(const r of this.invalidationListeners)r()}})}}getIdentity(){return this.identityPromise??=e_().catch(e=>{throw this.identityPromise=null,e}),this.identityPromise}ensureInvalidationObservationStarted(){const e=this.startInvalidationObservation;this.startInvalidationObservation=void 0,e?.()}};function Qg(e){let t=null;const r=()=>{t==null&&(t=setTimeout(()=>{t=null,e()},Xg))},n=(i,a)=>{a.title===void 0&&a.url===void 0&&a.favIconUrl===void 0||r()};return chrome.tabs.onCreated.addListener(r),chrome.tabs.onRemoved.addListener(r),chrome.tabs.onReplaced.addListener(r),chrome.tabs.onActivated.addListener(r),chrome.tabs.onUpdated.addListener(n),chrome.tabs.onMoved.addListener(r),chrome.tabs.onAttached.addListener(r),chrome.tabs.onDetached.addListener(r),()=>{t!=null&&(clearTimeout(t),t=null),chrome.tabs.onCreated.removeListener(r),chrome.tabs.onRemoved.removeListener(r),chrome.tabs.onReplaced.removeListener(r),chrome.tabs.onActivated.removeListener(r),chrome.tabs.onUpdated.removeListener(n),chrome.tabs.onMoved.removeListener(r),chrome.tabs.onAttached.removeListener(r),chrome.tabs.onDetached.removeListener(r)}}async function e_(){const[e,t]=await Promise.all([Ce(),chrome.storage.session.get(ea)]),r=t[ea],n=Va(r)??crypto.randomUUID();return n!==r&&await chrome.storage.session.set({[ea]:n}),{profileInstanceId:e,generation:n}}function t_(e,t,r=null){return{id:e.id,browserId:t.profileInstanceId,faviconUrl:r,lastOpened:new Date(an(e)).toISOString(),providerTabId:ll(t,e.id),title:e.title??"",url:e.url}}function ll(e,t){return JSON.stringify([e.generation,String(t)])}async function r_(e){switch(e.namespace){case"bookmarks":return await i_(e.args[0]);case"tabs":return await ta(e.method==="remove"?Array.isArray(e.args[0])?e.args[0]:[e.args[0]]:[]);case"tabGroups":return await ta();case"windows":return await n_(e);default:throw new Error(`Unhandled browser management namespace: ${e.namespace}`)}}async function n_(e){const t={windows:(await chrome.windows.getAll({windowTypes:["normal"]})).filter(({incognito:r})=>!r).flatMap(({focused:r,height:n,id:i,left:a,state:s,top:o,width:l})=>i==null?[]:[{focused:r,height:n,id:i,left:a,state:s,top:o,width:l}])};return e.method==="create"&&Vt(e.args[0])&&Object.hasOwn(e.args[0],"tabId")&&(t.tabLayout=(await ta()).tabLayout),t}async function i_(e){if(typeof e!="string")return{};const[t]=await chrome.bookmarks.get(e);if(t==null)throw new Error(`Chrome bookmark ${e} is unavailable`);const{id:r,index:n,parentId:i,title:a,url:s}=t;return{bookmarks:[{id:r,index:n,parentId:i,title:a,url:s}]}}async function ta(e=[]){const[t,r]=await Promise.all([chrome.tabs.query({}),chrome.tabGroups?.query?.({}).catch(()=>[])??[]]),n=t.filter(({incognito:a})=>!a),i=new Set(n.map(({groupId:a})=>a));return{tabLayout:{tabs:n.flatMap(({autoDiscardable:a,groupId:s,id:o,index:l,pinned:h,url:m,windowId:d})=>o==null?[]:[{autoDiscardable:a,groupId:s,id:o,index:l,pinned:h,windowId:d,...e.includes(o)?{url:m}:{}}]),groups:r.filter(({id:a})=>i.has(a)).map(({collapsed:a,color:s,id:o,title:l,windowId:h})=>({collapsed:a,color:s,id:o,title:l,windowId:h}))}}}var ra="BROWSER_MANAGEMENT_AUDIT_TRAIL",cl=50,a_=4320*60*1e3,ul=Promise.resolve();async function s_(e,t){return await hl(async()=>{const r=await dl().catch(()=>{});if(r==null)return await t();const n=await r_(e).catch(()=>{});if(n==null)return await t();const i=await t();if(!l_(e,n))return i;const a={args:e.args,before:n,createdAt:Date.now(),method:e.method,namespace:e.namespace};return typeof i=="number"?a.result=i:Vt(i)&&typeof i.id=="string"?a.result={id:i.id}:e.namespace==="windows"&&Vt(i)&&typeof i.id=="number"&&(a.result=i.id),r.push(a),await c_(r).catch(()=>{}),i})}async function o_(){return await hl(async()=>({changes:(await dl()).toReversed()}))}function l_(e,t){if(e.namespace==="bookmarks")return!0;if(e.namespace==="windows")return e.method==="create"||(t.windows?.some(({id:a})=>a===e.args[0])??!1);const r=t.tabLayout?.tabs??[];if(e.namespace==="tabGroups")return r.some(({groupId:a})=>a===e.args[0]);const n=e.args[0],i=Vt(n)?n.tabIds:n;return(Array.isArray(i)?i:[i]).every(a=>r.some(({id:s})=>s===a))}async function dl(){const e=await chrome.storage.session.get(ra),t=Date.now()-a_;return(e[ra]??[]).filter(({createdAt:r})=>r>=t).slice(-cl)}async function c_(e){await chrome.storage.session.set({[ra]:e.slice(-cl)})}async function hl(e){const t=ul.then(e);return ul=t.then(()=>{},()=>{}),await t}var u_=new Set(["autoDiscardable","pinned"]),d_=new Set(["collapsed","color","title"]),h_=new Set(["focused","height","left","state","top","width"]),f_=new Set(["focused","height","left","state","tabId","top","type","width"]);async function p_(e){if(e.args.length>1)throw new Error("Chrome API windows.create accepts at most one argument");const t=sn(e.args.length===0?{}:e.args[0],f_,"windows.create",!0);if(t.type!==void 0&&t.type!=="normal")throw new Error("Chrome API windows.create only supports normal windows");if(_l(t.state,"windows.create"),!Object.hasOwn(t,"tabId"))return t;const r=await chrome.tabs.get(Ye(t.tabId,"tab ID"));if(r.pinned)throw new Error("Chrome API windows.create cannot move a pinned tab without changing its pinning");return await gl(r.windowId,"windows.create"),await vl([r.windowId]),t}async function m_(e){const t=Ye(e.args[0],"window ID");_l(sn(e.args[1],h_,"windows.update").state,"windows.update"),await gl(t,"windows.update")}async function fl(e){const t=Ye(e.args[0],"group ID");e.method==="update"&&sn(e.args[1],d_,"tabGroups.update"),await ia(t)}async function g_(e){const t=sn(e.args[1],u_,"tabs.update"),r=Ye(e.args[0],"tab ID");t.pinned===!0&&await aa([r])}async function __(e){const t=na(e.args[0]),r=Xt(e.args[1],"tabs.move"),n=await Promise.all(t.map(a=>chrome.tabs.get(a))),i=new Set(n.map(({windowId:a})=>a));Object.hasOwn(r,"windowId")&&i.add(Ye(r.windowId,"window ID")),await vl(i)}async function pl(e){await aa(na(e.args[0]))}async function v_(e){const t=Xt(e.args[0],"tabs.group"),r=await aa(na(t.tabIds));let n,i;if(Object.hasOwn(t,"groupId")?i=(await ia(Ye(t.groupId,"group ID"))).windowId:(n=t.createProperties===void 0?{}:Xt(t.createProperties,"tabs.group createProperties"),i=n.windowId===void 0?r[0].windowId:Ye(n.windowId,"createProperties.windowId")),r.some(a=>a.windowId!==i))throw new Error("Chrome API tabs.group cannot move tabs between windows; group tabs separately by window. Use tabs.move only for user-requested transfers.");return n===void 0?t:{...t,createProperties:{...n,windowId:i}}}function ml(e){const t=Xt(e.args[e.method==="create"?0:1],`bookmarks.${e.method}`);if(Object.hasOwn(t,"url")){try{if(typeof t.url=="string"){const{protocol:r}=new URL(t.url);if(r==="http:"||r==="https:")return}}catch{}throw new Error(`Chrome API bookmarks.${e.method} requires a valid http or https URL`)}}function sn(e,t,r,n=!1){const i=Xt(e,r),a=Object.keys(i);if(!n&&a.length===0||a.some(s=>!t.has(s)))throw new Error(`Chrome API ${r} contains an unsupported property`);return i}function Xt(e,t){if(!Vt(e))throw new Error(`Chrome API ${t} requires a plain options object`);return e}function na(e){const t=Array.isArray(e)?e:[e];if(t.length===0)throw new Error("Chrome API requires at least one tab ID");return t.map(r=>Ye(r,"tab ID"))}function Ye(e,t){if(typeof e!="number"||!Number.isSafeInteger(e)||e<0)throw new Error(`Chrome API requires an explicit valid ${t}`);return e}async function gl(e,t){const r=await chrome.windows.get(e);if(r.type!=="normal"||r.incognito)throw new Error(`Chrome API ${t} requires a normal non-incognito window`)}function _l(e,t){if(e==="locked-fullscreen")throw new Error(`Chrome API ${t} cannot lock a window in fullscreen`)}async function vl(e){await wl((await Promise.all([...e].map(t=>chrome.tabs.query({windowId:t})))).flat())}async function ia(e){const t=await chrome.tabGroups.get(e);if(t.shared)throw new Error(`Chrome API cannot modify shared tab group ${e} without permission to share`);return t}async function aa(e){const t=await Promise.all([...new Set(e)].map(r=>chrome.tabs.get(r)));return await wl(t),t}async function wl(e){const t=new Set(e.map(({groupId:r})=>r));t.delete(-1),await Promise.all([...t].map(ia))}var bl={bookmarks:{create:{audit:!0,validate:ml},get:{},getChildren:{},getSubTree:{},getTree:{},move:{audit:!0},remove:{audit:!0},search:{},update:{audit:!0,validate:ml}},tabGroups:{get:{},move:{audit:!0,validate:fl},query:{},update:{audit:!0,validate:fl}},tabs:{get:{},group:{audit:!0},move:{audit:!0,validate:__},query:{},remove:{audit:!0,validate:pl},ungroup:{audit:!0,validate:pl},update:{audit:!0,validate:g_}},windows:{create:{audit:!0},get:{},getAll:{},getCurrent:{},getLastFocused:{},update:{audit:!0,validate:m_}}};async function w_(e){if(!b_(e))throw new Error(`Chrome API chrome.${e.namespace}.${e.method} is not allowed`);const t=bl[e.namespace];if(!Object.hasOwn(t,e.method))throw new Error(`Chrome API chrome.${e.namespace}.${e.method} is not allowed`);const r=t[e.method],n=async()=>{if(e.namespace==="windows"&&e.method==="create"){const o=await p_(e),l={...o,incognito:!1};return Object.hasOwn(o,"tabId")||(l.url="about:blank"),await chrome.windows.create(l)}await r.validate?.(e);const i=chrome[e.namespace];if(i==null||!Object.hasOwn(i,e.method))throw new Error(`Chrome API chrome.${e.namespace}.${e.method} is unavailable`);const a=Reflect.get(i,e.method);if(typeof a!="function")throw new Error(`Chrome API chrome.${e.namespace}.${e.method} is unavailable`);const s=e.namespace==="tabs"&&e.method==="group"?[await v_(e),...e.args.slice(1)]:e.args;return Reflect.apply(a,i,s)};return r.audit?await s_(e,n):await n()}function b_(e){return Object.hasOwn(bl,e.namespace)}var y_={id:"pageAssets",description:"List assets already observed in the current page state and bundle selected assets into a temporary local artifact."},ft=new Set,on=new Set,ln=new Map,cn=new Map,un=new Map,S_=1500,T_=1e4,It="about:blank",E_=5e3,I_=25,yl=!1;function A_(){yl||(chrome.debugger?.onDetach?.addListener(e=>{typeof e.tabId=="number"&&ft.delete(e.tabId),typeof e.targetId=="string"&&(on.delete(e.targetId),ln.delete(e.targetId))}),yl=!0)}var C_=class{browserFamily=Ot(navigator.userAgent,"brave"in navigator);sessions=new Map;tabLeases=ze.getInstance();requestHeaderPolicy=new xg;agentPopupInterceptorEnabled;browserManagementEnabled;webMcpConfig;browserTabMentionProvider;cursorArrivalWaitersByKey=new Map;downloadChangeListeners=new Set;downloadFilenamesById=new Map;downloadUrlsById=new Map;nextCursorMoveSequence=1;constructor({agentPopupInterceptorEnabled:e,buildChannel:t=Er("prod"),browserManagementEnabled:r,browserTabMentionProvider:n,webMcpConfig:i}={}){this.agentPopupInterceptorEnabled=e,this.browserManagementEnabled=r??Promise.resolve(!0),this.webMcpConfig=i;const a=Ji.getInstance();this.browserTabMentionProvider=n??new ol(t,a),A_(),fg(),Ym()}ping(){return"pong"}async focusTab(e){if(!Number.isSafeInteger(e.tabId)||e.tabId<=0)throw new Error("focusTab requires a positive integer tabId");if(e.session_id!=null&&!this.sessions.has(this.requireSessionId(e)))return!1;const t=await Qe(e.tabId);return await Promise.all([chrome.tabs.update(e.tabId,{active:!0}),chrome.windows.update(t.windowId,{focused:!0})]),e.session_id==null?void 0:!0}async executeCdp(e){return await(await this.activateSession(e)).executeCdp(e)}async attach(e){await this.resolveSession(e).attach(e)}async attachTarget(e){await this.resolveSession(e).attachTarget(e)}async detach(e){await this.resolveSession(e).detach(e)}async detachTarget(e){await this.resolveSession(e).detachTarget(e)}async getCommittedTabUrl(e){return await(await this.activateSession(e)).getCommittedTabUrl(e.tabId)}async getTabs(e){const t=await(await this.activateSession(e)).getTabs();return await Promise.all(t.map(async r=>({...r,providerTabId:await this.browserTabMentionProvider.getProviderTabId(r.id)})))}async getUserTabs(e){if(e.includeFavicons!==void 0||e.limit!==void 0||e.query!==void 0)return await this.browserTabMentionProvider.getUserTabs(e);const t=await L_();return await Promise.all(t.map(async r=>({...r,providerTabId:await this.browserTabMentionProvider.getProviderTabId(r.id)})))}async getUserHistory(e){return await this.activateSession(e),await D_(e)}async executeTabRead(e){return hn("executeTabRead",e.tabId),await this.activateSession(e),await Bm(e)}async getBookmarks(e){return await this.activateSession(e),await chrome.bookmarks.getTree()}async createNotification(e){return await this.activateSession(e),await chrome.notifications.create({type:"basic",iconUrl:chrome.runtime.getURL("/images/icon128.png"),title:e.title,message:e.message})}async getRecentlyClosedSessions(e){return await this.activateSession(e),await chrome.sessions.getRecentlyClosed()}async getTopSites(e){return await this.activateSession(e),await chrome.topSites.get()}async claimUserTab(e){return await this.resolveSession(e).claimUserTab(e,e.tabId)}async createTab(e){const t=this.resolveSession(e),r=typeof e.preferredWindowId=="number"&&Number.isSafeInteger(e.preferredWindowId)&&e.preferredWindowId>=0?e.preferredWindowId:void 0;return await t.createTab(e,r)}async markTab(e){await this.resolveSession(e).markTab(e,e.tabId,e.status)}async finalizeTabs(e){const t=this.resolveSession(e);if(!Array.isArray(e.keep))throw new Error("finalizeTabs requires a keep array");await t.finalizeTabs(e,e.keep)}async nameSession(e){await this.resolveSession(e).nameSession(e,e.name)}async executeUnhandledCommand(e){if(e.type==="browser_safari_context"){const t=await this.activateSession(e);await globalThis.ChatGPTSafariAgent.authorize(t,e);return{}}if(e.type==="browser_safari_command"){const t=await this.activateSession(e);return globalThis.ChatGPTSafariAgent.execute(e.command,t,e)}const t=await this.activateSession(e),r=this.requireTurnId(e);return await Fc({backendName:Te[this.browserFamily].shortDisplayName,commandSets:[Lm,Em],handlers:{[Yr]:async n=>{if(!await this.browserManagementEnabled)throw new Error("Browser management capability is disabled");const i=Kt.parse(n);return Oi.parse({value:await t.executeBrowserManagementCall(r,i)})},[Qr]:async n=>{if(!await this.browserManagementEnabled)throw new Error("Browser management capability is disabled");return Pi.parse(n),Mi.parse(await t.getBrowserManagementAuditTrail(r))},[tn]:async n=>{const i=Ui.parse(n);return await t.setViewport(e,{height:i.height,width:i.width}),Fi.parse({})},[en]:async n=>(xi.parse(n),await t.setViewport(e,null),Ni.parse({}))},payload:e})}async moveMouse(e){q_("moveMouse",e);const t=he.isObserved(e.tabId);await(await this.activateSession(e)).requireSessionTab(e.tabId,{publishOverlay:!1,trackOverlay:!0});const r=this.nextCursorMoveSequence;this.nextCursorMoveSequence+=1;const n=e.waitForArrival===!1||!t?!1:await G_(e.tabId),i=e.waitForArrival!==!1&&n?this.createCursorArrivalWaiter({moveSequence:r,sessionId:e.session_id,turnId:e.turn_id}):null,a=await he.setCursorState(e.session_id,e.tabId,e.turn_id,{...n?{}:{animateMovement:!1},moveSequence:r,visible:!0,x:e.x,y:e.y},{publish:t});if(i!=null){if(!a){i.cancel();return}await i.promise}}notifyCursorArrived({moveSequence:e,sessionId:t,turnId:r}){Number.isInteger(e)&&this.cursorArrivalWaitersByKey.get(Sl(t,r,e))?.()}async turnEnded(e){const t=this.requireSessionId(e),r=this.requireTurnId(e);let n=this.sessions.get(t);n||(n=new Tl(t,this.browserFamily,this.agentPopupInterceptorEnabled,this.requestHeaderPolicy),this.sessions.set(t,n));try{await n.endTurn(r)}finally{globalThis.ChatGPTSafariAgent.release(t,r)}}async getInfo(e){const t=await Ce();return{browserTabMentions:await this.browserTabMentionProvider.getCapabilityInfo(),family:"safari",name:"Safari",version:typeof chrome.runtime.getVersion=="function"?chrome.runtime.getVersion():"unknown",type:"extension",apiSupportOverrides:{"Browser.user":true,"BrowserUser.getTabContext":true,"Browser.capabilities":true,"Browser.history":false,"Tabs.new":false,"Tabs.content":false,"Tab.ax":false,"Tab.capabilities":false,"Tab.clipboard":false,"Tab.content":false,"Tab.cua":false,"Tab.dev":false,"Tab.dom_cua":true,"Tab.playwright":false,"Tab.screenshot":false,"Tab.getJsDialog":false,"Tab.requestManualHandoff":false,"DomCUAAPI.double_click":false,"DomCUAAPI.downloadMedia":true},agentRequestHeaderEnabled:await this.requestHeaderPolicy.isEnabled(),capabilities:{browser:await this.browserManagementEnabled?[{...Mo.info,description:"Organize ordinary Safari tabs and native named tab groups. Read Safari-specific documentation first."}]:[],tab:[y_,...await this.webMcpConfig?.enabled()?[Ao]:[]]},metadata:{extensionId:chrome.runtime.id,extensionInstanceId:t}}}addDownloadChangeListener(e){return this.downloadChangeListeners.add(e),()=>{this.downloadChangeListeners.delete(e)}}handleDownloadCreated(e){Ll(e.id)&&he.isBrowserControlActive()&&typeof e.filename=="string"&&(this.downloadFilenamesById.set(e.id,e.filename),this.downloadUrlsById.set(e.id,e.finalUrl),this.emitDownloadChange({id:String(e.id),filename:e.filename,url:e.finalUrl,status:"started"}))}handleDownloadChanged(e){if(!Ll(e.id))return;const t=z_(e,this.downloadFilenamesById);if(t==null)return;const r=this.downloadUrlsById.get(e.id);if(r==null)return;this.downloadFilenamesById.set(e.id,t);const n=V_(e);n!=null&&this.emitDownloadChange({id:String(e.id),filename:t,url:r,status:n})}async handleCreatedNavigationTarget(e){const t=await this.tabLeases.getActiveLease(e.sourceTabId);if(t==null)return;const r=this.sessions.get(t.sessionId);r!=null&&await r.claimChildTab(t,e.tabId)}async handleAgentBackgroundPopup(e,t){const r=await this.tabLeases.getActiveLease(e);if(r==null)return;const n=this.sessions.get(r.sessionId);if(n==null||n.currentTurnId!==r.turnId)return;let i;try{i=new URL(t)}catch{return}if(i.protocol!=="http:"&&i.protocol!=="https:")return;const a=await Qe(e),s=await chrome.tabs.create({active:!1,openerTabId:e,url:"about:blank",windowId:a.windowId});if(s.id!=null)try{await n.claimChildTab(r,s.id,{logicalActive:!0}),await this.tabLeases.getActiveLease(s.id)==null?await chrome.tabs.remove(s.id).catch(()=>{}):await chrome.tabs.update(s.id,{url:i.href})}catch(o){throw await chrome.tabs.remove(s.id).catch(()=>{}),o}}resolveSession(e){const t=this.requireSessionId(e);this.requireTurnId(e);let r=this.sessions.get(t);if(e.session_context==="cached"){if(!r)throw new Error(`Browser session ${t} is not active`);return r.requireActiveTurn(this.requireTurnId(e)),r}return r||(r=new Tl(t,this.browserFamily,this.agentPopupInterceptorEnabled,this.requestHeaderPolicy),this.sessions.set(t,r)),r}async activateSession(e){const t=this.resolveSession(e);return await t.activateTurn(e),t}requireSessionId(e){const t=e?.session_id;if(typeof t!="string")throw new Error("Missing required browser session_id");return t}requireTurnId(e){const t=e?.turn_id;if(typeof t!="string")throw new Error("Missing required browser turn_id");return t}createCursorArrivalWaiter({moveSequence:e,sessionId:t,turnId:r}){const n=Sl(t,r,e);let i=null,a=null;const s=()=>{i!=null&&(clearTimeout(i),i=null),this.cursorArrivalWaitersByKey.delete(n),a?.()};return{cancel:s,promise:new Promise(o=>{a=o,i=setTimeout(s,S_),this.cursorArrivalWaitersByKey.set(n,s)})}}emitDownloadChange(e){for(const t of this.downloadChangeListeners)t(e)}};function Sl(e,t,r){return`${e}:${t}:${r}`}var Tl=class{tabGroups=globalThis.ChatGPTSafariSessionWindows;tabLeases=ze.getInstance();tabFavicons=Ji.getInstance();activeTabId=null;lifecycleQueue=Promise.resolve();currentTurnId=null;requestHeaderEnabled;constructor(e,t,r,n){this.sessionId=e,this.browserFamily=t,this.agentPopupInterceptorEnabled=r,this.requestHeaderPolicy=n}async activateTurn(e){this.currentTurnId===e.turn_id&&e.agent_request_header_enabled===void 0||await this.runTurnMutation(e,async()=>{})}requireActiveTurn(e){if(this.currentTurnId!==e)throw new Error(`Browser session ${this.sessionId} turn ${e} is not active`)}async executeBrowserManagementCall(e,t){return await this.runLifecycle(async()=>(this.requireActiveTurn(e),await w_(t)))}async getBrowserManagementAuditTrail(e){return await this.runLifecycle(async()=>(this.requireActiveTurn(e),await o_()))}async executeCdp(e){const t=e.target.tabId;if(typeof t=="number"&&(await this.requireSessionTab(t),!ft.has(t)))throw new Error("Debugger unattached");try{return typeof t=="number"&&e.target.sessionId==null&&e.target.targetId==null&&(e.method==="Page.close"||e.method==="Target.closeTarget")&&await this.tabFavicons.restoreTabFaviconsBestEffort([t]),await Z_(e)}catch(r){throw X_(r)&&typeof t=="number"&&e.preserveDebuggerOnTimeout!==!0&&await O_(t),r}}async attach(e){await this.runTurnMutation(e,async()=>{await this.requireSessionTab(e.tabId),await El(e.tabId,await this.tabLeases.takeViewportSizeForAttach(this.sessionId,e.turn_id,e.tabId))})}async attachTarget(e){await this.runTurnMutation(e,async()=>{await this.requireSessionTab(e.tabId),await k_(e.tabId,e.targetId)})}async detach(e){await this.runLifecycle(async()=>{this.currentTurnId!=null&&this.requireActiveTurn(e.turn_id),await this.requireOwnedTab(e.tabId),await Al(e.tabId)})}async detachTarget(e){await this.runLifecycle(async()=>{this.currentTurnId!=null&&this.requireActiveTurn(e.turn_id),await this.requireOwnedTab(e.tabId),await Cl(e.targetId)})}async getCommittedTabUrl(e){return await this.requireOwnedTab(e),(await chrome.tabs.get(e)).url}async getTabs(){return await this.listSessionTabs()}async createTab(e,t){return await this.runTurnMutation(e,async()=>{const r=await this.activeAgentTabIds();r.length===0&&t==null&&this.activeTabId!=null&&(t=(await Qe(this.activeTabId).catch(()=>null))?.windowId);const n=Yt(await this.tabGroups.createTab(this.sessionId,r.length===0?t:void 0));return this.activeTabId=n.id,await rl(n.id),await this.tabGroups.ensureAgentTabGroup(this.sessionId,n.id,r),await this.tabLeases.claimTab(this.sessionId,e.turn_id,n.id,"agent",this.requestHeaderEnabled),await this.requireSessionTab(n.id,{trackOverlay:!0}),{...n,active:!0}})}async claimChildTab(e,t,r={}){await this.runLifecycle(async()=>{if(this.currentTurnId!==e.turnId||!await this.tabLeases.claimTabIfSourceLeaseMatches(e,t))return;const n=await Qe(t).catch(()=>null);if(n==null)return;(n.active===!0||r.logicalActive===!0)&&(this.activeTabId=t);const i=(await this.activeAgentTabIds()).filter(a=>a!==t);await Promise.allSettled([rl(t),this.tabGroups.ensureAgentTabGroup(this.sessionId,t,i),this.requireSessionTab(t,{trackOverlay:!0})])})}async claimUserTab(e,t){return await this.runTurnMutation(e,async()=>{let r=await Qe(t);const n=await this.tabLeases.getOwningSessionId(t);if(n!=null&&n!==this.sessionId)throw new Error(`Tab ${t} is already part of browser session ${n}`);if((ja(this.browserFamily,r.url)||ja(this.browserFamily,r.pendingUrl))&&(r=await M_(t)),br(this.browserFamily,r.url)||br(this.browserFamily,r.pendingUrl))throw new Error(`${Te[this.browserFamily].shortDisplayName} internal tab ${t} cannot be claimed`);return this.activeTabId=r.id,n===this.sessionId?(await this.requireSessionTab(r.id,{trackOverlay:!0}),{...Yt(r),active:!0}):(await this.tabLeases.claimTab(this.sessionId,e.turn_id,r.id,"user",this.requestHeaderEnabled),await this.requireSessionTab(r.id,{trackOverlay:!0}),{...Yt(r),active:!0})})}async markTab(e,t,r){await this.runTurnMutation(e,async()=>{hn("markTab",t),H_(r),await this.requireSessionTab(t),await this.tabLeases.setTabMark(this.sessionId,e.turn_id,t,r)})}async nameSession(e,t){await this.runTurnMutation(e,async()=>{await this.tabGroups.setSessionGroupTitle(this.sessionId,t,await this.activeAgentTabIds())})}async setViewport(e,t){await this.runTurnMutation(e,async()=>{const r=(await this.listSessionTabs()).find(n=>n.active);await this.tabLeases.setViewportSize(this.sessionId,e.turn_id,r?.id??null,t),r!=null&&await El(r.id,t)})}async finalizeTabs(e,t){await this.runLifecycle(async()=>{await this.activateTurnUnlocked(e);const r=await this.listSessionTabs(),n=W_(t,new Set(r.map(i=>i.id)));await this.tabLeases.replaceTurnMarks(this.sessionId,e.turn_id,n),await this.endTurnUnlocked(e.turn_id)})}async endTurn(e){await this.runLifecycle(()=>this.endTurnUnlocked(e))}async endTurnUnlocked(e){if(this.currentTurnId!=null&&this.currentTurnId!==e)return;await this.tabLeases.clearPendingViewportSize(this.sessionId,e);const t=await this.tabLeases.getSessionActiveLeases(this.sessionId),r=new Map([...t].filter(([,h])=>h.turnId===e)),n=new Set((await this.listSessionTabs()).map(h=>h.id)),{handoff:i,deliverable:a,close:s,release:o}=$c([...r.values()].filter(h=>n.has(h.tabId))),l=[...i,...a,...s,...o];await he.stopSessions([this.sessionId]),await Promise.all([Promise.all([...a.map(async h=>this.tabFavicons.markFinalized(h,"deliverable").catch(()=>{})),...i.map(async h=>this.tabFavicons.markFinalized(h,"handoff").catch(()=>{}))]),this.detachAttachedDebuggersBestEffort(l)]),await Promise.allSettled([...l.map(gg),...l.map(eg)]),await this.tabGroups.releaseTabsFromManagedGroups(a),s.length>0&&(await this.tabFavicons.closeTabsWithFaviconRestore(s,()=>K_(s)),await this.tabGroups.refreshManagedGroupsFromChrome()),await Promise.all(l.map(async h=>he.untrackTab(this.sessionId,h))),await this.tabLeases.releaseTabs(this.sessionId,[...a,...s,...o]),i.length>0&&await this.tabLeases.handoffTabs(this.sessionId,e,i,{...this.activeTabId==null?{}:{activeTabId:this.activeTabId}}),this.activeTabId=null,this.currentTurnId=null,[...r.values()].some(h=>h.requestHeaderEnabled!==void 0)&&await this.tabLeases.reconcileRequestHeaders()}async resumeHandoffIfPresent(e){const t=await this.tabLeases.getSessionHandoffLeases(this.sessionId);if(t.size===0)return;const r=await Promise.all([...t.keys()].map(async l=>{try{return await Qe(l),{tabId:l,state:"reclaimed"}}catch{return{tabId:l,state:"stale"}}})),n=[],i=[];for(const l of r)l.state==="reclaimed"?n.push(l.tabId):i.push(l.tabId);if(i.length>0&&await this.tabLeases.releaseTabs(this.sessionId,i),n.length===0)return;const a=await this.tabLeases.resumeHandoffTabs(this.sessionId,e,n);if(a.length===0)return;const s=new Set(a),o=[...t.values()].find(l=>l.isActiveHandoff===!0&&s.has(l.tabId))?.tabId;this.activeTabId=o??a[0]??null}async detachAttachedDebuggersBestEffort(e){const t=new Set(e);await Promise.allSettled([...[...t].filter(r=>ft.has(r)).map(async r=>Al(r)),...Array.from(ln.entries()).filter(([,r])=>t.has(r)).map(async([r])=>Cl(r))])}async listSessionTabs(){const e=(await this.tabLeases.getSessionTabs(this.sessionId)).filter(t=>t.id!==void 0&&!br(this.browserFamily,t.url));return this.tabInfosWithLogicalActive(e)}async activeAgentTabIds(){return[...(await this.tabLeases.getSessionActiveLeases(this.sessionId)).values()].filter(e=>e.origin==="agent").map(e=>e.tabId)}tabInfosWithLogicalActive(e){const t=e.map(Yt),r=this.resolveLogicalActiveTabId(t);return r==null?t:t.map(n=>n.active===(n.id===r)?n:{...n,active:n.id===r})}resolveLogicalActiveTabId(e){return e.length===0?null:this.activeTabId!=null&&e.some(t=>t.id===this.activeTabId)?this.activeTabId:(this.activeTabId=e.find(t=>t.active)?.id??e[0]?.id??null,this.activeTabId)}async requireSessionTab(e,t={}){await this.requireOwnedTab(e);const r=t.trackOverlay===!0&&t.publishOverlay!==!1;await he.startSession(this.sessionId,this.currentTurnId,{publishTabs:r}),t.trackOverlay===!0&&await he.trackTab(this.sessionId,e,{publish:r}),mg(e),await Promise.all([Xo(e),Promise.resolve(this.requestHeaderEnabled===!0||this.agentPopupInterceptorEnabled).then(async n=>{if(!n)return;Qm(e);const i=await Ko(e);if(this.requestHeaderEnabled===!0&&!i&&(await chrome.tabs.get(e)).url!=="about:blank")throw new Error("Unable to prepare popup request headers. Retry the browser command.")})])}async requireOwnedTab(e){if(!await this.tabLeases.isClaimedBySession(this.sessionId,e))throw new Error(`Tab ${e} is not part of browser session ${this.sessionId}`)}async runLifecycle(e){const t=this.lifecycleQueue.then(e,e);return this.lifecycleQueue=t.then(()=>{},()=>{}),await t}async runTurnMutation(e,t){return await this.runLifecycle(async()=>(await this.activateTurnUnlocked(e),await t()))}async activateTurnUnlocked(e){if(e.session_context==="cached"&&this.requireActiveTurn(e.turn_id),e.agent_request_header_enabled!==void 0){if(typeof e.agent_request_header_enabled!="boolean")throw new Error("Invalid agent request-header policy: expected a boolean.");const r=await this.requestHeaderPolicy.applyDecision(e.agent_request_header_enabled);await this.tabLeases.setSessionRequestHeaderEnabled(this.sessionId,r),this.requestHeaderEnabled=r}const t=e.turn_id;this.currentTurnId!==t&&(await this.resumeHandoffIfPresent(t),await this.tabLeases.updateActiveSessionTurn(this.sessionId,t),this.currentTurnId=t)}};async function El(e,t){if(!chrome.debugger)throw new Error("Safari browser control is unavailable: the desktop runtime requires a CDP debugger, which Safari does not expose.");await oa(e,async()=>{if(ft.has(e)){t!==void 0&&await Il(e,t);return}try{await chrome.debugger.attach({tabId:e},"1.3")}catch(r){if(!Ml(r))throw r}await Il(e,t),ft.add(e)})}async function k_(e,t){if(!chrome.debugger)throw new Error("Safari browser control is unavailable: the desktop runtime requires a CDP debugger, which Safari does not expose.");await Pl(t,async()=>{if(!on.has(t)){try{await chrome.debugger.attach({targetId:t},"1.3")}catch(r){if(!Ml(r))throw r}on.add(t),ln.set(t,e)}})}async function Il(e,t){const r=t??R_(void 0);if(r==null){if(t===void 0)return;await la({target:{tabId:e},method:"Emulation.clearDeviceMetricsOverride",commandParams:{}});return}await la({target:{tabId:e},method:"Emulation.setDeviceMetricsOverride",commandParams:{...r,deviceScaleFactor:1,mobile:!1}})}function R_(e){if(typeof e!="string")return null;const t=/^(?<width>[1-9]\d*)x(?<height>[1-9]\d*)$/u.exec(e);return t?.groups==null?null:{width:Number.parseInt(t.groups.width,10),height:Number.parseInt(t.groups.height,10)}}async function Al(e){await oa(e,async()=>{try{await chrome.debugger.detach({tabId:e})}finally{ft.delete(e)}})}async function Cl(e){await Pl(e,async()=>{try{await chrome.debugger.detach({targetId:e})}finally{on.delete(e),ln.delete(e)}})}async function O_(e){await oa(e,async()=>{ft.delete(e);try{await chrome.debugger.detach({tabId:e})}catch{}})}async function P_(e){const t=await kl(e);if(t==null)return Yt(await Rl());let r;try{r=await sa(t)}catch(n){if(t!==e)throw n;const i=await kl(e);if(i===e)throw n;r=i==null?await Rl():await sa(i)}return Yt(r)}async function Qe(e){const t=await chrome.tabs.get(e);if(dn(t))return t;throw new Error(`Browser tab ${e} has no id`)}async function kl(e){const t=await chrome.windows.getAll({windowTypes:["normal"]}),r=t.find(i=>i.id===e);if(r?.id!==void 0)return r.id;const n=t.find(i=>i.focused&&i.id!==void 0);return n?.id!==void 0?n.id:t.find(i=>i.id!==void 0)?.id??null}async function Rl(){const e=await chrome.windows.create({focused:!1,type:"normal",url:It}),t=e?.tabs?.find(dn);if(t)return t;if(e?.id===void 0)throw new Error("Created browser window has no id");return await sa(e.id)}async function sa(e){const t=await chrome.tabs.create({active:!1,url:It,windowId:e});if(dn(t))return t;throw new Error("Created tab has no id")}async function M_(e){const t=await chrome.tabs.update(e,{url:It});if(t==null||!dn(t))throw new Error(`Browser tab ${e} has no id`);if(t.url===It)return t;const r=Date.now()+E_;let n=await Qe(e);for(;n.url!==It;){if(Date.now()>=r)throw new Error(`Browser tab ${e} did not navigate to ${It}`);await new Promise(i=>setTimeout(i,I_)),n=await Qe(e)}return n}function dn(e){return e.id!==void 0}function Yt(e){return{id:e.id,title:e.title,active:e.active,faviconUrl:e.favIconUrl,url:e.url}}async function L_(){const e=await sl({}),t=await $_(e.map(({tab:r})=>r));return e.map(({tab:r})=>j_(r,t))}async function D_(e){const t=U_(e.limit),r={text:"",maxResults:t},n=Ol(e.from,"from")??0,i=Ol(e.to,"to");return r.startTime=n,i!=null&&(r.endTime=i),N_(await Promise.all(x_(e).map(async a=>await chrome.history.search({...r,text:a}))),t)}function x_(e){if(e.queries==null)return[""];if(!Array.isArray(e.queries)||e.queries.length===0)throw new Error("getUserHistory requires queries to be a non-empty array of strings");const t=[];for(const r of e.queries){if(typeof r!="string")throw new Error("getUserHistory requires queries to be a non-empty array of strings");t.push(r)}return t}function N_(e,t){const r=e.flatMap(i=>i.flatMap(F_)).sort((i,a)=>a.dateVisited.localeCompare(i.dateVisited)),n=new Set;return r.filter(({url:i})=>n.has(i)?!1:(n.add(i),!0)).slice(0,t)}function U_(e){if(e==null)return 100;if(typeof e!="number"||!Number.isInteger(e)||e<=0)throw new Error("getUserHistory requires limit to be a positive integer");return e}function Ol(e,t){if(e!=null){if(typeof e!="string")throw new Error(`getUserHistory requires ${t} to be a valid date`);return B_(e,t)}}function F_(e){const t=e.url,r=e.lastVisitTime;return typeof t!="string"||typeof r!="number"||!Number.isFinite(r)?[]:[{url:t,...e.title==null?{}:{title:e.title},dateVisited:new Date(r).toISOString()}]}function B_(e,t){const r=Date.parse(e);if(Number.isNaN(r))throw new Error(`getUserHistory requires ${t} to be a valid date`);return r}async function $_(e){const t=new Set;for(const n of e)typeof n.groupId=="number"&&n.groupId!==-1&&t.add(n.groupId);const r=await Promise.all([...t].map(async n=>{try{const i=(await chrome.tabGroups.get(n)).title?.trim();return i?[n,i]:null}catch{return null}}));return new Map(r.filter(n=>n!=null))}function j_(e,t){const r=an(e),n=typeof e.groupId=="number"?t.get(e.groupId):void 0;return{id:e.id,...e.title==null?{}:{title:e.title},...e.url==null?{}:{url:e.url},...r<=0?{}:{lastOpened:new Date(r).toISOString()},...n==null?{}:{tabGroup:n}}}async function oa(e,t){const r=cn.get(e)??Promise.resolve();let n=()=>{};const i=new Promise(s=>{n=s}),a=r.catch(()=>{}).then(()=>i);cn.set(e,a);try{return await r.catch(()=>{}),await t()}finally{n(),cn.get(e)===a&&cn.delete(e)}}async function Pl(e,t){const r=un.get(e)??Promise.resolve();let n=()=>{};const i=new Promise(s=>{n=s}),a=r.catch(()=>{}).then(()=>i);un.set(e,a);try{return await r.catch(()=>{}),await t()}finally{n(),un.get(e)===a&&un.delete(e)}}function Ml(e){return Y_(e).includes("Another debugger")}function q_(e,t){if(hn(e,t.tabId),!Number.isFinite(t.x)||!Number.isFinite(t.y))throw new Error(`${e} requires finite x and y coordinates`)}async function G_(e){let t;try{t=await chrome.tabs.get(e)}catch{return!1}if(t.active!==!0||typeof t.windowId!="number")return!1;try{const r=await chrome.windows.get(t.windowId);return r.type==="normal"&&r.state!=="minimized"}catch{return!1}}function hn(e,t){if(!Number.isInteger(t))throw new Error(`${e} requires an integer tabId`)}function Ll(e){return typeof e=="number"&&Number.isInteger(e)&&e>=0}function z_(e,t){const r=e.filename?.current;return typeof r=="string"?r:t.get(e.id)}function V_(e){switch(e.state?.current){case"complete":return"complete";case"interrupted":return e.error?.current==="USER_CANCELED"?"canceled":"failed";case"in_progress":return"in_progress";case void 0:return}}function H_(e){if(e!=="handoff"&&e!=="deliverable")throw new Error(`markTab received invalid status ${String(e)}`)}function W_(e,t){const r=new Map;for(const n of e){if(n==null)throw new Error("finalizeTabs received invalid tab entry");const{tabId:i,status:a}=n;if(hn("finalizeTabs",i),!t.has(i))throw new Error(`finalizeTabs cannot keep unknown tab ${i}`);if(a!=="handoff"&&a!=="deliverable")throw new Error(`finalizeTabs received invalid status ${String(a)}`);if(r.has(i))throw new Error(`finalizeTabs received duplicate tab ${i}`);r.set(i,a)}return r}async function K_(e){const t=e[0];if(t!=null){if(e.length===1){await chrome.tabs.remove(t);return}await chrome.tabs.remove([t,...e.slice(1)])}}function la(e){if(e.method==="Target.getTargets")return chrome.debugger.getTargets().then(r=>({targetInfos:r}));const t=typeof e.target.targetId=="string"?{targetId:e.target.targetId}:e.target;return chrome.debugger.sendCommand(t,e.method,e.commandParams)}async function Z_(e){const t=J_(e.timeoutMs);let r;const n=new Promise((i,a)=>{r=setTimeout(()=>{a(new Dl(e.method,t))},t)});try{return await Promise.race([la(e),n])}finally{r!==void 0&&clearTimeout(r)}}function J_(e){return typeof e=="number"&&Number.isFinite(e)&&e>0?e:T_}var Dl=class extends Error{constructor(e,t){super(`Timed out after ${t}ms waiting for CDP command ${e}.`),this.name="CdpCommandTimeoutError"}};function X_(e){return e instanceof Dl}function Y_(e){if(e instanceof Error)return e.message;if(e&&typeof e=="object"&&"message"in e){const t=e.message;if(typeof t=="string")return t}return String(e??"")}var Q_="native-transport-reconnect",fn=5e3,ev=3e4/6e4,tv="native-host:",rv=/^native-host:\d+$/,nv=class extends Error{errorType;constructor(e,t){super(e),this.name="NativeHostRequestError",this.errorType=sv(t)}},iv=class extends Error{constructor(e,t){super(`Native host request ${e} timed out after ${t}ms`),this.method=e,this.timeoutMs=t,this.name="NativeHostRequestTimeoutError"}},pn=class extends Error{constructor(e){super(e),this.name="NativeTransportConnectionError"}},av=class{port=null;messageCallback=null;nextHostRequestId=0;pendingHostRequests=new Map;applicationCandidates;applicationIndex=0;failedApplications=new Set;reconnectAlarmName;reconnectTimeoutId=null;reconnectPending=!1;reconnectAttempt=0;status;handleReconnectAlarm=e=>{if(e.name===this.reconnectAlarmName){if(this.port){this.clearReconnectAlarm();return}this.runReconnectAttempt()}};constructor(e="com.openai.codexextension"){this.applicationCandidates=typeof e=="string"?[e]:[e[0],...e.slice(1)],this.reconnectAlarmName=`${Q_}:${this.application}`,this.status={state:"disconnected",hostName:this.application,lastChecked:Date.now(),reconnectAttempt:this.reconnectAttempt},chrome.alarms.onAlarm.addListener(this.handleReconnectAlarm),this.connect()||this.scheduleReconnect()}sendMessage(e){if(!this.port)throw this.scheduleReconnect(),new pn("Native transport is disconnected; reconnect is pending");this.port.postMessage(e)}requestHost(e,t,r={}){const n=this.port;if(!n)return this.scheduleReconnect(),Promise.reject(new pn("Native transport is disconnected; reconnect is pending"));const i=this.createHostRequestId(),a={jsonrpc:"2.0",id:i,method:e,...t===void 0?{}:{params:t}};return new Promise((s,o)=>{const l=r.timeoutMs,h=l==null?void 0:setTimeout(()=>{this.takePendingHostRequest(i)?.reject(new iv(e,l))},l);this.pendingHostRequests.set(i,{...h==null?{}:{timeoutId:h},reject:o,resolve:m=>s(m)});try{n.postMessage(a)}catch(m){this.takePendingHostRequest(i),o(m instanceof Error?m:new Error(String(m)))}})}setMessageCallback(e){this.messageCallback=e}getStatus(){return{...this.status}}refreshStatus(){return this.updateStatus(this.port?"connected":this.status.state,{error:this.status.error,nextRetryMs:this.status.nextRetryMs}),this.getStatus()}reconnectNow(e){const t=this.port;if(t!=null){this.port=null,this.rejectPendingHostRequests(new pn("Native transport reconnect requested"));try{t.disconnect()}catch{}}this.clearReconnectTimeout(),this.clearReconnectAlarm(),this.updateStatus("reconnecting",{...e==null?{}:{error:e},nextRetryMs:fn}),this.runReconnectAttempt()}connect(e={}){if(this.port)return!0;let t;for(;;)try{t=globalThis.ChatGPTSafariConnectNative(this.application);break}catch(r){const n=r instanceof Error?r.message:String(r),i=e.failureState??"disconnected";if(this.updateStatus(i,{error:n,...i==="reconnecting"?{nextRetryMs:fn}:{}}),!this.selectFallbackApplication(n))return!1}return this.port=t,this.reconnectPending=!1,this.reconnectAttempt=0,this.clearReconnectTimeout(),this.clearReconnectAlarm(),this.updateStatus("connected"),t.onMessage.addListener(r=>{this.port===t&&(this.failedApplications.clear(),!this.handleHostResponse(r)&&this.messageCallback?.(r))}),t.onDisconnect.addListener(()=>{if(this.port!==t)return;this.port=null,this.rejectPendingHostRequests(new pn("Native transport disconnected"));const r=chrome.runtime.lastError?.message;this.updateStatus("disconnected",{error:r}),!(this.selectFallbackApplication(r)&&this.connect({failureState:"reconnecting"}))&&this.scheduleReconnect()}),!0}createHostRequestId(){return this.nextHostRequestId+=1,`${tv}${this.nextHostRequestId}`}handleHostResponse(e){if(!("id"in e))return!1;const t=String(e.id),r=this.takePendingHostRequest(t);return r?("error"in e?r.reject(new nv(e.error.message,e.error.data)):"result"in e?r.resolve(e.result):r.reject(new Error("Native host returned an invalid response")),!0):rv.test(t)&&("error"in e||"result"in e)}rejectPendingHostRequests(e){for(const t of this.pendingHostRequests.keys())this.takePendingHostRequest(t)?.reject(e)}takePendingHostRequest(e){const t=this.pendingHostRequests.get(e);return this.pendingHostRequests.delete(e),t?.timeoutId!=null&&clearTimeout(t.timeoutId),t}scheduleReconnect(){this.port||(this.reconnectPending||(this.reconnectPending=!0,this.reconnectAttempt+=1),this.scheduleReconnectRetry(),this.updateStatus("reconnecting",{error:this.status.error,nextRetryMs:fn}))}scheduleReconnectTimeout(){this.port||this.reconnectTimeoutId!=null||(this.reconnectTimeoutId=setTimeout(()=>{this.reconnectTimeoutId=null,this.runReconnectAttempt()},fn))}clearReconnectTimeout(){this.reconnectTimeoutId!=null&&(clearTimeout(this.reconnectTimeoutId),this.reconnectTimeoutId=null)}scheduleReconnectRetry(){this.scheduleReconnectTimeout(),this.scheduleReconnectAlarm()}runReconnectAttempt(){this.port||(this.clearReconnectTimeout(),this.reconnectPending=!0,this.reconnectAttempt+=1,this.connect({failureState:"reconnecting"})||this.scheduleReconnectRetry())}async ensureReconnectAlarm(){if(this.port)return;const e=await chrome.alarms.get(this.reconnectAlarmName);this.port||e||await chrome.alarms.create(this.reconnectAlarmName,{periodInMinutes:ev})}clearReconnectAlarm(){chrome.alarms.clear(this.reconnectAlarmName).catch(()=>{})}scheduleReconnectAlarm(){this.ensureReconnectAlarm().catch(e=>{if(this.port)return;this.reconnectPending=!1;const t=e instanceof Error?e.message:String(e);this.updateStatus("disconnected",{error:t})})}updateStatus(e,t={}){this.status={state:e,hostName:this.application,lastChecked:Date.now(),reconnectAttempt:this.reconnectAttempt,...t.error?{error:t.error}:{},...t.error==="Specified native messaging host not found."?{errorType:"host_not_found"}:{},...t.nextRetryMs?{nextRetryMs:t.nextRetryMs}:{}}}selectFallbackApplication(e){if(e!=="Specified native messaging host not found."||this.applicationCandidates.length===1)return!1;this.failedApplications.add(this.application);const t=this.applicationCandidates.findIndex(r=>!this.failedApplications.has(r));return t===-1?(this.failedApplications.clear(),this.applicationIndex=0,!1):(this.applicationIndex=t,!0)}get application(){return this.applicationCandidates[this.applicationIndex]??this.applicationCandidates[0]}};function sv(e){if(e==null||typeof e!="object"||!("type"in e))return;const{type:t}=e;return typeof t=="string"?t:void 0}var iT="codex:page-event";function Qt(e,t){if(e.id!==chrome.runtime.id||e.frameId!==0||e.documentLifecycle!=null&&e.documentLifecycle!=="active"||typeof e.origin!="string"||typeof e.url!="string"||typeof e.tab?.id!="number"||typeof e.tab.windowId!="number")return!1;let r;try{r=new URL(e.url)}catch{return!1}return e.origin!==r.origin?!1:$n(r,t)}function ov(e,t,r){if(r.name!=="search_browser_tab_mentions")return;if(r.sender==null||r.sender.tab?.incognito===!0||!Nl(r.sender,t)){r.disconnect();return}const n=r.sender;let i=!1,a;const s=()=>{i||(i=!0,a?.(),r.onMessage.removeListener(l))},o=h=>{if(i)return!1;try{return r.postMessage(h),!0}catch{return s(),!1}},l=h=>{i||(r.onMessage.removeListener(l),xl(e,t,h,n,m=>{!o(m)||!m.ok||(a=e.subscribeCandidateUpdates(m.candidates,d=>{o({ok:!0,candidates:d})}))}))};r.onMessage.addListener(l),r.onDisconnect.addListener(s)}function xl(e,t,r,n,i){if(Dc(r)==null)return!1;if(!(n.tab?.incognito!==!0&&Nl(n,t)))return i({ok:!1,error:"Chrome tab mentions can only be accessed from ChatGPT"}),!0;const a=xc(r);if(a==null)return i({ok:!1,error:"Invalid Chrome tab mention search"}),!0;const s=n.tab?.id,o=Math.min(a.limit+(s!=null&&a.limit>0?1:0),100);return e.getUserTabs({includeFavicons:!0,query:a.query,limit:o}).then(l=>i({ok:!0,candidates:l.filter(({id:h})=>h!==s).slice(0,a.limit)})).catch(l=>i({ok:!1,error:lv(l)})),!0}function lv(e){return e instanceof Error?e.message:String(e)}function Nl(e,t){if(Qt(e,t))return!0;if(e.id!==chrome.runtime.id||e.tab!=null||e.documentLifecycle!=null&&e.documentLifecycle!=="active"||typeof e.url!="string"||typeof e.origin!="string")return!1;try{const r=new URL(e.url);return e.origin===r.origin&&$n(r,t)}catch{return!1}}var Ul="connector_openai_browser",ca={"OAI-Product-Sku":"TPP"};async function cv(e){const{plugin_id:t,plugin:r}=await e.request(`/ps/plugins/canonical-app/${Ul}`,{headers:ca});return t==null||r?.id!==t||r.status!=="ENABLED"||r.installation_policy==="NOT_AVAILABLE"||!(await e.request(`/ps/plugins/${encodeURIComponent(t)}/ensure`,{method:"POST",headers:ca})).enabled?!1:(await e.request("/aip/connectors/links/noauth",{method:"POST",headers:{...ca,"Content-Type":"application/json"},body:JSON.stringify({connector_id:Ul,name:"Browser",action_names:[],ensure_exists:!0})}),!0)}var mn="browserPluginSetupIdentity",er="browserPluginSetupNegativeResult",uv=30*6e4;function dv(){let e,t,r;return{async load(){e??=chrome.storage.session.get([mn,er]).catch(()=>({})).then(n=>{const i=n[mn];t=typeof i=="string"?i:void 0,r=hv(n[er])}),await e},isComplete(n){return t===tr(n)},shouldSkip(n){const i=tr(n);return t===i||r?.identity===i&&Date.now()<r.notBeforeMs},record(n,i){const a=tr(n);i?(t=a,chrome.storage.session.set({[mn]:a}).catch(()=>{})):(r={identity:a,notBeforeMs:Date.now()+uv},chrome.storage.session.set({[er]:r}).catch(()=>{}))},clear(){t=void 0,r=void 0,chrome.storage.session.remove([mn,er]).catch(()=>{})},clearNegative(){r=void 0,chrome.storage.session.remove(er).catch(()=>{})}}}function tr(e){return JSON.stringify([e.userId,e.id])}function hv(e){if(typeof e!="object"||e==null)return;const{identity:t,notBeforeMs:r}=e;if(typeof t=="string"&&typeof r=="number"&&Number.isFinite(r))return{identity:t,notBeforeMs:r}}var gn=1,ua=2e3,fv=2147483647,pv="chatgpt-work-browser-plugin";function mv(e){let t=!1,r,n=0,i=0,a,s,o;const l=dv();let h,m,d=!1;function f(y=hs()){if(t||Date.now()<i)return;const T=o;s?.abort();const E=new AbortController;s=E,c(E,y,T)}async function c(y,T,E){try{await l.load(),y.signal.throwIfAborted(),o==null&&a==null&&n>gn&&(n=0);const I=await T(y.signal);if(y.signal.throwIfAborted(),"error"in I&&I.status!==401&&I.status!==403)throw I.error==="http"?new Cr(I.status,I.retryAfterMs):new Error("Failed to read ChatGPT session.");const C="error"in I?null:I.session,O=C==null?void 0:tr(C.account);if((O!==r||C==null)&&(g(),h?.abort(),h=void 0,m=void 0,d=!1,(r!=null||C==null)&&(l.clear(),w()),r=O),C==null)return;if(l.isComplete(C.account)){w();return}if(m??=p(C.account.userId,T),await m,y.signal.throwIfAborted(),!d||a!=null||Date.now()<i||l.shouldSkip(C.account)||o!=null||E!=null&&tr(E.account)===O)return;u(new fs(C.accessToken,C.account))}catch(I){if(t||s!==y||y.signal.aborted)return;g(),v(I)}}async function p(y,T){const E=new AbortController;h=E;let I=!0;try{return await Vn(T,E.signal),await Rr(pv,(C,O,$)=>{if(t||h!==E)return;const G=d;d=O==="Ready"&&$===y&&C,d?!G&&!I&&n<=gn&&(l.clearNegative(),Date.now()<i?S(Math.max(ua,i-Date.now())):f()):(g(),$===y&&(clearTimeout(a),a=void 0)),O==="Ready"&&(I=!1)},E.signal)}catch(C){throw h===E&&(E.abort(),h=void 0,m=void 0,d=!1),C}}function u(y){o=y,cv(y).then(T=>{if(!(t||o!==y)&&(w(),l.record(y.account,T),T))try{e().catch(()=>{})}catch{}}).catch(T=>{!t&&o===y&&v(T)}).finally(()=>{y.dispose(),o===y&&(o=void 0)})}function g(){o?.dispose(),o=void 0}function w(){clearTimeout(a),a=void 0,n=0,i=0}function v(y){if(t)return;const T=y instanceof Cr?y.retryAfterMs??0:0;if(i=Math.max(i,Date.now()+T),y instanceof Cr&&(y.retryable===!1||![401,408,429,500,502,503,504].includes(y.status))){clearTimeout(a),a=void 0,n=gn+1;return}if(a==null&&n++>=gn){console.warn("[browser-plugin] failed to set up Browser");return}clearTimeout(a),a=void 0,S(Math.max(ua,i-Date.now())+Math.floor(Math.random()*ua))}function S(y){y>fv||(clearTimeout(a),a=setTimeout(()=>{a=void 0,f()},y))}return{refresh:f,stop(){t=!0,w(),s?.abort(),h?.abort(),g()}}}var da=new Map;async function Fl(e,t){const r=await chrome.tabs.query({url:Pu(e)});await Promise.allSettled(r.map(async n=>{if(n.id==null||n.discarded)return;const i=n.id,a=await chrome.webNavigation.getFrame({tabId:i,frameId:0});if(a==null||a.documentLifecycle!=="active"||!$n(new URL(a.url),e))return;const{documentId:s}=a;let o=da.get(s);o==null&&(o=gv(i,s).finally(()=>{da.delete(s)}),da.set(s,o)),!(!await o||!t)&&await chrome.tabs.sendMessage(i,{type:Rc},{documentId:s})}))}async function gv(e,t){const r=async()=>{const n=await ie(chrome.tabs.sendMessage(e,{type:kc},{documentId:t})).catch(()=>null);return typeof n=="object"&&n!=null&&"version"in n&&n.version===chrome.runtime.getManifest().version};return await r()?!0:await ie(chrome.scripting.executeScript({files:["content-scripts/chatgpt-website.js"],target:{tabId:e,documentIds:[t]}}))!=null&&await r()}var _v=String.raw`^https://(persistent\.oaistatic\.com/codex-app-prod/ChatGPT(-latest-x64)?\.dmg|get\.microsoft\.com/installer/download/9PLM9XGG6VKS\?cid=website_cta_psi)$`;async function Bl(){const[e]=await chrome.downloads.search({limit:1,orderBy:["-startTime"],urlRegex:_v});return e}function vv(e,t,r){return typeof e!="object"||e==null||!("type"in e)||e.type!=="SHOW_CODEX_INSTALLER"||!Qt(t,r)?!1:(Bl().then(n=>{n?.exists!==!1&&n?.state==="complete"&&chrome.downloads.show(n.id)}).catch(()=>{}),!0)}async function wv(){const e=await Bl();return e?.exists===!1||e?.state==="interrupted"||e?.paused===!0?{status:"idle"}:e?.state==="complete"?{status:"downloaded"}:e?.state!=="in_progress"?{status:"idle"}:{progressPercent:e.totalBytes>0?Math.min(Math.floor(e.bytesReceived/e.totalBytes*100),99):null,status:"downloading"}}var $l="codexSidePanelOpenWindowIds";function bv(e){return Array.isArray(e)?new Set(e.filter(t=>typeof t=="number"&&Number.isSafeInteger(t))):new Set}var jl=["#2563eb","#7c3aed","#db2777","#dc2626","#ea580c","#059669","#0891b2","#4f46e5"],yv=4,Sv=24,Tv=["alarms","bookmarks","debugger","declarativeNetRequestWithHostAccess","downloads","favicon","history","nativeMessaging","notifications","offscreen","scripting","sessions","storage","tabGroups","tabs","topSites","webNavigation"],aT=[...Tv,"contextMenus","sidePanel"],sT=`script-src 'self'; object-src 'none'; connect-src 'self' http://127.0.0.1:* http://localhost:* ws://127.0.0.1:* ws://localhost:* https://ab.chatgpt.com https://chatgpt.com https://api.openai.com https://api.openai.org ${ws.map(e=>`https://*${e}`).join(" ")}; font-src 'self' https://cdn.openai.com;`;function Ev(e){if(typeof e!="string")return null;const t=e.trim().replace(/\s+/gu," ");return t.length===0?null:t.slice(0,Sv)}function Iv(e){const t=Ev(e);return t==null?null:{backgroundColor:Av(t),text:Cv(t)}}function Av(e){let t=0;for(const r of e)t=t*31+r.charCodeAt(0)>>>0;return jl[t%jl.length]}function Cv(e){const t=e.match(/[A-Za-z0-9]+/gu)??[];return(t.length>1?t.map(r=>r[0]).join(""):t[0]??e).slice(0,yv).toUpperCase()}var rr={badgeBackgroundColor:"#0169cc",badgeText:"NEW",title:"Use the new ChatGPT side chat feature. Open the ChatGPT extension to continue.",version:1},nr="lastSeenExtensionActionCalloutVersion",ql=Promise.resolve();function kv(e){return ha(()=>zl(e))}function Rv(){return ha(async()=>{await Gl()||await Promise.all([chrome.browserAction.setTitle({title:rr.title}),chrome.browserAction.setBadgeBackgroundColor({color:rr.badgeBackgroundColor}),chrome.browserAction.setBadgeText({text:rr.badgeText})])})}function Ov(e=""){return ha(async()=>{if(await Gl())return;const t=chrome.runtime.getManifest();await Promise.all([chrome.browserAction.setTitle({title:t.action?.default_title??t.name}),zl(e)]),await chrome.storage.local.set({[nr]:rr.version})})}async function Gl(){const e=(await chrome.storage.local.get(nr))[nr];return typeof e=="number"&&e>=rr.version}async function zl(e){const t=Iv(e);if(t==null){await chrome.browserAction.setBadgeText({text:""});return}await Promise.all([chrome.browserAction.setBadgeBackgroundColor({color:t.backgroundColor}),chrome.browserAction.setBadgeText({text:t.text})])}function ha(e){const t=ql.then(e);return ql=t.catch(()=>{}),t}var ir="codexPendingUpdateVersion",Pv=class{pendingUpdateVersion=null;reloadInProgress=!1;currentVersion;isInUse;onUpdateAvailable;reload;storage;constructor(e,t={}){this.currentVersion=t.currentVersion??null,this.isInUse=e,this.onUpdateAvailable=t.onUpdateAvailable??chrome.runtime.onUpdateAvailable,this.reload=t.reload??(()=>chrome.runtime.reload()),this.storage=t.storage??chrome.storage.session}register(){this.onUpdateAvailable?.addListener(async e=>{await this.handleUpdateAvailable(e).catch(()=>{})}),this.maybeReloadForPendingUpdate().catch(()=>{})}get installedVersion(){return this.currentVersion??chrome.runtime.getManifest().version}async maybeReloadForPendingUpdate(){if(!this.reloadInProgress&&(this.pendingUpdateVersion==null&&await this.restorePendingUpdate(),this.pendingUpdateVersion!=null&&!this.isInUse())){this.reloadInProgress=!0;try{await this.clearPendingUpdate(),this.reload()}catch(e){throw this.reloadInProgress=!1,e}}}async handleUpdateAvailable(e){await this.storage.set({[ir]:e.version}),this.pendingUpdateVersion=e.version,await this.maybeReloadForPendingUpdate()}async restorePendingUpdate(){const e=(await this.storage.get(ir))[ir];if(typeof e=="string"){if(e===this.installedVersion){await this.clearPendingUpdate();return}this.pendingUpdateVersion=e}}async clearPendingUpdate(){this.pendingUpdateVersion=null,await this.storage.remove(ir)}};function Mv(e,t,r,n){if(n.name!=="chatgpt-extension-status")return;const i=n.sender,a=i?.tab?.id;if(i==null||typeof a!="number"||!Qt(i,r)){n.disconnect();return}const s={};let o=!1;const l=()=>{o||(o=!0,n.onDisconnect.removeListener(l),n.onMessage.removeListener(w),n.disconnect())},h=()=>{if(!o)try{n.postMessage({type:"update",status:s})}catch{l()}},m=(v,S)=>{let y=!1;return()=>{if(o||y)return;y=!0;const T=()=>{y=!1,h()};Promise.resolve().then(v).catch(E=>{if(o)throw E;return v()}).then(E=>{o||S(E)}).then(T,T)}},d=m(Ce,v=>{s.browserContext={instanceId:v}}),f=m(()=>chrome.storage.local.get(nr),v=>{const S=v[nr];s.sidePanel={...s.sidePanel,hasEverOpened:typeof S=="number"&&S>0}}),c=m(()=>Promise.all([chrome.storage.session.get([$l,ir]),chrome.tabs.get(a)]),([v,S])=>{s.sidePanel={...s.sidePanel,currentWindow:bv(v.codexSidePanelOpenWindowIds).has(S.windowId)?"open":"closed"},s.extension={...s.extension,updateAvailable:typeof v.codexPendingUpdateVersion=="string"&&v.codexPendingUpdateVersion!==t}}),p=m(()=>chrome.browserAction.getUserSettings(),v=>{s.toolbar={pin:v.isOnToolbar?"pinned":"unpinned"}}),u=m(wv,v=>{s.installer=v}),g=()=>{if(o)return;const v=e.refreshStatus(),S=typeof chrome.sidePanel?.open=="function";s.capabilities={[Fe.browserTabMentionsSearch]:!0,[Fe.browserControlStateRead]:!0,[Fe.extensionUpdateRead]:!0,[Fe.nativeHostStatus]:!0,...S?{[Fe.sidePanelOpen]:!0,[Fe.sidePanelPromptPrefill]:!0,[Fe.sidePanelStateRead]:!0}:{},[Fe.toolbarPinRead]:!0,[Fe.websiteActionRequest]:!0},s.extension={...s.extension,channel:r,version:t},s.browserControl={phase:he.isBrowserControlActive()?"active":"idle"},s.nativeHost={errorType:v.errorType,lastCheckedAt:v.lastChecked,transport:v.state},d(),f(),c(),p(),v.state!=="connected"&&u(),h()},w=v=>{v?.type==="refresh"&&g()};n.onDisconnect.addListener(l),n.onMessage.addListener(w),g()}var oT="GET_EXTENSION_INSTANCE_ID";function Lv(e,t,r){return e==null||typeof e!="object"||!("type"in e)||e.type!=="GET_EXTENSION_INSTANCE_ID"?!1:t.id!==chrome.runtime.id||t.url!==chrome.runtime.getURL("codex-work-sidepanel.html")?(r({instanceId:null}),!0):(Ce().then(n=>r({instanceId:n}),()=>r({instanceId:null})),!0)}var Dv="codex-app-chrome-extension-new-tab-onboarding-on-install";async function xv(){}var fa="codexSidePanelDestination",_n="codexSidePanelOpenDestinations",pa="codexWorkSidePanelTabIds",At={kind:"waiting_room"},te=At,ar,_e=new Map,Ct=new Set,pt=new Set,Vl,Hl,sr,vn=new AbortController,ma,ga=Promise.resolve();function or(){return te}function Wl(e){Ct.add(e)}function Kl(e){return te.kind!=="work_sidepanel"?Promise.resolve():chrome.sidePanel.setOptions({enabled:!0,path:ct,tabId:e})}async function _a(e,t){await lr(),t?pt.add(e):pt.delete(e),await Ta(),!t&&te.kind==="work_sidepanel"&&await chrome.sidePanel.setOptions({enabled:!1,path:ct,tabId:e})}async function va(e,t,r,n){if(await ya(),t){const a=await $v(e,r,n);return Ct.delete(e),_e.set(e,a),await Sa(),ar!=null&&(r==="side-panel-loading.html"||a.kind!==te.kind)?(await wa(te,!0),te):a}Ct.delete(e);const i=_e.get(e)??At;return _e.delete(e),await Sa(),_e.size===0&&Ct.size===0&&await Jl(),i}async function Nv(){ma??=Fv(vn.signal),await ma,await ga}function Uv(){if(sr!=null)return sr;const e=({tabId:i})=>{ba(i).catch(()=>{})},t=i=>{i.id!=null&&ba(i.id).catch(()=>{})},r=i=>{Gv(i).catch(()=>{})};chrome.tabs.onActivated.addListener(e),chrome.tabs.onCreated.addListener(t),chrome.tabs.onRemoved.addListener(r),Nv().catch(()=>{console.warn("Failed to initialize Chrome side panel destination.")});const n=vn;return sr=()=>{vn===n&&(n.abort(),chrome.tabs.onActivated.removeListener(e),chrome.tabs.onCreated.removeListener(t),chrome.tabs.onRemoved.removeListener(r),vn=new AbortController,ma=void 0,ar=void 0,sr=void 0)},sr}async function Fv(e){if(!e.aborted){await ec({kind:"work_sidepanel"});await wa({kind:"work_sidepanel"},!0)}}function Zl(e){return e?{kind:"work_sidepanel"}:{kind:"waiting_room"}}async function wa(e,t=!1){if(te=e.kind==="work_sidepanel"&&Zl(!0).kind!=="work_sidepanel"?{kind:"waiting_room"}:e,await ya(),_e.size>0||Ct.size>0){if(t){await Bv();for(const n of _e.keys())_e.set(n,te);await Sa()}const r=_e.values().next().value??te;await chrome.sidePanel.setPanelBehavior?.({openPanelOnActionClick:r.kind==="work_sidepanel"}).catch(()=>{});return}await Jl()}async function Bv(){const e=te.kind==="work_sidepanel"?ct:Nr,[t,r]=await Promise.all([chrome.sidePanel.getOptions({}),chrome.tabs.query(te.kind==="work_sidepanel"?{active:!0}:{})]);await Promise.all([(t.enabled||te.kind==="waiting_room")&&wn(t.path)!=null&&(!t.enabled||t.path!==e)?chrome.sidePanel.setOptions({enabled:!0,path:e}):Promise.resolve(),...r.map(async n=>{if(n.id==null)return;const i=await chrome.sidePanel.getOptions({tabId:n.id});i.tabId!==n.id||wn(i.path)==null||i.path===e||await chrome.sidePanel.setOptions({enabled:te.kind==="waiting_room"||i.enabled,path:e,tabId:n.id})})])}async function Jl(){try{await Xl(),te.kind==="work_sidepanel"?await Yl():await Ql()}catch{te=At,await ec(te),await Xl().catch(()=>{}),te.kind==="work_sidepanel"?await Yl().catch(()=>{}):await Ql().catch(()=>{})}await chrome.sidePanel.setPanelBehavior?.({openPanelOnActionClick:te.kind==="work_sidepanel"}).catch(()=>{})}async function Xl(){const e=te.kind==="waiting_room",t=Nr,r=await chrome.sidePanel.getOptions({});(r.enabled!==e||r.path!==t)&&await chrome.sidePanel.setOptions({enabled:e,path:t})}async function Yl(){await lr();const e=await chrome.tabs.query({});await Promise.all(e.map(t=>t.id==null?Promise.resolve():ba(t.id)))}async function Ql(){await lr(),pt.clear(),await Ta();const e=await chrome.tabs.query({});await Promise.all(e.map(async t=>{t.id!=null&&(await chrome.sidePanel.getOptions({tabId:t.id})).path==="codex-work-sidepanel.html"&&await chrome.sidePanel.setOptions({enabled:!0,path:Nr,tabId:t.id})}))}async function ba(e){if(te.kind==="work_sidepanel"){await ya();for(const t of _e.values())if(t.kind==="waiting_room")return;if(_e.size>0||Ct.size>0){const t=await chrome.sidePanel.getOptions({});if(t.enabled&&t.path==="codex-work-sidepanel.html"){const r=await chrome.sidePanel.getOptions({tabId:e});r.tabId===e&&r.path==="waiting-room.html"&&await chrome.sidePanel.setOptions({enabled:r.enabled,path:ct,tabId:e});return}}await lr(),await chrome.sidePanel.setOptions({enabled:pt.has(e),path:ct,tabId:e})}}async function $v(e,t,r){const n=wn(t);if(n!=null)return n;try{return wn((await chrome.sidePanel.getOptions(r==null?{}:{tabId:r})).path)??At}catch{return _e.get(e)??At}}function wn(e){if(e==="codex-work-sidepanel.html")return{kind:"work_sidepanel"};if(e==="waiting-room.html"||e==="side-panel-loading.html")return{kind:"waiting_room"}}async function ya(){Vl??=jv(),await Vl}async function jv(){const e=chrome.storage.session;if(e!=null)try{if(typeof chrome.runtime?.getContexts=="function"&&(await chrome.runtime.getContexts({contextTypes:["SIDE_PANEL"]})).length===0){await e.set({[_n]:{}});return}const t=(await e.get(_n))[_n];if(t==null||typeof t!="object")return;for(const[r,n]of Object.entries(t)){const i=Number(r);!Number.isSafeInteger(i)||i<0||(n==="waiting_room"||n==="work_sidepanel")&&_e.set(i,{kind:n})}}catch{}}async function Sa(){const e=chrome.storage.session;e!=null&&await e.set({[_n]:Object.fromEntries([..._e].map(([t,r])=>[t,r.kind]))}).catch(()=>{})}async function lr(){Hl??=qv(),await Hl}async function qv(){const e=chrome.storage.session;if(e!=null)try{const t=(await e.get(pa))[pa];if(!Array.isArray(t))return;for(const r of t)typeof r=="number"&&Number.isSafeInteger(r)&&r>=0&&pt.add(r)}catch{}}async function Ta(){await chrome.storage.session?.set({[pa]:[...pt]}).catch(()=>{})}async function Gv(e){await lr(),pt.delete(e)&&await Ta(),await chrome.storage.session?.remove?.([ih(e),Ks(e)]).catch(()=>{})}async function zv(){const e=chrome.storage.session;if(e==null)return{kind:"waiting_room"};try{const t=(await e.get(fa))[fa];return t==null?void 0:t==="waiting_room"||t==="work_sidepanel"?{kind:t}:{kind:"waiting_room"}}catch{return{kind:"waiting_room"}}}async function ec(e){const t=chrome.storage.session;if(t==null)return!1;try{return await t.set({[fa]:e.kind}),!0}catch{return!1}}var bn=new Set,yn=new Set,kt=new Map,tc=!1,rc="ask-chatgpt",Vv="codex_chrome_extension_sidechat_open";function Hv(){if(chrome.sidePanel==null){nc();return}Rv().catch(()=>{}),Xv(),nc(),Wv(),Jv()}function nc(){if(globalThis.ChatGPTSafariSidebar)return;chrome.browserAction.onClicked.addListener(e=>{if(typeof chrome.sidePanel?.open!="function"){const t=or().kind==="work_sidepanel"?"work_sidepanel":"waiting_room";chrome.tabs.create({url:chrome.runtime.getURL(t==="work_sidepanel"?ct:Nr)}).then(()=>{Ea("icon",t)}).catch(()=>{});return}or().kind==="work_sidepanel"&&e.windowId!=null&&oc(e.windowId,e.id)||ac(e,"icon").catch(()=>{})})}function Wv(){chrome.commands.onCommand.addListener((e,t)=>{e==="open-codex-side-panel"&&ac(t,"keyboard_shortcut").catch(()=>{})})}function Kv(e,t,r){const n=t.tab?.windowId,i=t.tab?.id;if(!tw(e)||e.type!=="OPEN_CODEX_SIDE_PANEL"||!Qt(t,r)||n==null||i==null||typeof chrome.sidePanel?.open!="function")return!1;const a=e.source===void 0?"chatgpt_website":e.source;return typeof a!="string"?!1:(ic(n,i,a,typeof e.prompt=="string"&&e.prompt.length<=8192&&e.prompt.trim().length>0?{createdAtMs:Date.now(),kind:"prompt",prompt:e.prompt}:void 0),!0)}function ic(e,t,r,n){const i=or().kind==="work_sidepanel"?t:void 0,a=i==null?Promise.resolve():Kl(i);Wl(e);const s=chrome.sidePanel.open(i==null?{windowId:e}:{tabId:i});Promise.all([a,s]).then(async()=>{const o=await cr(e,!0,void 0,i);if(Ea(r,sc(o)),o.kind==="work_sidepanel"&&n!=null&&(n.kind==="prompt"||n.selectedText.trim().length>0)){const l={type:Cc,createdAtMs:n.createdAtMs,prompt:n.kind==="prompt"?n.prompt:void 0,selectedText:n.kind==="selection"?n.selectedText.slice(0,Ac):void 0};await chrome.storage.session.set({[Ks(t)]:l}).catch(()=>{})}},async()=>{i!=null&&await _a(i,!1).catch(()=>{}),await va(e,!1).catch(()=>{})}).catch(()=>{})}function Zv(){chrome.sidePanel!=null&&chrome.contextMenus.create({contexts:["page","frame","selection","link","editable","image","video","audio"],id:rc,title:"Ask ChatGPT"})}function Jv(){chrome.contextMenus.onClicked.addListener((e,t)=>{if(e.menuItemId!==rc)return;const r=t?.id,n=t?.windowId,i=t?.url??t?.pendingUrl??e.pageUrl,a=e.frameUrl??e.pageUrl??i;r==null||n==null||i==null||a==null||ic(n,r,"context_menu",{createdAtMs:Date.now(),kind:"selection",selectedText:e.selectionText??"",tabId:r,tabUrl:i,url:a})})}function Xv(){if(tc)return;const e=chrome.sidePanel;e!=null&&(e.onOpened?.addListener(t=>{cr(t.windowId,!0,t.path,t.tabId).catch(()=>{})}),e.onClosed?.addListener(t=>{cr(t.windowId,!1,t.path,t.tabId).catch(()=>{})}),tc=!0)}async function ac(e,t){const r=e?.windowId??(await chrome.windows.getCurrent()).id;if(r==null)throw new Error(`Unable to find the current ${ew()} window`);const n=chrome.sidePanel;if(n==null||typeof n.open!="function")return;if(oc(r,e?.id)&&typeof n.close=="function"){const o=e?.id,l=o!=null&&kt.get(r)?.has(o)===!0?{tabId:o}:{windowId:r};try{await n.close(l)}finally{await cr(r,!1,void 0,"tabId"in l?l.tabId:void 0)}return}const i=or().kind==="work_sidepanel"?e?.id:void 0,a=i==null?Promise.resolve():Kl(i);Wl(r);const s=n.open(i==null?{windowId:r}:{tabId:i});try{await Promise.all([a,s])}catch(o){throw i!=null&&await _a(i,!1).catch(()=>{}),await va(r,!1).catch(()=>{}),o}Ea(t,sc(await cr(r,!0,void 0,i)))}function sc(e){return e.kind==="work_sidepanel"?"work_sidepanel":"waiting_room"}function Ea(e,t){zn(Vv,1,{destination:t,source:e}).catch(()=>{console.warn("Failed to report Chrome extension sidechat open.")})}function Yv(){return chrome.storage.session.set({[$l]:[...bn]})}async function cr(e,t,r,n){n!=null&&(r==="codex-work-sidepanel.html"||or().kind==="work_sidepanel")&&await _a(n,t),Qv(e,t,n);const i=await va(e,bn.has(e),r,n);return await Yv().catch(()=>{}),t&&await Ov().catch(()=>{}),i}function Qv(e,t,r){if(r==null)t?yn.add(e):yn.delete(e);else{const n=kt.get(e)??new Set;t?(n.add(r),kt.set(e,n)):(n.delete(r),n.size===0&&kt.delete(e))}yn.has(e)||kt.has(e)?bn.add(e):bn.delete(e)}function oc(e,t){return yn.has(e)||t!=null&&kt.get(e)?.has(t)===!0}function ew(){return Te[Ot(navigator.userAgent,"brave"in navigator)].shortDisplayName}function tw(e){return e!=null&&typeof e=="object"}var Ia="codexToolbarStateLastSnapshot",rw="codex_chrome_extension_toolbar_state",Aa="codex-toolbar-state-alarm",lc=1440*60*1e3,cc=Promise.resolve();function nw(){chrome.browserAction.onUserSettingsChanged?.addListener(({isOnToolbar:e})=>{e!=null&&Sn("changed",e)}),chrome.alarms.onAlarm.addListener(({name:e})=>{e===Aa&&Sn("alarm")}),chrome.alarms.get(Aa).then(e=>{if(!e)return chrome.alarms.create(Aa,{periodInMinutes:360})}).catch(()=>{console.warn("Failed to schedule Chrome extension toolbar state.")})}function Sn(e,t){cc=cc.then(()=>iw(e,t)).catch(()=>{console.warn("Failed to report Chrome extension toolbar state.")})}async function iw(e,t){const r=Date.now(),n=(await chrome.storage.local.get([Ia]))[Ia];typeof n=="number"&&(e==="update"||(e==="startup"||e==="alarm")&&Math.floor(n/lc)===Math.floor(r/lc))||(await zn(rw,t??(await chrome.browserAction.getUserSettings()).isOnToolbar?1:0,{trigger:e}),e!=="changed"&&await chrome.storage.local.set({[Ia]:r}))}function aw({buildChannel:e,sidePanelEnabled:t,browserPluginInstallation:r}){const n=o=>{xv(o).catch(()=>{}),t&&((o.reason==="install"||o.reason==="update")&&Sn(o.reason),Zv())},i=()=>{r.refresh(),t&&Sn("startup")},a=o=>{if(o.frameId===0&&new URL(o.url).origin==="https://chatgpt.com"){const l=hs();r.refresh(l),Vn(l).catch(()=>{})}},s=()=>r.refresh();return self.addEventListener("activate",s),chrome.runtime.onInstalled.addListener(n),chrome.runtime.onStartup.addListener(i),chrome.webNavigation.onCompleted.addListener(a,{url:[{hostEquals:new URL(qn).hostname}]}),Fl(e,!1).catch(()=>{}),()=>{self.removeEventListener("activate",s),chrome.runtime.onInstalled.removeListener(n),chrome.runtime.onStartup.removeListener(i),chrome.webNavigation.onCompleted.removeListener(a),r.stop()}}var Ca="client-heartbeat-alarm";async function sw(...e){await chrome.alarms.get(Ca)||await chrome.alarms.create(Ca,{periodInMinutes:.5}),chrome.alarms.onAlarm.addListener(async t=>{if(t.name!==Ca)return;ze.getInstance().reconcileRequestHeaders().catch(()=>{console.error("Failed to read tab leases for request-header reconciliation.")});try{const n=new Promise(i=>setTimeout(()=>i(!1),3e3));if(await Promise.any([n,...e.map(i=>i())]))return}catch{}await he.stopActiveSessions();if(chrome.debugger==null)return;const r=await chrome.debugger.getTargets();await Promise.allSettled(r.filter(n=>typeof n.tabId=="number").map(n=>chrome.debugger.detach({tabId:n.tabId}).catch(()=>{})))})}var uc={matches:["<all_urls>"],runAt:"document_start",world:"MAIN"},ow={...uc,world:"ISOLATED"},dc=[{...uc,id:"codex-webmcp",js:["content-scripts/webmcp.js"],persistAcrossSessions:!1},{...ow,id:"codex-webmcp-bridge",js:["content-scripts/webmcp-bridge.js"],persistAcrossSessions:!1}];async function hc(e){const t=await chrome.scripting.getRegisteredContentScripts({ids:dc.map(({id:i})=>i)});if(!e){t.length>0&&await chrome.scripting.unregisterContentScripts({ids:t.map(({id:i})=>i)});return}const r=new Set(t.map(({id:i})=>i)),n=dc.filter(({id:i})=>!r.has(i));n.length>0&&await chrome.scripting.registerContentScripts(n)}var lw="codex-app-webmcp";function cw(){let e,t,r=Promise.resolve();const n=a=>(t=a,r=r.then(async()=>{if(!(a!==t||a===e)){e=void 0;try{await hc(a),e=a}catch{try{await hc(!1),e=!1}catch{}console.warn("Failed to apply Chrome extension WebMCP gate.")}}}),r),i=Rr(lw,a=>{n(a)}).catch(()=>n(!1));return{async enabled(){await i;let a;do a=r,await a;while(a!==r);return t===!0&&e===!0}}}var lT="CODEX_WORK_SIDE_PANEL_LOAD_EVENT";function uw(e){if(typeof e!="object"||e==null)return!1;const t=e;return t.type==="CODEX_WORK_SIDE_PANEL_LOAD_EVENT"&&(t.event==="timeout"||t.event==="ready"||t.event==="retry"||t.event==="open_chatgpt")&&typeof t.attempt=="number"&&Number.isSafeInteger(t.attempt)&&t.attempt>=0&&typeof t.elapsedMs=="number"&&Number.isSafeInteger(t.elapsedMs)&&t.elapsedMs>=0&&typeof t.timedOut=="boolean"}function dw(e,t,r){return uw(e)?t.id!==chrome.runtime.id||t.url!==chrome.runtime.getURL("codex-work-sidepanel.html")?(r(),!0):(zn("codex_chrome_extension_work_sidepanel_load",e.event,{attempt:String(e.attempt),elapsed_ms:String(e.elapsedMs),timed_out:String(e.timedOut),extension_id:chrome.runtime.id,chromium_major:/(?:Chrome|Chromium)\/(\d+)/.exec(navigator.userAgent)?.[1]??"unknown"}).then(r,r),!0):!1}var cT="CODEX_WORK_SIDE_PANEL_AUTH_OPEN",hw="CODEX_WORK_SIDE_PANEL_AUTH_REVALIDATE",uT="CODEX_WORK_SIDE_PANEL_AUTH_STATE";function fc(e){if(typeof e!="object"||e==null)return!1;const t=e;return t.type==="CODEX_WORK_SIDE_PANEL_AUTH_OPEN"&&(t.action==="login"||t.action==="logout"||t.action==="open")&&mt(t.ownerTabId)&&mt(t.ownerWindowId)}function pc(e){if(typeof e!="object"||e==null)return!1;const t=e;return t.type==="CODEX_WORK_SIDE_PANEL_AUTH_STATE"&&(t.state==="signed_in"||t.state==="signed_out")&&mt(t.ownerTabId)&&mt(t.ownerWindowId)}function mt(e){return typeof e=="number"&&Number.isSafeInteger(e)&&e>=0}var ka="codexWorkSidePanelAuthOperations",fw=600*1e3;function pw(e,t){if(e==null)return()=>!1;const r=new URL(e).origin,n=chrome.runtime.getURL(ct);let i=Promise.resolve();const a=h=>{const m=i.then(h,h);return i=m.then(()=>{},()=>{}),m},s=async()=>{const h=(await chrome.storage.session.get(ka))[ka];return typeof h=="object"&&h!=null&&!Array.isArray(h)?Object.fromEntries(Object.entries(h).filter(([,m])=>gw(m))):{}},o=h=>chrome.storage.session.set({[ka]:h}),l=async h=>{if((await chrome.tabs.get(h.ownerTabId)).windowId!==h.ownerWindowId)return;await chrome.tabs.update(h.ownerTabId,{active:!0}),await chrome.windows.update(h.ownerWindowId,{focused:!0});const m={ownerTabId:h.ownerTabId,type:hw};await chrome.runtime.sendMessage(m).catch(()=>{})};return chrome.tabs.onUpdated.addListener((h,m,d)=>{const f=d.url;m.status!=="complete"||f==null||a(async()=>{const c=await s(),p=Object.values(c).find(g=>g.authTabId===h);if(p==null)return;if(p.expiresAt<=Date.now()){Reflect.deleteProperty(c,String(p.ownerTabId)),await o(c);return}let u;try{u=new URL(f)}catch{return}u.origin!==r||u.pathname.startsWith("/auth/")&&!(p.action==="logout"&&(u.pathname==="/auth/login"||u.pathname==="/auth/login/"))||await l(p).catch(()=>{})}).catch(()=>{})}),chrome.tabs.onRemoved.addListener(h=>{a(async()=>{const m=await s(),d=Object.values(m).find(f=>f.authTabId===h||f.ownerTabId===h);d!=null&&(Reflect.deleteProperty(m,String(d.ownerTabId)),await o(m),d.authTabId===h&&await l(d).catch(()=>{}))}).catch(()=>{})}),(h,m,d)=>!fc(h)&&!pc(h)?!1:m.id!==chrome.runtime.id||m.url!==n?(d({ok:!1}),!1):(pc(h)&&t?.(),a(async()=>{if(fc(h))await mw({getOperations:s,message:h,setOperations:o,workOrigin:r});else{const f=await s(),c=f[String(h.ownerTabId)];if(c==null||c.ownerWindowId!==h.ownerWindowId||c.expiresAt<=Date.now()||h.state!==(c.action==="logout"?"signed_out":"signed_in"))throw new Error("Work side-panel authentication is not complete");Reflect.deleteProperty(f,String(c.ownerTabId)),await o(f),await chrome.tabs.remove(c.authTabId).catch(()=>{})}d({ok:!0})}).catch(()=>d({ok:!1})),!0)}async function mw({getOperations:e,message:t,setOperations:r,workOrigin:n}){if((await chrome.tabs.get(t.ownerTabId)).windowId!==t.ownerWindowId)throw new Error("Work side panel no longer owns its browser tab");const i=await e(),a=i[String(t.ownerTabId)];if(a!=null&&(a.action===t.action||t.action==="open")&&a.ownerWindowId===t.ownerWindowId&&a.expiresAt>Date.now())try{if((await chrome.tabs.get(a.authTabId)).windowId===t.ownerWindowId){await chrome.tabs.update(a.authTabId,{active:!0}),await chrome.windows.update(t.ownerWindowId,{focused:!0});return}}catch{}const s=new URL(t.action==="open"?"/":t.action==="logout"?"/auth/logout":"/auth/login",n);t.action==="login"&&s.searchParams.set("next","/");const o=await chrome.tabs.create({active:!0,openerTabId:t.ownerTabId,url:s.href,windowId:t.ownerWindowId});if(o.id==null)throw new Error("The authentication tab has no browser tab identifier");i[String(t.ownerTabId)]={action:t.action,authTabId:o.id,expiresAt:Date.now()+fw,ownerTabId:t.ownerTabId,ownerWindowId:t.ownerWindowId},await r(i)}function gw(e){if(typeof e!="object"||e==null)return!1;const t=e;return(t.action==="login"||t.action==="logout"||t.action==="open")&&mt(t.authTabId)&&typeof t.expiresAt=="number"&&Number.isFinite(t.expiresAt)&&mt(t.ownerTabId)&&mt(t.ownerWindowId)}function _w(e,t){return vw(e)?ww(e)?(ie(yw(e)).then(r=>t({didSeek:r??!1,ok:!0})).catch(()=>t({error:"Unable to seek the YouTube video",ok:!1})),!0):(t({error:"Invalid YouTube timestamp request",ok:!1}),!0):!1}function vw(e){return mc(e)&&e.type==="seek_youtube_timestamp"}function ww(e){return mc(e)&&Object.keys(e).length===5&&e.type==="seek_youtube_timestamp"&&typeof e.tabId=="number"&&Number.isSafeInteger(e.tabId)&&e.tabId>=0&&typeof e.videoId=="string"&&xn.test(e.videoId)&&typeof e.timestampSeconds=="number"&&Number.isFinite(e.timestampSeconds)&&e.timestampSeconds>=0&&e.timestampSeconds<=604800&&typeof e.windowId=="number"&&Number.isSafeInteger(e.windowId)&&e.windowId>=0}function mc(e){return typeof e=="object"&&e!=null&&!Array.isArray(e)}function bw(e,t){let r=null;try{const i=new URL(window.location.href);if(i.protocol!=="https:"||i.username!==""||i.password!==""||i.port!=="")return!1;if(i.hostname==="youtube.com"||i.hostname==="www.youtube.com"||i.hostname==="m.youtube.com")if(i.pathname==="/watch"){const a=i.searchParams.getAll("v");r=a.length===1?a[0]??null:null}else{const a=i.pathname.split("/").filter(Boolean);a.length===2&&a[0]==="shorts"&&(r=a[1]??null)}else if(i.hostname==="youtu.be"){const a=i.pathname.split("/").filter(Boolean);a.length===1&&(r=a[0]??null)}}catch{return!1}if(r!==t)return!1;const n=document.querySelector("video");if(!(n instanceof HTMLVideoElement))return!1;try{return n.currentTime=e,!0}catch{return!1}}async function yw({tabId:e,timestampSeconds:t,videoId:r,windowId:n}){const i=await chrome.tabs.get(e);if(i.windowId!==n||i.url==null||qc(i.url)!==r)return!1;const[a]=await chrome.scripting.executeScript({args:[t,r],func:bw,target:{tabId:e}});return a?.result===!0}var Sw={dev:vr.dev,internal:vr.internal,prod:vr.production},Tw="codex-app-chrome-extension-background-popups",Ew="codex-app-chrome-extension-browser-management",Iw="chrome-standalone-js-kernel";function Aw(e){const t=Sw[e];return e==="prod"&&Ot(navigator.userAgent)==="edge"?[t,vr.internal]:[t]}async function Cw(){const e=Er("prod"),t=Aw(e),r=ah(),n=mv(()=>Fl(e,!0));kv("").catch(()=>{});const i=new Pv(()=>he.isBrowserControlActive()),a=new Map;let s=null;const o=()=>{if(s==null)return;const v=s,S=()=>{kw(v,chrome.runtime);for(const{browser:y}of a.values())y.sendBrowserTabMentionsInvalidated()};Qg(S),l.subscribeInvalidations(S)},l=new ol(e,Ji.getInstance(),o),h=new C_({buildChannel:e,browserTabMentionProvider:l,webMcpConfig:cw(),browserManagementEnabled:wt(Ew).catch(()=>!1),agentPopupInterceptorEnabled:wt(Tw).catch(()=>!1)}),m=new AbortController,d=()=>{m.signal.aborted||(m.abort(),Pd((v,S,y)=>{const T=new Qn(v);a.set(v,{browser:new Ga(S,h),control:new Ad(y,T),controlImpl:T})},v=>{a.delete(v)}),th(async(v,S)=>{const y=a.get(v);if(y==null){await h.turnEnded(S);return}try{await y.control.sendTurnEnded(S)}catch(T){throw await h.turnEnded(S),T}}).catch(eh))};Rr(Iw,v=>{safariTunnelState.kernelGate=v===!0;v&&d()},m.signal).catch(()=>{console.warn("Failed to observe Chrome extension kernel gate.")}),i.register(),he.setBrowserControlActivityChangeHandler(v=>{v||i.maybeReloadForPendingUpdate().catch(()=>{})});const f=new av(t);globalThis.ChatGPTSafariNativeManager=f;globalThis.ChatGPTSafariHooks={getInstanceId:Ce,getTabMentions:v=>l.getUserTabs(v)};if(r){nw(),Hv();const v=Uv()}const c=r?pw("https://chatgpt.com/?surface=browser_side_chat",()=>{n.refresh(),wt(Ws).catch(()=>{})}):()=>!1,p=new Ga(f,h),u=v=>{for(const{browser:S}of a.values())v(S);v(p)};s=p;const g=ze.getInstance();g.ensureInit().catch(()=>{console.error("Failed to restore tab leases for request-header reconciliation.")}),chrome.runtime.onConnect.addListener(v=>{ov(l,e,v),Mv(f,chrome.runtime.getManifest().version,e,v)}),chrome.runtime.onMessage.addListener((v,S,y)=>{if(Lv(v,S,y))return!0;if(v?.type==="BROWSER_SETTINGS_UPDATED")return Qt(S,e)?(Promise.allSettled([...a.values()].map(({controlImpl:T})=>Qn.refreshBrowserSettings(T))).then(T=>y({ok:T.every(E=>E.status==="fulfilled")})),!0):!1;if(c(v,S,y))return!0;if(tg(v)){const T=S.tab?.id;return typeof T!="number"?!1:(h.handleAgentBackgroundPopup(T,v.url).then(()=>y({ok:!0})).catch(()=>y({ok:!1})),!0)}if(v?.type==="codex:page-event"&&Uc(v.event)){const T=S.tab?.id;return typeof T=="number"&&Number.isInteger(T)&&g.getActiveLease(T).then(E=>{E!=null&&u(I=>{I.sendPageEvent({...v.event,session_id:E.sessionId,tabId:T})})}).catch(()=>{}),!1}return xl(l,e,v,S,y)||_w(v,y)?!0:vv(v,S,e)?(y({ok:!0}),!1):dw(v,S,y)?!0:Kv(v,S,e)?(y({ok:!0}),!1):Rw(h,v,S,y)}),chrome.debugger?.onDetach?.addListener(v=>{u(S=>S.sendCdpDetach(v))}),chrome.debugger?.onEvent?.addListener((v,S,y)=>{u(T=>{T.sendCdpEvent({source:v,method:S,params:y})})}),h.addDownloadChangeListener(v=>{u(S=>S.sendDownloadChange(v))}),chrome.downloads?.onCreated?.addListener(v=>{h.handleDownloadCreated(v)}),Ce().catch(()=>{}),chrome.downloads?.onChanged?.addListener(v=>{h.handleDownloadChanged(v)}),chrome.webNavigation.onCreatedNavigationTarget?.addListener(v=>{h.handleCreatedNavigationTarget(v).catch(()=>{})});const w=aw({buildChannel:e,sidePanelEnabled:r,browserPluginInstallation:n});await nn.initialize(),await sw(()=>p.ping(),()=>Promise.any(Array.from(a.values(),({browser:v})=>v.ping())))}function kw(e,t){e.sendBrowserTabMentionsInvalidated(),t.sendMessage({type:Ic}).catch(()=>{})}function Rw(e,t,r,n){const i=r.tab?.id;switch(t?.type){case"GET_AGENT_CURSOR_STATE":return typeof i!="number"?(n({ok:!0,state:he.readCursorOverlayState(-1)}),!0):(n({ok:!0,state:he.readCursorOverlayState(i)}),!0);case"AGENT_CURSOR_ARRIVED":return typeof i!="number"||!("sessionId"in t)||!("turnId"in t)||!("moveSequence"in t)||typeof t.sessionId!="string"||typeof t.turnId!="string"||!Number.isInteger(t.moveSequence)?(n({ok:!1}),!0):(e.notifyCursorArrived({moveSequence:t.moveSequence,sessionId:t.sessionId,turnId:t.turnId}),n({ok:!0}),!0);default:return!1}}function Ow(e){return e==null||typeof e=="function"?{main:e}:e}var Pw=Ow(()=>{Cw()});function dT(){}var hT=globalThis.browser?.runtime?.id?globalThis.browser:globalThis.chrome,gc=class{constructor(e){if(e==="<all_urls>")this.isAllUrls=!0,this.protocolMatches=[...gc.PROTOCOLS],this.hostnameMatch="*",this.pathnameMatch="*";else{const t=/(.*):\/\/(.*?)(\/.*)/.exec(e);if(t==null)throw new Tn(e,"Incorrect format");const[r,n,i,a]=t;Mw(e,n),Lw(e,i),this.protocolMatches=n==="*"?["http","https"]:[n],this.hostnameMatch=i,this.pathnameMatch=a}}includes(e){if(this.isAllUrls)return!0;const t=typeof e=="string"?new URL(e):e instanceof Location?new URL(e.href):e;return!!this.protocolMatches.find(r=>{if(r==="http")return this.isHttpMatch(t);if(r==="https")return this.isHttpsMatch(t);if(r==="file")return this.isFileMatch(t);if(r==="ftp")return this.isFtpMatch(t);if(r==="urn")return this.isUrnMatch(t)})}isHttpMatch(e){return e.protocol==="http:"&&this.isHostPathMatch(e)}isHttpsMatch(e){return e.protocol==="https:"&&this.isHostPathMatch(e)}isHostPathMatch(e){if(!this.hostnameMatch||!this.pathnameMatch)return!1;const t=[this.convertPatternToRegex(this.hostnameMatch),this.convertPatternToRegex(this.hostnameMatch.replace(/^\*\./,""))],r=this.convertPatternToRegex(this.pathnameMatch);return!!t.find(n=>n.test(e.hostname))&&r.test(e.pathname)}isFileMatch(e){throw Error("Not implemented: file:// pattern matching. Open a PR to add support")}isFtpMatch(e){throw Error("Not implemented: ftp:// pattern matching. Open a PR to add support")}isUrnMatch(e){throw Error("Not implemented: urn:// pattern matching. Open a PR to add support")}convertPatternToRegex(e){const t=this.escapeForRegex(e).replace(/\\\*/g,".*");return RegExp(`^${t}$`)}escapeForRegex(e){return e.replace(/[.*+?^${}()|[\]\\]/g,"\\$&")}},Ra=gc;Ra.PROTOCOLS=["http","https","file","ftp","urn"];var Tn=class extends Error{constructor(e,t){super(`Invalid match pattern "${e}": ${t}`)}};function Mw(e,t){if(!Ra.PROTOCOLS.includes(t)&&t!=="*")throw new Tn(e,`${t} not a valid protocol (${Ra.PROTOCOLS.join(", ")})`)}function Lw(e,t){if(t.includes(":"))throw new Tn(e,"Hostname cannot include a port");if(t.includes("*")&&t.length>1&&!t.startsWith("*."))throw new Tn(e,"If using a wildcard (*), it must go at the start of the hostname")}function fT(e,t){}function En(e,...t){}var Dw={debug:(...e)=>En(console.debug,...e),log:(...e)=>En(console.log,...e),warn:(...e)=>En(console.warn,...e),error:(...e)=>En(console.error,...e)},Oa;try{Oa=Pw.main(),Oa instanceof Promise&&console.warn("The background's main() function return a promise, but it must be synchronous")}catch(e){throw Dw.error("The background crashed on startup!"),e}var xw=Oa;return xw})();
+`)}var ym=Wt({capability:wm,info:Ao}),Sm=[Up,Tp,Xp,_m,ym],QS=Tm(Sm);function Tm(e){return new Map(e.map(t=>[t.id,t.create]))}var Co=We({PayloadSchema:()=>Kt,ResultSchema:()=>Oi,commandType:()=>Yr,create:()=>ko}),Yr="browser_management_call",Kt=b({args:N(xe()),browser_id:_(),method:_(),namespace:_()}),Oi=b({value:xe()});function ko(e){return new K(Yr,Kt,e)}var Ro=We({AuditChangeSchema:()=>Oo,PayloadSchema:()=>Pi,ResultSchema:()=>Mi,commandType:()=>Qr,create:()=>Po}),Qr="browser_management_get_audit_trail",Pi=Kt.pick({browser_id:!0}),Oo=Kt.omit({browser_id:!0}).extend({before:b({bookmarks:N(b({id:_(),index:k().optional(),parentId:_().optional(),title:_(),url:_().optional()})),tabLayout:b({groups:N(b({collapsed:J(),color:_(),id:k(),title:_().optional(),windowId:k()})),tabs:N(b({autoDiscardable:J(),groupId:k(),id:k(),index:k(),pinned:J(),url:_().optional(),windowId:k()}))}),windows:N(b({focused:J(),height:k().optional(),id:k(),left:k().optional(),state:_().optional(),top:k().optional(),width:k().optional()}))}).partial(),createdAt:k(),result:io([k(),b({id:_()})]).optional()}),Mi=b({changes:N(Oo)});function Po(e){return new K(Qr,Pi,e)}var Em=We({Call:()=>Co,GetAuditTrail:()=>Ro,commands:()=>Im}),Im={[Yr]:Co,[Qr]:Ro},Am={id:"management",description:"Organize windows, tabs, tab groups, and bookmarks. Use only for user-requested browser organization."},Cm=class extends Ci{constructor({browserId:e,documentation:t,info:r,transport:n}){super(n,e,t,r),this.windows=this.createNamespace("windows"),this.tabs=this.createNamespace("tabs"),this.tabGroups=this.createNamespace("tabGroups"),this.bookmarks=this.createNamespace("bookmarks")}async getAuditTrail(){const e=await this.transport.send({command:Po({browser_id:this.browserId})});return Mi.parse(e)}async invoke(e,t,...r){const n=await this.transport.send({command:ko({args:r,browser_id:this.browserId,method:t,namespace:e})});return Oi.parse(n).value}createNamespace(e){return new Proxy({},{get:(t,r)=>{if(!(typeof r!="string"||r==="then"||r==="toJSON"||r in Object.prototype))return(...n)=>this.invoke(e,r,...n)}})}},Mo=ki({capability:Cm,info:Am}),km=We({PayloadSchema:()=>Lo,ResultSchema:()=>Do,commandType:()=>Li,create:()=>xo}),Li="browser_visibility_get",Lo=b({browser_id:_()}),Do=b({visible:J()});function xo(e){return new K(Li,Lo,e)}var Rm=We({PayloadSchema:()=>No,ResultSchema:()=>Uo,commandType:()=>Di,create:()=>Fo}),Di="browser_visibility_set",No=b({browser_id:_(),visible:J()}),Uo=b({});function Fo(e){return new K(Di,No,e)}var eT={[Li]:km,[Di]:Rm},Om={id:"visibility",description:"Use to show or hide the browser to the user, and to determine the browser's current visibility. Keep browser work in the background unless the user asks to see it or live viewing is useful. When the browser should be visible, call set(true)."},Pm=class extends Ci{constructor({browserId:e,documentation:t,info:r,transport:n}){super(n,e,t,r)}async set(e){const t=await this.transport.send({command:Fo({browser_id:this.browserId,visible:e})});Uo.parse(t)}async get(){const e=await this.transport.send({command:xo({browser_id:this.browserId})});return Do.parse(e).visible}},Mm=ki({capability:Pm,info:Om}),Bo=We({PayloadSchema:()=>xi,ResultSchema:()=>Ni,commandType:()=>en,create:()=>$o}),en="browser_viewport_reset",xi=b({browser_id:_()}),Ni=b({});function $o(e){return new K(en,xi,e)}var jo=We({PayloadSchema:()=>Ui,ResultSchema:()=>Fi,commandType:()=>tn,create:()=>qo}),tn="browser_viewport_set",Ui=b({browser_id:_(),height:k().int().positive(),width:k().int().positive()}),Fi=b({});function qo(e){return new K(tn,Ui,e)}var Lm=We({Reset:()=>Bo,Set:()=>jo,commands:()=>Dm}),Dm={[en]:Bo,[tn]:jo},xm={id:"viewport",description:"Controls an explicit browser viewport override for responsive or device-size testing. Use it when a task calls for specific dimensions or breakpoint validation; otherwise leave it unset so the browser uses its normal viewport. Reset temporary overrides before finishing unless the user asked to keep them."},Nm=class extends Ci{constructor({browserId:e,documentation:t,info:r,transport:n}){super(n,e,t,r)}async set(e){const t=await this.transport.send({command:qo({browser_id:this.browserId,...e})});Fi.parse(t)}async reset(){const e=await this.transport.send({command:$o({browser_id:this.browserId})});Ni.parse(e)}},Go=ki({capability:Nm,info:xm}),Um=[Mo,Mm,Go],tT=Fm(Um);function Fm(e){return new Map(e.map(t=>[t.id,t.create]))}var rT=b({side_effects:N(_())}).passthrough();async function Bm({expectedUrl:e,read:t,tabId:r}){const n=new URL(e);if(n.protocol!=="https:"&&n.protocol!=="http:")throw new Error("Tab reads require an HTTP or HTTPS URL");const i=await chrome.tabs.get(r);if(i.incognito===!0||i.url!==e)throw new Error(it);const a=await Zu(e,t,async(o,l,h)=>{const[m]=await chrome.scripting.executeScript({args:l,func:o,target:{tabId:r},world:h});return m?.result}),s=await chrome.tabs.get(r);if(s.incognito===!0||s.url!==e)throw new Error(it);return a??null}var Bi=new Map,$m=1e3;async function zo(e){if(await $i(e))return!0;let t=Bi.get(e);return t||(t=jm(e),Bi.set(e,t),t.finally(()=>{Bi.delete(e)})),await t}async function $i(e){try{return(await ie(chrome.tabs.sendMessage(e,{type:"CONTENT_PING"})))?.ok===!0}catch{return!1}}async function ie(e,t=$m){let r;const n=new Promise(i=>{r=setTimeout(()=>i(null),t)});try{return await Promise.race([e,n])}finally{r!==void 0&&clearTimeout(r)}}async function jm(e){try{if(await ie(chrome.scripting.executeScript({files:["content-scripts/codex.js"],injectImmediately:!0,target:{tabId:e}}))==null)return!1}catch{return!1}return await $i(e)}var ji=1e6,qm=ji+4999,Gm=class{appliedRules;failureReported=!1;async synchronize(e,t=!1){const r=chrome.declarativeNetRequest;let n="check DNR permission";try{if(r==null){if(e.size>0)throw new Error("The declarativeNetRequest permission is missing");return null}let i;t&&e.size>0&&(n="query existing tabs",i=new Set((await chrome.tabs.query({})).map(l=>l.id)));const a=new Map;for(const[l,h]of e){if(!Number.isSafeInteger(l)||l<0||i!=null&&!i.has(l))continue;const m=a.get(h);m?m.push(l):a.set(h,[l])}const s=[];for(const[l,h]of[...a].sort(([m],[d])=>m.localeCompare(d)))h.sort((m,d)=>m-d),s.push(...[{tabIds:h,resourceTypes:[r.ResourceType.MAIN_FRAME,r.ResourceType.SUB_FRAME,r.ResourceType.OBJECT]},{tabIds:h,excludedInitiatorDomains:[chrome.runtime.id],excludedResourceTypes:[r.ResourceType.MAIN_FRAME,r.ResourceType.SUB_FRAME,r.ResourceType.OBJECT]}].map((m,d)=>({id:ji+s.length+d,priority:1,action:{type:r.RuleActionType.MODIFY_HEADERS,requestHeaders:[{header:"x-browser-agent",value:`ChatGPT/${l}`,operation:r.HeaderOperation.SET}]},condition:m})));const o=JSON.stringify(s);return!t&&this.appliedRules===o||(n=s.length===0?"remove session rules":"update session rules",await r.updateSessionRules({removeRuleIds:await this.readOwnedRuleIds(),addRules:s}),this.appliedRules=o,this.failureReported=!1),null}catch{return this.appliedRules=void 0,this.failureReported||(console.error("Controlled-tab request headers failed. Check the DNR permission. Retrying on the next lease change or heartbeat.",{operation:n}),this.failureReported=!0),new Error(`Unable to ${n} for agent request headers. Retry the browser command.`)}}async readOwnedRuleIds(){return(await chrome.declarativeNetRequest.getSessionRules()).filter(({id:e})=>e>=ji&&e<=qm).map(({id:e})=>e)}};function zm(e){return e==="agent"||e==="user"}function Vm(e){return e==="active"||e==="handoff"}function Hm(e){return e==="handoff"||e==="deliverable"}function Vo(e){if(e===null)return null;if(!e||typeof e!="object")return;const t=e;if(!(typeof t.width!="number"||!Number.isInteger(t.width)||t.width<=0||typeof t.height!="number"||!Number.isInteger(t.height)||t.height<=0))return{height:t.height,width:t.width}}function Wm(e){if(!e||typeof e!="object")return null;const t=e;if(typeof t.tabId!="number"||!Number.isInteger(t.tabId)||typeof t.sessionId!="string"||typeof t.turnId!="string"||!zm(t.origin)||typeof t.claimedAt!="number"||!Number.isFinite(t.claimedAt)||t.instanceId!==null&&typeof t.instanceId!="string"||!Vm(t.state))return null;const r=Vo(t.viewportSize);return{tabId:t.tabId,sessionId:t.sessionId,turnId:t.turnId,origin:t.origin,claimedAt:t.claimedAt,instanceId:t.instanceId,state:t.state,requestHeaderEnabled:typeof t.requestHeaderEnabled=="boolean"?t.requestHeaderEnabled:void 0,...Hm(t.mark)?{mark:t.mark}:{},...typeof t.isActiveHandoff=="boolean"?{isActiveHandoff:t.isActiveHandoff}:{},...r!==void 0?{viewportSize:r}:{}}}function Km(e){if(!e||typeof e!="object"||!("leases"in e)||!e.leases||typeof e.leases!="object"||Array.isArray(e.leases))return new Map;const t=new Map;for(const[r,n]of Object.entries(e.leases)){const i=Number(r),a=Wm(n);!Number.isInteger(i)||a==null||a.tabId!==i||t.set(i,a)}return t}function Zm(e){if(!e||typeof e!="object"||!("pendingViewportSizes"in e)||!e.pendingViewportSizes||typeof e.pendingViewportSizes!="object"||Array.isArray(e.pendingViewportSizes))return new Map;const t=new Map;for(const[r,n]of Object.entries(e.pendingViewportSizes)){if(!n||typeof n!="object")continue;const i=n,a=Vo(i.viewportSize);typeof i.turnId!="string"||a===void 0||t.set(r,{turnId:i.turnId,viewportSize:a})}return t}function Jm(e,t){return e!=null&&e.tabId===t.tabId&&e.sessionId===t.sessionId&&e.turnId===t.turnId&&e.origin===t.origin&&e.claimedAt===t.claimedAt&&e.instanceId===t.instanceId&&e.state===t.state&&e.isActiveHandoff===t.isActiveHandoff}var ze=class mr{static instance=null;leases=new Map;pendingViewportSizes=new Map;storageKey="TAB_LEASES";storage;requestHeaders=new Gm;initializePromise=null;mutationQueue=Promise.resolve();storageLoaded=!1;listenersRegistered=!1;activeTabLeaseChangeHandlers=new Set;handleTabRemoved=t=>{this.removeTab(t)};handleTabReplaced=(t,r)=>{this.replaceTab(t,r)};static getInstance(){return mr.instance||(mr.instance=new mr),mr.instance}constructor(t=chrome.storage.session){this.storage=t,this.registerEventListeners()}async ensureInit(){this.initializePromise||(this.initializePromise=this.loadFromStorage()),await this.initializePromise}async reconcileRequestHeaders(){await this.ensureInit();const t=await this.mutate(()=>!1,!0);if(t!=null)throw t}async getOwningSessionId(t){await this.ensureInit(),await this.waitForPendingMutations();const r=this.leases.get(t);return r?.state==="active"?r.sessionId:null}async getActiveLease(t){await this.ensureInit(),await this.waitForPendingMutations();const r=this.leases.get(t);return r?.state==="active"?{...r}:null}async claimTabIfSourceLeaseMatches(t,r){await this.ensureInit();const n=await Ce();let i=!1,a;const s=await this.mutate(()=>{const o=this.leases.get(t.tabId);return t.state!=="active"||o==null||!Jm(o,t)||this.leases.has(r)?!1:(a=o.requestHeaderEnabled,this.leases.set(r,{tabId:r,sessionId:t.sessionId,turnId:t.turnId,origin:"agent",claimedAt:Date.now(),instanceId:n,state:"active",requestHeaderEnabled:a,...Object.hasOwn(o,"viewportSize")?{viewportSize:o.viewportSize}:{}}),i=!0,!0)});if(s!=null&&a!==void 0)throw s;return i}subscribeActiveTabLeaseChanges(t){return this.activeTabLeaseChangeHandlers.add(t),()=>{this.activeTabLeaseChangeHandlers.delete(t)}}mightHaveActiveTabLease(t){return!this.storageLoaded||this.leases.get(t)?.state==="active"}async claimTab(t,r,n,i,a){await this.ensureInit();const s=await Ce(),o=await this.mutate(()=>{const l=this.leases.get(n);if(l?.state==="active"){if(l.sessionId!==t)throw new Error(`Tab ${n} is already part of browser session ${l.sessionId}`);return l.turnId===r&&l.instanceId===s?!1:(this.leases.set(n,{...l,turnId:r,instanceId:s}),!0)}return this.leases.set(n,{tabId:n,sessionId:t,turnId:r,origin:i,claimedAt:Date.now(),instanceId:s,state:"active",requestHeaderEnabled:a}),!0});if(o!=null&&a!==void 0)throw o}async setSessionRequestHeaderEnabled(t,r){await this.ensureInit();const n=await this.mutate(()=>{let i=!1;for(const[a,s]of this.leases)s.sessionId!==t||s.requestHeaderEnabled===r||(this.leases.set(a,{...s,requestHeaderEnabled:r}),i=!0);return i});if(n!=null)throw n}async isClaimedBySession(t,r){await this.ensureInit(),await this.waitForPendingMutations();const n=this.leases.get(r);return n?.state==="active"&&n.sessionId===t}async getSessionActiveLeases(t){return await this.getSessionLeases(t,"active")}async getSessionHandoffLeases(t){return await this.getSessionLeases(t,"handoff")}async setViewportSize(t,r,n,i){await this.ensureInit(),await this.mutate(()=>{if(n==null)return this.pendingViewportSizes.set(t,{turnId:r,viewportSize:i}),!0;const a=this.leases.get(n);if(a?.state!=="active"||a.sessionId!==t||a.turnId!==r)throw new Error(`Tab ${n} is not part of browser session ${t}`);return this.leases.set(n,{...a,viewportSize:i}),this.pendingViewportSizes.delete(t),!0})}async takeViewportSizeForAttach(t,r,n){await this.ensureInit();let i;return await this.mutate(()=>{const a=this.leases.get(n);if(a?.state!=="active"||a.sessionId!==t)throw new Error(`Tab ${n} is not part of browser session ${t}`);if(Object.hasOwn(a,"viewportSize"))return i=a.viewportSize,!1;const s=this.pendingViewportSizes.get(t);return s?.turnId!==r?!1:(i=s.viewportSize,this.pendingViewportSizes.delete(t),this.leases.set(n,{...a,viewportSize:i}),!0)}),i}async clearPendingViewportSize(t,r){await this.ensureInit(),await this.mutate(()=>this.pendingViewportSizes.get(t)?.turnId!==r?!1:this.pendingViewportSizes.delete(t))}async setTabMark(t,r,n,i){await this.ensureInit(),await this.mutate(()=>{const a=this.leases.get(n);if(a?.state!=="active"||a.sessionId!==t||a.turnId!==r)throw new Error(`Tab ${n} is not part of browser session ${t}`);return a.mark===i?!1:(this.leases.set(n,{...a,mark:i}),!0)})}async replaceTurnMarks(t,r,n){await this.ensureInit(),await this.mutate(()=>{let i=!1;for(const[a,s]of this.leases){if(s.state!=="active"||s.sessionId!==t||s.turnId!==r)continue;const o=n.get(a);if(s.mark===o)continue;const l={...s};delete l.mark,this.leases.set(a,o==null?l:{...l,mark:o}),i=!0}return i})}async getSessionTabs(t){const r=await this.getSessionActiveLeases(t),n=await Promise.all([...r.keys()].map(async s=>{try{return{tab:await chrome.tabs.get(s),tabId:s,state:"found"}}catch{return{tabId:s,state:"stale"}}})),i=[],a=[];for(const s of n)s.state==="found"?i.push(s.tab):a.push(s.tabId);return a.length>0&&await this.releaseTabs(t,a),i}async updateActiveSessionTurn(t,r){await this.ensureInit();const n=await Ce();await this.mutate(()=>{let i=!1;for(const[a,s]of this.leases.entries()){if(s.sessionId!==t||s.state!=="active"||s.turnId===r&&s.instanceId===n)continue;const o={...s};delete o.mark,this.leases.set(a,{...s.turnId===r?s:o,turnId:r,instanceId:n}),i=!0}return i})}async handoffTabs(t,r,n,i){await this.ensureInit();const a=await Ce(),s=new Set(n);s.size!==0&&await this.mutate(()=>{let o=!1;for(const l of s){const h=this.leases.get(l);if(h?.state!=="active"||h.sessionId!==t)continue;const m={...h};delete m.mark,this.leases.set(l,{...m,turnId:r,instanceId:a,state:"handoff",...i.activeTabId===l?{isActiveHandoff:!0}:{}}),o=!0}return o})}async resumeHandoffTabs(t,r,n){await this.ensureInit();const i=await Ce(),a=new Set(n);if(a.size===0)return[];const s=[];let o=!1;const l=await this.mutate(()=>{let h=!1;for(const m of a){const d=this.leases.get(m);d?.state!=="handoff"||d.sessionId!==t||(this.leases.set(m,{tabId:m,sessionId:t,turnId:r,origin:d.origin,claimedAt:d.claimedAt,instanceId:i,state:"active",requestHeaderEnabled:d.requestHeaderEnabled,...Object.hasOwn(d,"viewportSize")?{viewportSize:d.viewportSize}:{}}),s.push(m),o||=d.requestHeaderEnabled!==void 0,h=!0)}return h});if(l!=null&&o)throw l;return s}async releaseTabs(t,r){await this.ensureInit();const n=new Set(r);n.size!==0&&await this.mutate(()=>{let i=!1;for(const a of n)this.leases.get(a)?.sessionId===t&&(this.leases.delete(a),i=!0);return i})}async releaseActiveTurn(t,r){await this.ensureInit(),await this.mutate(()=>{let n=!1;for(const[i,a]of this.leases.entries())a.sessionId!==t||a.turnId!==r||a.state!=="active"||(this.leases.delete(i),n=!0);return n})}async getSessionLeases(t,r){return await this.ensureInit(),await this.waitForPendingMutations(),new Map([...this.leases.entries()].filter(([,n])=>n.sessionId===t&&n.state===r))}registerEventListeners(){this.listenersRegistered||(this.listenersRegistered=!0,chrome.tabs.onRemoved?.addListener(this.handleTabRemoved),chrome.tabs.onReplaced?.addListener(this.handleTabReplaced))}async removeTab(t){await this.ensureInit(),await this.mutate(()=>this.leases.delete(t))}async replaceTab(t,r){await this.ensureInit(),await this.mutate(()=>{const n=this.leases.get(r);return n==null?!1:(this.leases.delete(r),this.leases.set(t,{...n,tabId:t}),!0)})}async loadFromStorage(){const t=this.readActiveTabIds();let r;try{r=await this.storage.get(this.storageKey)}catch(n){throw await this.requestHeaders.synchronize(new Map,!0),n}for(const[n,i]of Km(r[this.storageKey]))this.leases.set(n,i);for(const[n,i]of Zm(r[this.storageKey]))this.pendingViewportSizes.set(n,i);this.storageLoaded=!0,await this.requestHeaders.synchronize(this.readActiveRequestHeaders(),!0),this.publishActiveTabLeaseChanges(t)}async mutate(t,r=!1){const n=async()=>{const a=this.readActiveTabIds(),s=new Map(this.leases),o=new Map(this.pendingViewportSizes);try{await t()&&await this.saveToStorage()}catch(h){this.leases.clear();for(const[m,d]of s)this.leases.set(m,d);this.pendingViewportSizes.clear();for(const[m,d]of o)this.pendingViewportSizes.set(m,d);throw h}const l=await this.requestHeaders.synchronize(this.readActiveRequestHeaders(),r);return this.publishActiveTabLeaseChanges(a),l},i=this.mutationQueue.then(n,n);return this.mutationQueue=i.then(()=>{},()=>{}),await i}async waitForPendingMutations(){await this.mutationQueue}async saveToStorage(){const t=Object.fromEntries(this.pendingViewportSizes.entries()),r={leases:Object.fromEntries(this.leases.entries()),...Object.keys(t).length>0?{pendingViewportSizes:t}:{}};await this.storage.set({[this.storageKey]:r})}readActiveTabIds(){return new Set([...this.leases.entries()].filter(([,t])=>t.state==="active").map(([t])=>t))}readActiveRequestHeaders(){const t=new Map;for(const[r,n]of this.leases)n.state==="active"&&n.requestHeaderEnabled===!0&&t.set(r,n.sessionId);return t}publishActiveTabLeaseChanges(t){const r=Xm(t,this.readActiveTabIds());if(r.length!==0)for(const n of this.activeTabLeaseChangeHandlers)Promise.resolve(n(r)).catch(()=>{})}};function Xm(e,t){const r=new Set;for(const n of e)t.has(n)||r.add(n);for(const n of t)e.has(n)||r.add(n);return[...r]}var nT="CODEX_OPEN_AGENT_BACKGROUND_POPUP",Zt="__codexAgentPopupInterceptor",Ho="__codexAgentBackgroundPopupRequest",be=new Set,Xe=new Map,Wo=!1;function Ym(){Wo||(Wo=!0,chrome.tabs.onRemoved?.addListener(sg),chrome.tabs.onReplaced?.addListener(ag),chrome.webNavigation?.onCommitted?.addListener(ng))}function Qm(e){be.add(e)}async function Ko(e){if(!be.has(e))return!1;let t=Xe.get(e);return t==null&&(t=rg(e),Xe.set(e,t),t.finally(()=>{Xe.get(e)===t&&Xe.delete(e)})),await t}async function eg(e){const t=be.delete(e),r=Xe.get(e);!t&&r==null||(r!=null&&await r.catch(()=>{}),Xe.delete(e),await Promise.allSettled([ie(chrome.scripting.executeScript({args:[Zt],func:ug,injectImmediately:!0,target:{allFrames:!0,tabId:e},world:"MAIN"})),ie(chrome.scripting.executeScript({args:[Zt],func:dg,injectImmediately:!0,target:{allFrames:!0,tabId:e}}))]))}function tg(e){return e!=null&&typeof e=="object"&&"type"in e&&e.type==="CODEX_OPEN_AGENT_BACKGROUND_POPUP"&&"url"in e&&typeof e.url=="string"}async function rg(e){if(!be.has(e))return!1;try{const t=await ie(chrome.scripting.executeScript({args:[Zt],func:og,injectImmediately:!0,target:{allFrames:!0,tabId:e},world:"MAIN"}));return t!=null&&t.length>0&&t.every(r=>r.result===!0)?be.has(e):!(await ie(chrome.scripting.executeScript({args:[Zt,Ho,"CODEX_OPEN_AGENT_BACKGROUND_POPUP"],func:lg,injectImmediately:!0,target:{allFrames:!0,tabId:e}}))==null||!be.has(e)||await ie(chrome.scripting.executeScript({args:[Zt,Ho],func:cg,injectImmediately:!0,target:{allFrames:!0,tabId:e},world:"MAIN"}))==null||!be.has(e))}catch{return!1}}function ng(e){be.has(e.tabId)&&ig(e.tabId)}function ig(e){const t=ze.getInstance();t.mightHaveActiveTabLease(e)&&t.getActiveLease(e).then(async r=>{r==null||!be.has(e)||await Ko(e)}).catch(()=>{})}function ag(e,t){be.delete(t)&&(be.add(e),Xe.delete(t))}function sg(e){be.delete(e),Xe.delete(e)}function og(e){return globalThis[e]!=null}function lg(e,t,r){const n=globalThis;if(n[e]!=null)return;let i=!1;const a=o=>{o.isTrusted&&(i=!1)},s=o=>{if(!(o instanceof CustomEvent)||navigator.userActivation?.isActive===!1)return;if(i){o.preventDefault();return}const l=o.detail;typeof l=="string"&&(i=!0,chrome.runtime.sendMessage({type:r,url:l}).catch(()=>{}))};document.addEventListener("click",a,!0),document.addEventListener("keydown",a,!0),document.addEventListener(t,s),n[e]={listener:s,requestEvent:t,resetPopupAllowance:a}}function cg(e,t){const r=globalThis;if(r[e]!=null)return;const n=window.open,i=h=>{if(navigator.userActivation?.isActive===!1)return;let m;try{m=new URL(h,document.baseURI)}catch{return}if(!(m.protocol!=="http:"&&m.protocol!=="https:"))return document.dispatchEvent(new CustomEvent(t,{cancelable:!0,detail:m.href}))},a=h=>["_self","_parent","_top","_unfencedtop"].includes(h.toLowerCase())||Array.from(document.querySelectorAll("iframe, frame")).some(m=>m.getAttribute("name")===h),s=(h,m,d)=>{if(h==null||h===""||a(String(m??"")))return n.call(window,h,m,d);const f=i(String(h));return f==null?n.call(window,h,m,d):!f||d?.split(",").some(c=>/^(?:noopener|noreferrer)(?:\s*=\s*(?:1|yes|true))?$/i.test(c.trim()))?null:{closed:!1,focus:()=>{}}},o=h=>{if(h.defaultPrevented||h.button!==0)return;const m=h.composedPath().find(f=>f instanceof HTMLAnchorElement);if(m==null||m.hasAttribute("download")&&m.origin===window.location.origin)return;const d=m.target;d===""||a(d)||i(m.href)!=null&&h.preventDefault()},l=()=>{window.removeEventListener("click",o),window.addEventListener("click",o,{once:!0})};window.open=s,window.addEventListener("click",l,!0),r[e]={captureClickListener:l,clickListener:o,interceptedOpen:s,originalOpen:n}}function ug(e){const t=globalThis,r=t[e];if(r==null||typeof r!="object")return;const n=r;window.removeEventListener("click",n.captureClickListener,!0),window.removeEventListener("click",n.clickListener),window.open===n.interceptedOpen&&(window.open=n.originalOpen),Reflect.deleteProperty(t,e)}function dg(e){const t=globalThis,r=t[e];if(r==null||typeof r!="object")return;const n=r;document.removeEventListener("click",n.resetPopupAllowance,!0),document.removeEventListener("keydown",n.resetPopupAllowance,!0),document.removeEventListener(n.requestEvent,n.listener),Reflect.deleteProperty(t,e)}var qi="__codexForeignExtensionFrameMonitor";function hg(e=qi){const t=globalThis;if(t[e]!=null)return!0;const r=chrome.dom?.openOrClosedShadowRoot,n=new WeakSet,i=d=>{if(d==null||!d.startsWith("chrome-extension://"))return null;try{const f=new URL(d).host;return f.length>0&&f!==chrome.runtime.id?f:null}catch{return null}},a=d=>{const f=d.getAttribute("src")?.trim()??"";return d instanceof HTMLIFrameElement?{attrSrc:f,propertySrc:d.src?.trim()??""}:{attrSrc:f,propertySrc:""}},s=d=>{if(!(d instanceof HTMLElement))return null;if(typeof r=="function")try{return r(d)}catch{}return d.shadowRoot},o=d=>{const f=s(d);if(d.tagName==="IFRAME"||d.tagName==="FRAME"){const c=a(d);if((i(c.attrSrc)??i(c.propertySrc))!=null){if(d instanceof HTMLIFrameElement){if(d.getAttribute("srcdoc")==="")return;d.setAttribute("srcdoc","");return}d.setAttribute("src","about:blank")}}f!=null&&m(f)},l=d=>{if(!(d instanceof Document||d instanceof ShadowRoot||d instanceof Element))return;const f=u=>{o(u);const g=s(u);g!=null&&l(g)};d instanceof Element&&f(d);const c=document.createTreeWalker(d,NodeFilter.SHOW_ELEMENT);let p=c.nextNode();for(;p!=null;)f(p),p=c.nextNode()},h=new MutationObserver(d=>{for(const f of d){f.type==="attributes"&&f.target instanceof Element&&o(f.target);for(const c of f.addedNodes)l(c)}}),m=d=>{n.has(d)||(n.add(d),h.observe(d,{attributeFilter:["src"],attributes:!0,childList:!0,subtree:!0}),l(d))};t[e]={observer:h,observedRoots:n};try{m(document)}catch(d){throw h.disconnect(),Reflect.deleteProperty(t,e),d}return!0}var le=new Set,Ve=new Map,He=new Map,rn=new Map,Zo=!1,Jo=!1;function fg(){Zo||(Zo=!0,chrome.tabs.onUpdated?.addListener(Tg),chrome.tabs.onRemoved?.addListener(Ig),chrome.webNavigation?.onCommitted?.addListener(e=>{Vi(e.tabId,e.frameId!==0)}),chrome.debugger?.onDetach?.addListener(e=>{e.tabId!=null&&Vi(e.tabId)}),pg(),ze.getInstance().ensureInit().catch(()=>{}))}function pg(){Jo||(Jo=!0,chrome.tabs.onReplaced?.addListener(Eg))}function mg(e){le.add(e)}async function Xo(e){if(!le.has(e))return!1;const t=await Gi(e);if(t==null||!le.has(e))return!1;let r=He.get(e);r?.leaseKey!==t&&(r={leaseKey:t,installedDocumentIds:new Set},He.set(e,r));const n=r;return n.pending??=_g(e,n).finally(()=>{delete n.pending}),await n.pending}async function gg(e){le.delete(e),He.delete(e);const t=Ve.get(e);await Promise.allSettled([...t==null?[]:[t],...Array.from(rn.get(e)??[])]),Ve.get(e)===t&&Ve.delete(e),le.has(e)||await Yo(e)}async function Gi(e){const t=await ze.getInstance().getActiveLease(e);return t==null?null:JSON.stringify([t.sessionId,t.turnId,t.claimedAt,t.instanceId])}function Jt(e,t){return le.has(e)&&He.get(e)===t}async function _g(e,t){try{const r=await chrome.webNavigation.getAllFrames({tabId:e});if(!Jt(e,t))return!1;if(r==null||!r.some(a=>a.frameId===0)||r.some(a=>!a.documentId||a.errorOccurred||a.documentLifecycle!=="active"))return await zi(e,t);const n=new Set(r.map(a=>a.documentId));for(const a of t.installedDocumentIds)n.has(a)||t.installedDocumentIds.delete(a);const i=[...n].filter(a=>!t.installedDocumentIds.has(a));if(i.length>0){const a=ie(chrome.scripting.executeScript({args:[qi],func:hg,injectImmediately:!0,target:{tabId:e,documentIds:i}}));let s=rn.get(e);s==null&&(s=new Set,rn.set(e,s)),s.add(a);let o;try{o=await a}finally{s.delete(a),s.size===0&&rn.delete(e)}if(!Jt(e,t))return!1;for(const l of o??[])l.result===!0&&i.includes(l.documentId)&&t.installedDocumentIds.add(l.documentId);if(i.some(l=>!t.installedDocumentIds.has(l)))return await zi(e,t)}return await Gi(e)===t.leaseKey&&Jt(e,t)}catch{return await zi(e,t)}}async function zi(e,t){return Jt(e,t)?await vg(e)&&await Gi(e)===t.leaseKey&&Jt(e,t):!1}function Vi(e,t=!1){const r=He.get(e);r!=null&&He.set(e,{leaseKey:r.leaseKey,installedDocumentIds:t?new Set(r.installedDocumentIds):new Set})}async function vg(e){if(!le.has(e))return!1;if(await wg(e))return le.has(e);let t=Ve.get(e);return t||(t=yg(e),Ve.set(e,t),t.finally(()=>{Ve.get(e)===t&&Ve.delete(e)})),await t}async function wg(e){try{return(await ie(chrome.scripting.executeScript({args:["__codexForeignExtensionFrameMonitor"],func:Sg,injectImmediately:!0,target:{allFrames:!0,tabId:e}})))?.every(t=>t.result===!0)??!1}catch{return!1}}async function bg(e){try{if(await ie(chrome.scripting.executeScript({files:["content-scripts/foreign-frame-monitor.js"],injectImmediately:!0,target:{allFrames:!0,tabId:e}}))==null)return!1}catch{return!1}return!0}async function yg(e){if(!le.has(e))return!1;const t=await bg(e);return le.has(e)?t:(await Yo(e),!1)}function Sg(e){return globalThis[e]!=null}function Tg(e,t,r){if(t.status!=="loading"||(Vi(e),br(Ot(navigator.userAgent),r.url)))return;const n=ze.getInstance();le.has(e)&&n.mightHaveActiveTabLease(e)&&n.getOwningSessionId(e).then(async i=>{i==null||!le.has(e)||await Xo(e)}).catch(()=>{})}function Eg(e,t){He.delete(t),He.delete(e),le.delete(t)&&(le.add(e),Ve.delete(t))}function Ig(e){le.delete(e),He.delete(e),Ve.delete(e)}async function Yo(e){try{await ie(chrome.scripting.executeScript({args:[qi],func:Ag,injectImmediately:!0,target:{allFrames:!0,tabId:e}}))}catch{}}function Ag(e){const t=globalThis,r=t[e];if(r==null||typeof r!="object")return;const n="observer"in r?r.observer:void 0;(n!=null&&typeof n=="object"&&"disconnect"in n&&typeof n.disconnect=="function"?n.disconnect:null)?.call(n),Reflect.deleteProperty(t,e)}var Cg="codex-favicon-badge",Qo={cursor:null,isVisible:!1,sessionId:null,turnId:null};function el(e){if(e==null||!e.startsWith("data:image/svg+xml,"))return!1;try{return decodeURIComponent(e.slice(19)).includes(`data-codex-favicon-badge="${Cg}"`)}catch{return!1}}var kg=class extends Error{constructor(e){super(e),this.name="AtlasCommandError"}},Rg=()=>{};function Og(){return new kg("Codex is not running for this browser session.")}var Pg=class{sessions=new Map;tabSessions=new Map;observedTabs;onBrowserControlActivityChanged;lastBrowserControlActive=!1;constructor(e={}){this.observedTabs=e.observedTabs??{isObserved:()=>!1},this.onBrowserControlActivityChanged=e.onBrowserControlActivityChanged??Rg}async startSession(e,t=null,r={}){const n=this.ensureSession(e);t!=null&&n.currentTurnId!==t&&n.cursorByTabId.clear(),n.currentTurnId=t??n.currentTurnId,n.isRunning=!0,r.publishTabs!==!1&&await this.publishSessionTabs(e),this.updateBrowserControlActivity()}async finishSession(e){const t=this.sessions.get(e);t&&(await this.publishTabs(this.detachSession(e,t)),this.updateBrowserControlActivity())}isBrowserControlActive(){for(const e of this.sessions.values())if(e.isRunning||e.activeRequests>0)return!0;return!1}setBrowserControlActivityChangeHandler(e){this.onBrowserControlActivityChanged=e,this.updateBrowserControlActivity()}requireRunningSession(e){if(!this.sessions.get(e)?.isRunning)throw Og()}throwIfAgentNotRunning(e){this.requireRunningSession(e)}async trackTab(e,t,r={}){this.linkTabToSession(e,t),r.publish!==!1&&await this.publishTabState(t)}async untrackTab(e,t){const r=this.sessions.get(e);r?.tabIds.delete(t),r?.cursorByTabId.delete(t),r?.tabIds.size===0&&this.sessions.delete(e);const n=this.tabSessions.get(t);n&&(n.delete(e),n.size===0&&this.tabSessions.delete(t)),await this.publishTabState(t),this.updateBrowserControlActivity()}async startRequest(e,t){this.throwIfAgentNotRunning(e);const r=this.linkTabToSession(e,t);return r.activeRequests+=1,(!r.abortController||r.abortController.signal.aborted)&&(r.abortController=new AbortController),await this.publishSessionTabs(e),this.updateBrowserControlActivity(),r.abortController.signal}async finishRequest(e){const t=this.sessions.get(e);t&&(t.activeRequests=Math.max(0,t.activeRequests-1),t.activeRequests===0&&(t.abortController=null),await this.publishSessionTabs(e),this.updateBrowserControlActivity())}async stopActiveSessions(){const e=Array.from(this.sessions.entries()).filter(([,t])=>t.isRunning).map(([t])=>t);return await this.stopSessions(e),e}async stopSessions(e){for(const t of e)await this.stopSession(t)}async setCursorState(e,t,r,n,i={}){const a=this.sessions.get(e);return!a?.isRunning||(a.currentTurnId=r,a.cursorByTabId.set(t,n),i.publish===!1)?!1:await this.publishTabCursorState(t)}isObserved(e){return this.observedTabs.isObserved(e)}readCursorOverlayState(e){const t=this.getHighestPrioritySessionIdForTab(e);if(t==null)return Qo;const r=this.sessions.get(t);if(!r?.isRunning)return Qo;const n=r.cursorByTabId.get(e)??null,i=this.observedTabs.isObserved(e);return{cursor:!i&&n!=null?{visible:!1,x:n.x,y:n.y}:n,isVisible:i,sessionId:t,turnId:r.currentTurnId}}async republishTabState(e){await this.publishTabState(e)}async republishTabStates(e){await this.publishTabs(e)}async stopSession(e){const t=this.sessions.get(e);t?.isRunning&&(t.isRunning=!1,t.abortController?.abort(),await this.publishSessionTabs(e),this.updateBrowserControlActivity())}ensureSession(e){let t=this.sessions.get(e);return t||(t={tabIds:new Set,isRunning:!1,currentTurnId:null,cursorByTabId:new Map,activeRequests:0,abortController:null},this.sessions.set(e,t)),t}linkTabToSession(e,t){const r=this.ensureSession(e);return r.tabIds.add(t),this.attachTabSession(t,e),r}attachTabSession(e,t){const r=this.tabSessions.get(e);if(r){r.add(t);return}this.tabSessions.set(e,new Set([t]))}detachSession(e,t){const r=Array.from(t.tabIds);this.sessions.delete(e);for(const n of r){const i=this.tabSessions.get(n);i&&(i.delete(e),i.size===0&&this.tabSessions.delete(n))}return r}async publishSessionTabs(e){const t=this.sessions.get(e);t&&await this.publishTabs(t.tabIds)}async publishTabs(e){await Promise.all(Array.from(e,async t=>this.publishTabState(t)))}async publishTabState(e){await this.publishTabCursorState(e)}async publishTabCursorState(e){if(!await this.prepareContentScript(e))return!1;const t={type:"AGENT_CURSOR_STATE",state:this.readCursorOverlayState(e)};try{return(await ie(chrome.tabs.sendMessage(e,t)))?.ok===!0}catch{return!1}}async prepareContentScript(e){return this.tabSessions.has(e)?await zo(e):await $i(e)}getHighestPrioritySessionIdForTab(e){const t=this.tabSessions.get(e);if(!t||t.size===0)return null;for(const r of t)if(this.sessions.get(r)?.isRunning)return r;return null}updateBrowserControlActivity(){const e=this.isBrowserControlActive();e!==this.lastBrowserControlActive&&(this.lastBrowserControlActive=e,this.onBrowserControlActivityChanged(e))}},Mg=class{activeTabIds=new Set;activeTabIdByWindowId=new Map;listenersRegistered=!1;onChanged;handleTabActivated=e=>{this.setWindowActiveTab(e.windowId,e.tabId)};handleTabCreated=e=>{if(e.active!==!0)return;const t=tl(e);t!=null&&this.setWindowActiveTab(t.windowId,t.tabId)};handleTabRemoved=()=>{this.refreshActiveTabs()};handleTabReplaced=()=>{this.refreshActiveTabs()};handleTabWindowChanged=()=>{this.refreshActiveTabs()};handleWindowCreated=()=>{this.refreshActiveTabs()};handleWindowFocusChanged=()=>{this.refreshActiveTabs()};handleWindowRemoved=()=>{this.refreshActiveTabs()};constructor(e={}){this.onChanged=e.onChanged??(()=>{})}setChangeHandler(e){this.onChanged=e}async initialize(){this.registerEventListeners(),await this.refreshActiveTabs()}dispose(){this.listenersRegistered&&(this.listenersRegistered=!1,chrome.tabs.onActivated?.removeListener(this.handleTabActivated),chrome.tabs.onCreated?.removeListener(this.handleTabCreated),chrome.tabs.onRemoved?.removeListener(this.handleTabRemoved),chrome.tabs.onReplaced?.removeListener(this.handleTabReplaced),chrome.tabs.onAttached?.removeListener(this.handleTabWindowChanged),chrome.tabs.onDetached?.removeListener(this.handleTabWindowChanged),chrome.windows?.onCreated?.removeListener(this.handleWindowCreated),chrome.windows?.onFocusChanged?.removeListener(this.handleWindowFocusChanged),chrome.windows?.onRemoved?.removeListener(this.handleWindowRemoved))}isObserved(e){return this.activeTabIds.has(e)}registerEventListeners(){this.listenersRegistered||(this.listenersRegistered=!0,chrome.tabs.onActivated?.addListener(this.handleTabActivated),chrome.tabs.onCreated?.addListener(this.handleTabCreated),chrome.tabs.onRemoved?.addListener(this.handleTabRemoved),chrome.tabs.onReplaced?.addListener(this.handleTabReplaced),chrome.tabs.onAttached?.addListener(this.handleTabWindowChanged),chrome.tabs.onDetached?.addListener(this.handleTabWindowChanged),chrome.windows?.onCreated?.addListener(this.handleWindowCreated),chrome.windows?.onFocusChanged?.addListener(this.handleWindowFocusChanged),chrome.windows?.onRemoved?.addListener(this.handleWindowRemoved))}async refreshActiveTabs(){const e=await chrome.tabs.query({active:!0});this.setActiveTabs(e.flatMap(t=>tl(t)??[]))}setActiveTabs(e){const t=new Set,r=new Map;for(const i of e)t.add(i.tabId),r.set(i.windowId,i.tabId);const n=Lg(this.activeTabIds,t);this.activeTabIds=t,this.activeTabIdByWindowId=r,this.publishChangedTabs(n)}setWindowActiveTab(e,t){const r=new Set,n=this.activeTabIdByWindowId.get(e);n!==void 0&&n!==t&&(this.activeTabIds.delete(n),r.add(n)),this.activeTabIdByWindowId.set(e,t),this.activeTabIds.has(t)||(this.activeTabIds.add(t),r.add(t)),this.publishChangedTabs(r)}publishChangedTabs(e){const t=Array.from(e);t.length!==0&&Promise.resolve(this.onChanged(t)).catch(()=>{})}};function tl(e){return typeof e.id!="number"||typeof e.windowId!="number"?null:{tabId:e.id,windowId:e.windowId}}function Lg(e,t){const r=new Set;for(const n of e)t.has(n)||r.add(n);for(const n of t)e.has(n)||r.add(n);return r}var nn=new Mg,he=new Pg({observedTabs:nn}),Hi=new Set,Wi=new Set;nn.setChangeHandler(async e=>{const t=e.filter(r=>nn.isObserved(r));for(const r of t)Hi.has(r)&&Wi.add(r);await Promise.all([he.republishTabStates(e),Dg(t)])});async function rl(e){Hi.add(e);try{const t=await il(e);if(!t||t.active===!0||t.mutedInfo?.muted===!0)return;try{await chrome.tabs.update(e,{muted:!0})}catch{return}Wi.has(e)&&await nl(e)}finally{Hi.delete(e),Wi.delete(e)}}async function Dg(e){await Promise.allSettled(e.map(async t=>nl(t)))}async function nl(e){const t=await il(e);if(!(!t||t.mutedInfo?.muted!==!0||t.mutedInfo.reason!=="extension"||t.mutedInfo.extensionId!==chrome.runtime.id))try{await chrome.tabs.update(e,{muted:!1})}catch{}}async function il(e){try{return await chrome.tabs.get(e)}catch{return null}}var Ki="AGENT_REQUEST_HEADER_ENABLED",xg=class{enabled=!1;async isEnabled(){if(this.enabled)return!0;const e=await chrome.storage.local.get(Ki);return this.enabled||=e[Ki]===!0,this.enabled}async applyDecision(e){return await this.isEnabled()||!e?this.enabled:(await chrome.storage.local.set({[Ki]:!0}),this.enabled=!0,!0)}},Ng=2e3,Ug=250,Zi=64*1024,al={type:"TAB_FAVICON_BADGE",badge:null,faviconDataUrl:null},Ji=class _t{static instance=null;unseenFinalizedBadges=new Map;storageKey="TAB_FAVICON_BADGES";storage;tabLeases=ze.getInstance();faviconDataUrls=new Map;closingTabIds=new Set;initializePromise=null;stateOperationQueue=Promise.resolve();publicationQueue=Promise.resolve();listenersRegistered=!1;unsubscribeActiveTabLeaseChanges=null;handleTabActivated=t=>{this.clearFinalizedBadge(t.tabId)};handleWindowFocused=t=>{t!==chrome.windows.WINDOW_ID_NONE&&this.clearFocusedWindowFinalizedBadge(t)};handleTabUpdated=(t,r)=>{const n=r.favIconUrl,i=n!=null,a=typeof n=="string"&&el(n);if((r.url!=null||i&&!a)&&this.faviconDataUrls.delete(t),r.status==="complete"||i&&!a){if(this.closingTabIds.has(t)||!this.mightHaveBadge(t))return;this.republishBadge(t)}};handleTabRemoved=t=>{this.closingTabIds.delete(t),this.faviconDataUrls.delete(t),this.forgetFinalizedBadge(t)};handleTabReplaced=(t,r)=>{this.closingTabIds.delete(r),this.faviconDataUrls.delete(r),this.faviconDataUrls.delete(t),this.replaceFinalizedBadge(t,r)};handleActiveTabLeaseChanges=t=>{this.reconcileActiveTabLeaseChanges(t)};static getInstance(){return _t.instance||(_t.instance=new _t),_t.instance}constructor(t=chrome.storage.session){this.storage=t,this.unsubscribeActiveTabLeaseChanges=this.tabLeases.subscribeActiveTabLeaseChanges(this.handleActiveTabLeaseChanges),this.registerEventListeners(),this.ensureInit().catch(()=>{}),this.tabLeases.ensureInit().catch(()=>{})}async ensureInit(){this.initializePromise||(this.initializePromise=this.loadFromStorage()),await this.initializePromise}async markFinalized(t,r){await this.ensureInit(),await this.runStateOperation(async()=>{const n=!await this.tabIsVisible(t);await this.updateUnseenFinalizedBadges(()=>n?this.unseenFinalizedBadges.get(t)===r?!1:(this.unseenFinalizedBadges.set(t,r),!0):this.unseenFinalizedBadges.delete(t))}),this.scheduleReconcileTab(t)}async restoreTabFaviconsBestEffort(t){await ie(Promise.allSettled(t.map(async r=>{await chrome.tabs.sendMessage(r,al)})),Ug)}async closeTabsWithFaviconRestore(t,r){for(const n of t)this.closingTabIds.add(n);await this.restoreTabFaviconsBestEffort(t);try{return await r()}catch(n){for(const i of t)this.closingTabIds.delete(i);throw n}}dispose(){this.listenersRegistered&&(this.listenersRegistered=!1,chrome.tabs.onActivated?.removeListener(this.handleTabActivated),chrome.tabs.onUpdated?.removeListener(this.handleTabUpdated),chrome.tabs.onRemoved?.removeListener(this.handleTabRemoved),chrome.tabs.onReplaced?.removeListener(this.handleTabReplaced),chrome.windows.onFocusChanged?.removeListener(this.handleWindowFocused)),this.unsubscribeActiveTabLeaseChanges?.(),this.unsubscribeActiveTabLeaseChanges=null,this.closingTabIds.clear(),_t.instance===this&&(_t.instance=null)}registerEventListeners(){this.listenersRegistered||(this.listenersRegistered=!0,chrome.tabs.onActivated?.addListener(this.handleTabActivated),chrome.tabs.onUpdated?.addListener(this.handleTabUpdated),chrome.tabs.onRemoved?.addListener(this.handleTabRemoved),chrome.tabs.onReplaced?.addListener(this.handleTabReplaced),chrome.windows.onFocusChanged?.addListener(this.handleWindowFocused))}async clearFinalizedBadge(t){await this.ensureInit();let r=!1;await this.runStateOperation(async()=>{this.unseenFinalizedBadges.has(t)&&await this.updateUnseenFinalizedBadges(()=>r=this.unseenFinalizedBadges.delete(t))}),r&&this.scheduleReconcileTab(t)}async clearFocusedWindowFinalizedBadge(t){if(!await this.hasUnseenFinalizedBadges())return;let r;try{r=await chrome.tabs.query({active:!0,windowId:t})}catch{return}const n=r.find(i=>typeof i.id=="number")?.id;n!=null&&await this.clearFinalizedBadge(n)}async hasUnseenFinalizedBadges(){await this.ensureInit();let t=!1;return await this.runStateOperation(async()=>{t=this.unseenFinalizedBadges.size>0}),t}async forgetFinalizedBadge(t){await this.ensureInit(),await this.runStateOperation(async()=>{await this.updateUnseenFinalizedBadges(()=>this.unseenFinalizedBadges.delete(t))})}async replaceFinalizedBadge(t,r){await this.ensureInit();let n=null;await this.runStateOperation(async()=>{await this.updateUnseenFinalizedBadges(()=>{const i=this.unseenFinalizedBadges.get(r);return i==null?!1:(this.unseenFinalizedBadges.delete(r),this.unseenFinalizedBadges.set(t,i),n=i,!0)})}),n!=null&&this.scheduleReconcileTab(t)}async republishBadge(t){await this.ensureInit(),await this.waitForStateOperations();const r=await this.readEffectiveBadge(t);r!=null&&this.schedulePublishBadge(t,r)}async reconcileActiveTabLeaseChanges(t){await this.ensureInit();const r=[...t];await this.runStateOperation(async()=>{let n=!1;for(const i of r)await this.tabLeases.getOwningSessionId(i)!=null&&(n=this.unseenFinalizedBadges.delete(i)||n);n&&await this.saveToStorage()});for(const n of r)this.scheduleReconcileTab(n)}async reconcileTab(t){await this.publishBadge(t,await this.readEffectiveBadge(t))}async readEffectiveBadge(t){return await this.tabLeases.getOwningSessionId(t)!=null?"active":this.unseenFinalizedBadges.get(t)??null}mightHaveBadge(t){return this.unseenFinalizedBadges.has(t)||this.tabLeases.mightHaveActiveTabLease(t)}async tabIsVisible(t){try{const r=await chrome.tabs.get(t);return r.active!==!0||typeof r.windowId!="number"?!1:(await chrome.windows.get(r.windowId)).focused===!0}catch{return!1}}async loadFromStorage(){const t=(await this.storage.get(this.storageKey))[this.storageKey];if(!t||typeof t!="object"||!("badges"in t)||!t.badges||typeof t.badges!="object"||Array.isArray(t.badges))return;const r=[];for(const[n,i]of Object.entries(t.badges)){const a=Number(n);!Number.isInteger(a)||!Fg(i)||(this.unseenFinalizedBadges.set(a,i),r.push(a))}for(const n of r)this.scheduleReconcileTab(n)}async runStateOperation(t){const r=this.stateOperationQueue.then(t,t);this.stateOperationQueue=r.then(()=>{},()=>{}),await r}async waitForStateOperations(){await this.stateOperationQueue}scheduleReconcileTab(t){this.schedulePublication(async()=>{await this.reconcileTab(t)})}schedulePublishBadge(t,r){this.schedulePublication(async()=>{await this.publishBadge(t,r)})}schedulePublication(t){const r=this.publicationQueue.then(t,t);this.publicationQueue=r.then(()=>{},()=>{}),r.catch(()=>{})}async updateUnseenFinalizedBadges(t){t()&&await this.saveToStorage()}async saveToStorage(){const t={badges:Object.fromEntries(this.unseenFinalizedBadges.entries())};await this.storage.set({[this.storageKey]:t})}async publishBadge(t,r){if(this.closingTabIds.has(t))return;const[n,i]=await Promise.all([zo(t),r==null?Promise.resolve(null):this.readFaviconDataUrl(t)]);if(!n||this.closingTabIds.has(t))return;const a=r==null||i==null?al:{type:"TAB_FAVICON_BADGE",badge:r,faviconDataUrl:i};try{await ie(chrome.tabs.sendMessage(t,a))}catch{}}getCachedFaviconDataUrl(t,r){const n=this.faviconDataUrls.get(t);return n?.pageUrl===r?n.dataUrl:null}async readFaviconDataUrl(t,r){let n;try{n=await chrome.tabs.get(t)}catch{return null}if(typeof n.url!="string"||n.url.length===0||r!=null&&n.url!==r)return null;const i=n.url,a=n.favIconUrl,s=this.getCachedFaviconDataUrl(t,i);if(s!=null)return s;if(typeof a!="string"||a.length===0||el(a))return null;const o=await Bg(i);if(o==null)return null;let l;try{l=await chrome.tabs.get(t)}catch{return null}return l.url!==i||l.favIconUrl!==a?null:(this.faviconDataUrls.set(t,{dataUrl:o,pageUrl:i}),o)}};function Fg(e){return e==="deliverable"||e==="handoff"}async function Bg(e){const t=new URL(chrome.runtime.getURL("/_favicon/"));return t.searchParams.set("pageUrl",e),t.searchParams.set("size","32"),await $g(t.toString(),"image/bmp")}async function $g(e,t){const r=new AbortController,n=setTimeout(()=>r.abort(),Ng);try{const i=await fetch(e,{credentials:"omit",signal:r.signal});if(!i.ok)return null;const a=i.headers.get("content-type")??t;if(a==null||!a.startsWith("image/"))return null;const s=await jg(i);return s==null||s.length===0?null:`data:${a};base64,${qg(s)}`}catch{return null}finally{clearTimeout(n)}}async function jg(e){const t=e.headers.get("content-length"),r=t==null?null:Number(t);if(r!=null&&Number.isFinite(r)&&r>Zi)return await e.body?.cancel(),null;if(e.body==null){const l=new Uint8Array(await e.arrayBuffer());return l.length<=Zi?l:null}const n=e.body.getReader(),i=[];let a=0;for(;;){const{done:l,value:h}=await n.read();if(l)break;if(!(h==null||h.length===0)){if(a+=h.length,a>Zi)return await n.cancel(),null;i.push(h)}}const s=new Uint8Array(a);let o=0;for(const l of i)s.set(l,o),o+=l.length;return s}function qg(e){let t="";for(let n=0;n<e.length;n+=32768)t+=String.fromCharCode(...e.subarray(n,n+32768));return btoa(t)}var Xi=["grey","blue","red","yellow","green","pink","purple","cyan","orange"];function Gg(){return Xi[Math.floor(Math.random()*Xi.length)]??Xi[0]}function Yi(e){if(typeof e!="string")return;const t=e.trim();return t.length>0?t:void 0}var zg=class gr{static instance=null;defaultSessionGroupTitle="ChatGPT";managedGroupIds=new Set;sessionGroupTitles=new Map;initializePromise=null;listenersRegistered=!1;storageKey="TAB_GROUPS";static getInstance(){return gr.instance||(gr.instance=new gr),gr.instance}async ensureInit(){this.initializePromise||(this.registerEventListeners(),this.initializePromise=this.loadFromStorage()),await this.initializePromise}async ensureAgentTabGroup(t,r,n){await this.ensureInit();const i=await this.findManagedGroupContainingTabs(n);if(i!=null){await this.addTabToGroup(i,r);return}await this.createGroup(r,this.sessionGroupTitles.get(t)),await this.saveToStorage()}async releaseTabsFromManagedGroups(t){await this.ensureInit();const r=new Set(t);if(r.size===0)return;const n=await Promise.all([...r].map(async o=>{try{const l=await chrome.tabs.get(o);return typeof l.groupId!="number"||!this.managedGroupIds.has(l.groupId)?null:{groupId:l.groupId,tabId:o}}catch{return null}})),i=[],a=new Set;for(const o of n)o!=null&&(i.push(o.tabId),a.add(o.groupId));i.length>0&&chrome.tabs.ungroup&&await Promise.allSettled(i.map(async o=>await chrome.tabs.ungroup(o)));let s=!1;for(const o of a)s=await this.removeManagedGroupIfEmpty(o)||s;s&&await this.saveToStorage()}async refreshManagedGroupsFromChrome(){await this.ensureInit();let t=!1;for(const r of Array.from(this.managedGroupIds))t=await this.removeManagedGroupIfEmpty(r)||t;t&&await this.saveToStorage()}async setSessionGroupTitle(t,r,n){await this.ensureInit();const i=Yi(r),a=this.sessionGroupTitles.get(t)!==i;i?this.sessionGroupTitles.set(t,i):this.sessionGroupTitles.delete(t);const s=await this.findManagedGroupContainingTabs(n);if(s!=null&&chrome.tabGroups?.update)try{await chrome.tabGroups.update(s,{title:i??this.defaultSessionGroupTitle})}catch{}a&&await this.saveToStorage()}async loadFromStorage(){const t=(await chrome.storage.local.get(this.storageKey))[this.storageKey];if(t){if(Array.isArray(t)){for(const r of t)!r||typeof r.chromeGroupId!="number"||this.managedGroupIds.add(r.chromeGroupId);return}for(const r of t.groups??[])!r||typeof r.chromeGroupId!="number"||this.managedGroupIds.add(r.chromeGroupId);for(const[r,n]of Object.entries(t.sessionGroupTitles??{})){const i=Yi(n);i&&this.sessionGroupTitles.set(r,i)}}}async saveToStorage(){const t={groups:Array.from(this.managedGroupIds,r=>({chromeGroupId:r})),sessionGroupTitles:Object.fromEntries(this.sessionGroupTitles.entries())};await chrome.storage.local.set({[this.storageKey]:t})}async createGroup(t,r){const{windowId:n}=await chrome.tabs.get(t),i=await chrome.tabs.group({createProperties:{windowId:n},tabIds:[t]});if(this.managedGroupIds.add(i),chrome.tabGroups?.update)try{await chrome.tabGroups.update(i,{color:Gg(),title:Yi(r)??this.defaultSessionGroupTitle})}catch{}}async addTabToGroup(t,r){(await chrome.tabs.get(r)).groupId!==t&&await chrome.tabs.group({groupId:t,tabIds:r})}registerEventListeners(){this.listenersRegistered||!chrome.tabGroups||(this.listenersRegistered=!0,chrome.tabGroups.onRemoved?.addListener(t=>{this.handleRemovedGroup(t.id)}))}handleRemovedGroup(t){this.managedGroupIds.delete(t)&&this.saveToStorage()}async readGroup(t){if(!chrome.tabGroups?.get)return null;try{return await chrome.tabGroups.get(t)}catch{return null}}async removeManagedGroupIfEmpty(t){return(await this.groupTabIds(t)).length>0?!1:(this.managedGroupIds.delete(t),!0)}async groupTabIds(t){return(await chrome.tabs.query({groupId:t})).map(r=>r.id).filter(r=>typeof r=="number")}async findManagedGroupContainingTabs(t){for(const r of t)try{const n=await chrome.tabs.get(r);if(typeof n.groupId!="number")continue;if(this.managedGroupIds.has(n.groupId)&&await this.readGroup(n.groupId))return n.groupId}catch{}return null}},Vg=1e3;async function sl(e){const t=e.urlProtocols==null?null:new Set(e.urlProtocols),r=(await chrome.tabs.query({})).filter(Hg).filter(s=>e.includeIncognito!==!1||!s.incognito).filter(s=>e.browserTabMentionsOnly!==!0||Qi(s)).filter(s=>Kg(s,e.query,t)).sort(Zg),n=new Set,i=[],a=e.limit??Vg;for(const s of r)if(!n.has(s.id)&&(n.add(s.id),i.push({faviconUrl:e.includeFavicons===!0&&e.getFaviconDataUrl!=null&&typeof s.url=="string"?e.getFaviconDataUrl({...s,url:s.url}):null,tab:s}),i.length===a))break;return i}function an(e){const t=e.lastAccessed;return typeof t=="number"&&Number.isFinite(t)&&t>=0?t:0}function Hg(e){return Number.isSafeInteger(e.id)&&(e.id??-1)>=0}function Qi(e){if(!Wg(e)||!(Number.isSafeInteger(e.windowId)&&e.windowId>=0&&Number.isSafeInteger(e.index)&&e.index>=0&&(e.title==null||e.title.length<=4096&&Ln(e.title))))return!1;const t=new URL(e.url).hostname.replace(/\.$/,"");return t!=="chatgpt.com"&&!t.endsWith(".chatgpt.com")}function Wg(e){if(e.incognito||!(Number.isSafeInteger(e.id)&&(e.id??-1)>=0&&typeof e.url=="string"&&e.url.length<=16384&&Ln(e.url)))return!1;try{const t=new URL(e.url).protocol;return t==="http:"||t==="https:"}catch{return!1}}function Kg(e,t,r){if(r!=null){if(typeof e.url!="string")return!1;try{const n=new URL(e.url).protocol;if(n!=="http:"&&n!=="https:"||!r.has(n))return!1}catch{return!1}}return Pc({title:e.title??"",url:e.url??""},t??"")}function Zg(e,t){return an(t)-an(e)||(e.windowId??0)-(t.windowId??0)||(e.index??0)-(t.index??0)||(e.id??Number.MAX_SAFE_INTEGER)-(t.id??Number.MAX_SAFE_INTEGER)}var ea="browserTabMentionGeneration",Jg=4,Xg=50,Yg={getCachedFaviconDataUrl:()=>null,readFaviconDataUrl:async()=>null},ol=class{invalidationListeners=new Set;faviconListeners=new Set;pendingFaviconReads=new Set;faviconWarmupQueue=[];activeFaviconWarmupCount=0;faviconWarmupSucceeded=!1;identityPromise=null;constructor(e,t=Yg,r){this.buildChannel=e,this.faviconProvider=t,this.startInvalidationObservation=r}async getCapabilityInfo(){const{generation:e}=await this.getIdentity();return{protocolVersion:1,buildChannel:this.buildChannel,generation:e}}async getUserTabs(e){this.ensureInvalidationObservationStarted();const t=Ha({limit:e.limit,query:e.query});if(t==null)throw new Error("Invalid Chrome tab mention search query");const r=await this.getIdentity(),n=Math.min(t.limit,100);return n===0?[]:(await sl({browserTabMentionsOnly:!0,getFaviconDataUrl:i=>this.getFaviconDataUrl(i),includeFavicons:e.includeFavicons!==!1,includeIncognito:!1,limit:n,query:t.query,urlProtocols:["http:","https:"]})).flatMap(({faviconUrl:i,tab:a})=>Qi(a)?[t_(a,r,i)]:[])}async getProviderTabId(e){return ll(await this.getIdentity(),e)}subscribeInvalidations(e){return this.invalidationListeners.add(e),()=>{this.invalidationListeners.delete(e)}}subscribeCandidateUpdates(e,t){const r=new Map(e.filter(a=>a.faviconUrl==null).map(a=>[a.id,a.url])),n=({tabId:a,pageUrl:s,faviconUrl:o})=>{r.get(a)===s&&(r.delete(a),e=e.map(l=>l.id===a?{...l,faviconUrl:o}:l),t(e))},i=(a,s,o)=>{if(s.favIconUrl===void 0||!Qi(o)||r.get(o.id)!==o.url)return;const l=this.getFaviconDataUrl(o);l!=null&&n({tabId:o.id,pageUrl:o.url,faviconUrl:l})};return this.faviconListeners.add(n),chrome.tabs.onUpdated.addListener(i),queueMicrotask(()=>{for(const[a,s]of r){const o=this.getCachedFaviconDataUrl(a,s);o!=null&&n({tabId:a,pageUrl:s,faviconUrl:o})}}),()=>{r.clear(),this.faviconListeners.delete(n),chrome.tabs.onUpdated.removeListener(i)}}getFaviconDataUrl(e){const t=this.getCachedFaviconDataUrl(e.id,e.url);return this.loadFaviconDataUrl(e,t),t}getCachedFaviconDataUrl(e,t){try{return za(this.faviconProvider.getCachedFaviconDataUrl(e,t))}catch{return null}}loadFaviconDataUrl(e,t){const r=JSON.stringify([e.id,e.url]);t!=null||typeof e.favIconUrl!="string"||e.favIconUrl.length===0||this.pendingFaviconReads.has(r)||(this.pendingFaviconReads.add(r),this.faviconWarmupQueue.push({pageUrl:e.url,pendingKey:r,tabId:e.id}),this.startQueuedFaviconWarmups())}startQueuedFaviconWarmups(){for(;this.activeFaviconWarmupCount<Jg&&this.faviconWarmupQueue.length>0;){const e=this.faviconWarmupQueue.shift();if(e==null)continue;this.activeFaviconWarmupCount+=1;let t;try{t=this.faviconProvider.readFaviconDataUrl(e.tabId,e.pageUrl)}catch{t=Promise.resolve(null)}t.then(r=>{const n=za(r);if(n!=null){this.faviconWarmupSucceeded=!0;for(const i of this.faviconListeners)i({tabId:e.tabId,pageUrl:e.pageUrl,faviconUrl:n})}}).catch(()=>{}).finally(()=>{if(this.pendingFaviconReads.delete(e.pendingKey),this.activeFaviconWarmupCount-=1,this.startQueuedFaviconWarmups(),this.activeFaviconWarmupCount===0&&this.faviconWarmupQueue.length===0&&this.faviconWarmupSucceeded){this.faviconWarmupSucceeded=!1;for(const r of this.invalidationListeners)r()}})}}getIdentity(){return this.identityPromise??=e_().catch(e=>{throw this.identityPromise=null,e}),this.identityPromise}ensureInvalidationObservationStarted(){const e=this.startInvalidationObservation;this.startInvalidationObservation=void 0,e?.()}};function Qg(e){let t=null;const r=()=>{t==null&&(t=setTimeout(()=>{t=null,e()},Xg))},n=(i,a)=>{a.title===void 0&&a.url===void 0&&a.favIconUrl===void 0||r()};return chrome.tabs.onCreated.addListener(r),chrome.tabs.onRemoved.addListener(r),chrome.tabs.onReplaced.addListener(r),chrome.tabs.onActivated.addListener(r),chrome.tabs.onUpdated.addListener(n),chrome.tabs.onMoved.addListener(r),chrome.tabs.onAttached.addListener(r),chrome.tabs.onDetached.addListener(r),()=>{t!=null&&(clearTimeout(t),t=null),chrome.tabs.onCreated.removeListener(r),chrome.tabs.onRemoved.removeListener(r),chrome.tabs.onReplaced.removeListener(r),chrome.tabs.onActivated.removeListener(r),chrome.tabs.onUpdated.removeListener(n),chrome.tabs.onMoved.removeListener(r),chrome.tabs.onAttached.removeListener(r),chrome.tabs.onDetached.removeListener(r)}}async function e_(){const[e,t]=await Promise.all([Ce(),chrome.storage.session.get(ea)]),r=t[ea],n=Va(r)??crypto.randomUUID();return n!==r&&await chrome.storage.session.set({[ea]:n}),{profileInstanceId:e,generation:n}}function t_(e,t,r=null){return{id:e.id,browserId:t.profileInstanceId,faviconUrl:r,lastOpened:new Date(an(e)).toISOString(),providerTabId:ll(t,e.id),title:e.title??"",url:e.url}}function ll(e,t){return JSON.stringify([e.generation,String(t)])}async function r_(e){switch(e.namespace){case"bookmarks":return await i_(e.args[0]);case"tabs":return await ta(e.method==="remove"?Array.isArray(e.args[0])?e.args[0]:[e.args[0]]:[]);case"tabGroups":return await ta();case"windows":return await n_(e);default:throw new Error(`Unhandled browser management namespace: ${e.namespace}`)}}async function n_(e){const t={windows:(await chrome.windows.getAll({windowTypes:["normal"]})).filter(({incognito:r})=>!r).flatMap(({focused:r,height:n,id:i,left:a,state:s,top:o,width:l})=>i==null?[]:[{focused:r,height:n,id:i,left:a,state:s,top:o,width:l}])};return e.method==="create"&&Vt(e.args[0])&&Object.hasOwn(e.args[0],"tabId")&&(t.tabLayout=(await ta()).tabLayout),t}async function i_(e){if(typeof e!="string")return{};const[t]=await chrome.bookmarks.get(e);if(t==null)throw new Error(`Chrome bookmark ${e} is unavailable`);const{id:r,index:n,parentId:i,title:a,url:s}=t;return{bookmarks:[{id:r,index:n,parentId:i,title:a,url:s}]}}async function ta(e=[]){const[t,r]=await Promise.all([chrome.tabs.query({}),chrome.tabGroups?.query?.({}).catch(()=>[])??[]]),n=t.filter(({incognito:a})=>!a),i=new Set(n.map(({groupId:a})=>a));return{tabLayout:{tabs:n.flatMap(({autoDiscardable:a,groupId:s,id:o,index:l,pinned:h,url:m,windowId:d})=>o==null?[]:[{autoDiscardable:a,groupId:s,id:o,index:l,pinned:h,windowId:d,...e.includes(o)?{url:m}:{}}]),groups:r.filter(({id:a})=>i.has(a)).map(({collapsed:a,color:s,id:o,title:l,windowId:h})=>({collapsed:a,color:s,id:o,title:l,windowId:h}))}}}var ra="BROWSER_MANAGEMENT_AUDIT_TRAIL",cl=50,a_=4320*60*1e3,ul=Promise.resolve();async function s_(e,t){return await hl(async()=>{const r=await dl().catch(()=>{});if(r==null)return await t();const n=await r_(e).catch(()=>{});if(n==null)return await t();const i=await t();if(!l_(e,n))return i;const a={args:e.args,before:n,createdAt:Date.now(),method:e.method,namespace:e.namespace};return typeof i=="number"?a.result=i:Vt(i)&&typeof i.id=="string"?a.result={id:i.id}:e.namespace==="windows"&&Vt(i)&&typeof i.id=="number"&&(a.result=i.id),r.push(a),await c_(r).catch(()=>{}),i})}async function o_(){return await hl(async()=>({changes:(await dl()).toReversed()}))}function l_(e,t){if(e.namespace==="bookmarks")return!0;if(e.namespace==="windows")return e.method==="create"||(t.windows?.some(({id:a})=>a===e.args[0])??!1);const r=t.tabLayout?.tabs??[];if(e.namespace==="tabGroups")return r.some(({groupId:a})=>a===e.args[0]);const n=e.args[0],i=Vt(n)?n.tabIds:n;return(Array.isArray(i)?i:[i]).every(a=>r.some(({id:s})=>s===a))}async function dl(){const e=await chrome.storage.session.get(ra),t=Date.now()-a_;return(e[ra]??[]).filter(({createdAt:r})=>r>=t).slice(-cl)}async function c_(e){await chrome.storage.session.set({[ra]:e.slice(-cl)})}async function hl(e){const t=ul.then(e);return ul=t.then(()=>{},()=>{}),await t}var u_=new Set(["autoDiscardable","pinned"]),d_=new Set(["collapsed","color","title"]),h_=new Set(["focused","height","left","state","top","width"]),f_=new Set(["focused","height","left","state","tabId","top","type","width"]);async function p_(e){if(e.args.length>1)throw new Error("Chrome API windows.create accepts at most one argument");const t=sn(e.args.length===0?{}:e.args[0],f_,"windows.create",!0);if(t.type!==void 0&&t.type!=="normal")throw new Error("Chrome API windows.create only supports normal windows");if(_l(t.state,"windows.create"),!Object.hasOwn(t,"tabId"))return t;const r=await chrome.tabs.get(Ye(t.tabId,"tab ID"));if(r.pinned)throw new Error("Chrome API windows.create cannot move a pinned tab without changing its pinning");return await gl(r.windowId,"windows.create"),await vl([r.windowId]),t}async function m_(e){const t=Ye(e.args[0],"window ID");_l(sn(e.args[1],h_,"windows.update").state,"windows.update"),await gl(t,"windows.update")}async function fl(e){const t=Ye(e.args[0],"group ID");e.method==="update"&&sn(e.args[1],d_,"tabGroups.update"),await ia(t)}async function g_(e){const t=sn(e.args[1],u_,"tabs.update"),r=Ye(e.args[0],"tab ID");t.pinned===!0&&await aa([r])}async function __(e){const t=na(e.args[0]),r=Xt(e.args[1],"tabs.move"),n=await Promise.all(t.map(a=>chrome.tabs.get(a))),i=new Set(n.map(({windowId:a})=>a));Object.hasOwn(r,"windowId")&&i.add(Ye(r.windowId,"window ID")),await vl(i)}async function pl(e){await aa(na(e.args[0]))}async function v_(e){const t=Xt(e.args[0],"tabs.group"),r=await aa(na(t.tabIds));let n,i;if(Object.hasOwn(t,"groupId")?i=(await ia(Ye(t.groupId,"group ID"))).windowId:(n=t.createProperties===void 0?{}:Xt(t.createProperties,"tabs.group createProperties"),i=n.windowId===void 0?r[0].windowId:Ye(n.windowId,"createProperties.windowId")),r.some(a=>a.windowId!==i))throw new Error("Chrome API tabs.group cannot move tabs between windows; group tabs separately by window. Use tabs.move only for user-requested transfers.");return n===void 0?t:{...t,createProperties:{...n,windowId:i}}}function ml(e){const t=Xt(e.args[e.method==="create"?0:1],`bookmarks.${e.method}`);if(Object.hasOwn(t,"url")){try{if(typeof t.url=="string"){const{protocol:r}=new URL(t.url);if(r==="http:"||r==="https:")return}}catch{}throw new Error(`Chrome API bookmarks.${e.method} requires a valid http or https URL`)}}function sn(e,t,r,n=!1){const i=Xt(e,r),a=Object.keys(i);if(!n&&a.length===0||a.some(s=>!t.has(s)))throw new Error(`Chrome API ${r} contains an unsupported property`);return i}function Xt(e,t){if(!Vt(e))throw new Error(`Chrome API ${t} requires a plain options object`);return e}function na(e){const t=Array.isArray(e)?e:[e];if(t.length===0)throw new Error("Chrome API requires at least one tab ID");return t.map(r=>Ye(r,"tab ID"))}function Ye(e,t){if(typeof e!="number"||!Number.isSafeInteger(e)||e<0)throw new Error(`Chrome API requires an explicit valid ${t}`);return e}async function gl(e,t){const r=await chrome.windows.get(e);if(r.type!=="normal"||r.incognito)throw new Error(`Chrome API ${t} requires a normal non-incognito window`)}function _l(e,t){if(e==="locked-fullscreen")throw new Error(`Chrome API ${t} cannot lock a window in fullscreen`)}async function vl(e){await wl((await Promise.all([...e].map(t=>chrome.tabs.query({windowId:t})))).flat())}async function ia(e){const t=await chrome.tabGroups.get(e);if(t.shared)throw new Error(`Chrome API cannot modify shared tab group ${e} without permission to share`);return t}async function aa(e){const t=await Promise.all([...new Set(e)].map(r=>chrome.tabs.get(r)));return await wl(t),t}async function wl(e){const t=new Set(e.map(({groupId:r})=>r));t.delete(-1),await Promise.all([...t].map(ia))}var bl={bookmarks:{create:{audit:!0,validate:ml},get:{},getChildren:{},getSubTree:{},getTree:{},move:{audit:!0},remove:{audit:!0},search:{},update:{audit:!0,validate:ml}},tabGroups:{get:{},move:{audit:!0,validate:fl},query:{},update:{audit:!0,validate:fl}},tabs:{get:{},group:{audit:!0},move:{audit:!0,validate:__},query:{},remove:{audit:!0,validate:pl},ungroup:{audit:!0,validate:pl},update:{audit:!0,validate:g_}},windows:{create:{audit:!0},get:{},getAll:{},getCurrent:{},getLastFocused:{},update:{audit:!0,validate:m_}}};async function w_(e){if(!b_(e))throw new Error(`Chrome API chrome.${e.namespace}.${e.method} is not allowed`);const t=bl[e.namespace];if(!Object.hasOwn(t,e.method))throw new Error(`Chrome API chrome.${e.namespace}.${e.method} is not allowed`);const r=t[e.method],n=async()=>{if(e.namespace==="windows"&&e.method==="create"){const o=await p_(e),l={...o,incognito:!1};return Object.hasOwn(o,"tabId")||(l.url="about:blank"),await chrome.windows.create(l)}await r.validate?.(e);const i=chrome[e.namespace];if(i==null||!Object.hasOwn(i,e.method))throw new Error(`Chrome API chrome.${e.namespace}.${e.method} is unavailable`);const a=Reflect.get(i,e.method);if(typeof a!="function")throw new Error(`Chrome API chrome.${e.namespace}.${e.method} is unavailable`);const s=e.namespace==="tabs"&&e.method==="group"?[await v_(e),...e.args.slice(1)]:e.args;return Reflect.apply(a,i,s)};return r.audit?await s_(e,n):await n()}function b_(e){return Object.hasOwn(bl,e.namespace)}var y_={id:"pageAssets",description:"List assets already observed in the current page state and bundle selected assets into a temporary local artifact."},ft=new Set,on=new Set,ln=new Map,cn=new Map,un=new Map,S_=1500,T_=1e4,It="about:blank",E_=5e3,I_=25,yl=!1;function A_(){yl||(chrome.debugger?.onDetach?.addListener(e=>{typeof e.tabId=="number"&&ft.delete(e.tabId),typeof e.targetId=="string"&&(on.delete(e.targetId),ln.delete(e.targetId))}),yl=!0)}var C_=class{browserFamily=Ot(navigator.userAgent,"brave"in navigator);sessions=new Map;tabLeases=ze.getInstance();requestHeaderPolicy=new xg;agentPopupInterceptorEnabled;browserManagementEnabled;webMcpConfig;browserTabMentionProvider;cursorArrivalWaitersByKey=new Map;downloadChangeListeners=new Set;downloadFilenamesById=new Map;downloadUrlsById=new Map;nextCursorMoveSequence=1;constructor({agentPopupInterceptorEnabled:e,buildChannel:t=Er("prod"),browserManagementEnabled:r,browserTabMentionProvider:n,webMcpConfig:i}={}){this.agentPopupInterceptorEnabled=e,this.browserManagementEnabled=r??Promise.resolve(!0),this.webMcpConfig=i;const a=Ji.getInstance();this.browserTabMentionProvider=n??new ol(t,a),A_(),fg(),Ym()}ping(){return"pong"}async focusTab(e){if(!Number.isSafeInteger(e.tabId)||e.tabId<=0)throw new Error("focusTab requires a positive integer tabId");if(e.session_id!=null&&!this.sessions.has(this.requireSessionId(e)))return!1;const t=await Qe(e.tabId);return await Promise.all([chrome.tabs.update(e.tabId,{active:!0}),chrome.windows.update(t.windowId,{focused:!0})]),e.session_id==null?void 0:!0}async executeCdp(e){return await(await this.activateSession(e)).executeCdp(e)}async attach(e){await this.resolveSession(e).attach(e)}async attachTarget(e){await this.resolveSession(e).attachTarget(e)}async detach(e){await this.resolveSession(e).detach(e)}async detachTarget(e){await this.resolveSession(e).detachTarget(e)}async getCommittedTabUrl(e){return await(await this.activateSession(e)).getCommittedTabUrl(e.tabId)}async getTabs(e){const t=await(await this.activateSession(e)).getTabs();return await Promise.all(t.map(async r=>({...r,providerTabId:await this.browserTabMentionProvider.getProviderTabId(r.id)})))}async getUserTabs(e){if(e.includeFavicons!==void 0||e.limit!==void 0||e.query!==void 0)return await this.browserTabMentionProvider.getUserTabs(e);const t=await L_();return await Promise.all(t.map(async r=>({...r,providerTabId:await this.browserTabMentionProvider.getProviderTabId(r.id)})))}async getUserHistory(e){return await this.activateSession(e),await globalThis.ChatGPTSafariPersonalData.history(e)}async executeTabRead(e){return hn("executeTabRead",e.tabId),await this.activateSession(e),await Bm(e)}async getBookmarks(e){return await this.activateSession(e),await globalThis.ChatGPTSafariPersonalData.getBookmarks()}async createNotification(e){return await this.activateSession(e),await globalThis.ChatGPTSafariNotifications.create(e)}async getRecentlyClosedSessions(e){await this.activateSession(e);throw new Error("Safari does not expose its recently closed session inventory through a public WebExtension API. No browsing-history substitute or fabricated restore handle is returned.")}async getTopSites(e){await this.activateSession(e);throw new Error("Safari does not expose its frequently visited Top Sites inventory through a public WebExtension API. Bookmarks and history rankings are different data and are not substituted.")}async claimUserTab(e){return await this.resolveSession(e).claimUserTab(e,e.tabId)}async createTab(e){const t=this.resolveSession(e),r=typeof e.preferredWindowId=="number"&&Number.isSafeInteger(e.preferredWindowId)&&e.preferredWindowId>=0?e.preferredWindowId:void 0;return await t.createTab(e,r)}async markTab(e){await this.resolveSession(e).markTab(e,e.tabId,e.status)}async finalizeTabs(e){const t=this.resolveSession(e);if(!Array.isArray(e.keep))throw new Error("finalizeTabs requires a keep array");await t.finalizeTabs(e,e.keep)}async nameSession(e){await this.resolveSession(e).nameSession(e,e.name)}async executeUnhandledCommand(e){if(e.type==="browser_safari_context"){const t=await this.activateSession(e);await globalThis.ChatGPTSafariAgent.authorize(t,e);return{}}if(e.type==="browser_safari_command"){const t=await this.activateSession(e);return globalThis.ChatGPTSafariAgent.execute(e.command,t,e)}const t=await this.activateSession(e),r=this.requireTurnId(e);return await Fc({backendName:Te[this.browserFamily].shortDisplayName,commandSets:[Lm,Em],handlers:{[Yr]:async n=>{if(!await this.browserManagementEnabled)throw new Error("Browser management capability is disabled");const i=Kt.parse(n);return Oi.parse({value:await t.executeBrowserManagementCall(r,i)})},[Qr]:async n=>{if(!await this.browserManagementEnabled)throw new Error("Browser management capability is disabled");return Pi.parse(n),Mi.parse(await t.getBrowserManagementAuditTrail(r))},[tn]:async n=>{const i=Ui.parse(n);return await t.setViewport(e,{height:i.height,width:i.width}),Fi.parse({})},[en]:async n=>(xi.parse(n),await t.setViewport(e,null),Ni.parse({}))},payload:e})}async moveMouse(e){q_("moveMouse",e);const t=he.isObserved(e.tabId);await(await this.activateSession(e)).requireSessionTab(e.tabId,{publishOverlay:!1,trackOverlay:!0});const r=this.nextCursorMoveSequence;this.nextCursorMoveSequence+=1;const n=e.waitForArrival===!1||!t?!1:await G_(e.tabId),i=e.waitForArrival!==!1&&n?this.createCursorArrivalWaiter({moveSequence:r,sessionId:e.session_id,turnId:e.turn_id}):null,a=await he.setCursorState(e.session_id,e.tabId,e.turn_id,{...n?{}:{animateMovement:!1},moveSequence:r,visible:!0,x:e.x,y:e.y},{publish:t});if(i!=null){if(!a){i.cancel();return}await i.promise}}notifyCursorArrived({moveSequence:e,sessionId:t,turnId:r}){Number.isInteger(e)&&this.cursorArrivalWaitersByKey.get(Sl(t,r,e))?.()}async turnEnded(e){const t=this.requireSessionId(e),r=this.requireTurnId(e);let n=this.sessions.get(t);n||(n=new Tl(t,this.browserFamily,this.agentPopupInterceptorEnabled,this.requestHeaderPolicy),this.sessions.set(t,n));try{await n.endTurn(r)}finally{await globalThis.ChatGPTSafariAgent.release(t,r)}}async getInfo(e){const t=await Ce();return{browserTabMentions:await this.browserTabMentionProvider.getCapabilityInfo(),family:"safari",name:"Safari",version:typeof chrome.runtime.getVersion=="function"?chrome.runtime.getVersion():"unknown",type:"extension",apiSupportOverrides:{"Browser.user":true,"BrowserUser.getTabContext":true,"Browser.capabilities":true,"Browser.history":true,"Tabs.new":true,"Tabs.content":false,"Tab.ax":false,"Tab.capabilities":true,"Tab.clipboard":true,"Tab.content":true,"ContentAPI.export":false,"ContentAPI.exportGsuite":true,"ContentAPI.exportYouTubeTranscript":true,"Tab.cua":true,"Tab.dev":true,"Tab.dom_cua":true,"Tab.playwright":true,"PlaywrightAPI.evaluate":false,"PlaywrightLocator.evaluate":false,"PlaywrightLocator.evaluateAll":false,"PlaywrightAPI.waitForEvent":true,"PlaywrightAPI.elementInfo":false,"PlaywrightAPI.elementScreenshot":false,"Tab.screenshot":true,"Tab.getJsDialog":true,"Tab.requestManualHandoff":false,"DomCUAAPI.double_click":true,"DomCUAAPI.downloadMedia":true},agentRequestHeaderEnabled:await this.requestHeaderPolicy.isEnabled(),capabilities:{browser:[{...Go.info,description:"Set exact measured CSS dimensions by resizing the real ordinary Safari window. Native focus, screen and minimum-size limits apply. Read Safari-specific documentation and reset before finishing."},...await this.browserManagementEnabled?[{...Mo.info,description:"Organize ordinary Safari tabs and native named tab groups. Read Safari-specific documentation first."}]:[]],tab:[y_]},metadata:{extensionId:chrome.runtime.id,extensionInstanceId:t}}}addDownloadChangeListener(e){return this.downloadChangeListeners.add(e),()=>{this.downloadChangeListeners.delete(e)}}handleDownloadCreated(e){Ll(e.id)&&he.isBrowserControlActive()&&typeof e.filename=="string"&&(this.downloadFilenamesById.set(e.id,e.filename),this.downloadUrlsById.set(e.id,e.finalUrl),this.emitDownloadChange({id:String(e.id),filename:e.filename,url:e.finalUrl,status:"started"}))}handleDownloadChanged(e){if(!Ll(e.id))return;const t=z_(e,this.downloadFilenamesById);if(t==null)return;const r=this.downloadUrlsById.get(e.id);if(r==null)return;this.downloadFilenamesById.set(e.id,t);const n=V_(e);n!=null&&this.emitDownloadChange({id:String(e.id),filename:t,url:r,status:n})}async handleCreatedNavigationTarget(e){const t=await this.tabLeases.getActiveLease(e.sourceTabId);if(t==null)return;const r=this.sessions.get(t.sessionId);r!=null&&await r.claimChildTab(t,e.tabId)}async handleAgentBackgroundPopup(e,t){const r=await this.tabLeases.getActiveLease(e);if(r==null)return;const n=this.sessions.get(r.sessionId);if(n==null||n.currentTurnId!==r.turnId)return;let i;try{i=new URL(t)}catch{return}if(i.protocol!=="http:"&&i.protocol!=="https:")return;const a=await Qe(e),s=await chrome.tabs.create({active:!1,openerTabId:e,url:"about:blank",windowId:a.windowId});if(s.id!=null)try{await n.claimChildTab(r,s.id,{logicalActive:!0}),await this.tabLeases.getActiveLease(s.id)==null?await chrome.tabs.remove(s.id).catch(()=>{}):await chrome.tabs.update(s.id,{url:i.href})}catch(o){throw await chrome.tabs.remove(s.id).catch(()=>{}),o}}resolveSession(e){const t=this.requireSessionId(e);this.requireTurnId(e);let r=this.sessions.get(t);if(e.session_context==="cached"){if(!r)throw new Error(`Browser session ${t} is not active`);return r.requireActiveTurn(this.requireTurnId(e)),r}return r||(r=new Tl(t,this.browserFamily,this.agentPopupInterceptorEnabled,this.requestHeaderPolicy),this.sessions.set(t,r)),r}async activateSession(e){const t=this.resolveSession(e);return await t.activateTurn(e),t}requireSessionId(e){const t=e?.session_id;if(typeof t!="string")throw new Error("Missing required browser session_id");return t}requireTurnId(e){const t=e?.turn_id;if(typeof t!="string")throw new Error("Missing required browser turn_id");return t}createCursorArrivalWaiter({moveSequence:e,sessionId:t,turnId:r}){const n=Sl(t,r,e);let i=null,a=null;const s=()=>{i!=null&&(clearTimeout(i),i=null),this.cursorArrivalWaitersByKey.delete(n),a?.()};return{cancel:s,promise:new Promise(o=>{a=o,i=setTimeout(s,S_),this.cursorArrivalWaitersByKey.set(n,s)})}}emitDownloadChange(e){for(const t of this.downloadChangeListeners)t(e)}};function Sl(e,t,r){return`${e}:${t}:${r}`}var Tl=class{tabGroups=globalThis.ChatGPTSafariSessionWindows;tabLeases=ze.getInstance();tabFavicons=Ji.getInstance();activeTabId=null;lifecycleQueue=Promise.resolve();currentTurnId=null;requestHeaderEnabled;constructor(e,t,r,n){this.sessionId=e,this.browserFamily=t,this.agentPopupInterceptorEnabled=r,this.requestHeaderPolicy=n}async activateTurn(e){this.currentTurnId===e.turn_id&&e.agent_request_header_enabled===void 0||await this.runTurnMutation(e,async()=>{})}requireActiveTurn(e){if(this.currentTurnId!==e)throw new Error(`Browser session ${this.sessionId} turn ${e} is not active`)}async executeBrowserManagementCall(e,t){return await this.runLifecycle(async()=>(this.requireActiveTurn(e),await w_(t)))}async getBrowserManagementAuditTrail(e){return await this.runLifecycle(async()=>(this.requireActiveTurn(e),await o_()))}async executeCdp(e){const t=e.target.tabId;if(typeof t=="number"&&(await this.requireSessionTab(t),!ft.has(t)))throw new Error("Debugger unattached");try{return typeof t=="number"&&e.target.sessionId==null&&e.target.targetId==null&&(e.method==="Page.close"||e.method==="Target.closeTarget")&&await this.tabFavicons.restoreTabFaviconsBestEffort([t]),await Z_(e)}catch(r){throw X_(r)&&typeof t=="number"&&e.preserveDebuggerOnTimeout!==!0&&await O_(t),r}}async attach(e){await this.runTurnMutation(e,async()=>{await this.requireSessionTab(e.tabId),await El(e.tabId,await this.tabLeases.takeViewportSizeForAttach(this.sessionId,e.turn_id,e.tabId))})}async attachTarget(e){await this.runTurnMutation(e,async()=>{await this.requireSessionTab(e.tabId),await k_(e.tabId,e.targetId)})}async detach(e){await this.runLifecycle(async()=>{this.currentTurnId!=null&&this.requireActiveTurn(e.turn_id),await this.requireOwnedTab(e.tabId),await Al(e.tabId)})}async detachTarget(e){await this.runLifecycle(async()=>{this.currentTurnId!=null&&this.requireActiveTurn(e.turn_id),await this.requireOwnedTab(e.tabId),await Cl(e.targetId)})}async getCommittedTabUrl(e){return await this.requireOwnedTab(e),(await chrome.tabs.get(e)).url}async getTabs(){return await this.listSessionTabs()}async createTab(e,t){return await this.runTurnMutation(e,async()=>{const r=await this.activeAgentTabIds();r.length===0&&t==null&&this.activeTabId!=null&&(t=(await Qe(this.activeTabId).catch(()=>null))?.windowId);const n=Yt(await this.tabGroups.createTab(this.sessionId,r.length===0?t:void 0));return this.activeTabId=n.id,await rl(n.id),await this.tabGroups.ensureAgentTabGroup(this.sessionId,n.id,r),await this.tabLeases.claimTab(this.sessionId,e.turn_id,n.id,"agent",this.requestHeaderEnabled),await this.requireSessionTab(n.id,{trackOverlay:!0}),{...n,active:!0}})}async claimChildTab(e,t,r={}){await this.runLifecycle(async()=>{if(this.currentTurnId!==e.turnId||!await this.tabLeases.claimTabIfSourceLeaseMatches(e,t))return;const n=await Qe(t).catch(()=>null);if(n==null)return;(n.active===!0||r.logicalActive===!0)&&(this.activeTabId=t);const i=(await this.activeAgentTabIds()).filter(a=>a!==t);await Promise.allSettled([rl(t),this.tabGroups.ensureAgentTabGroup(this.sessionId,t,i),this.requireSessionTab(t,{trackOverlay:!0})])})}async claimUserTab(e,t){return await this.runTurnMutation(e,async()=>{let r=await Qe(t);const n=await this.tabLeases.getOwningSessionId(t);if(n!=null&&n!==this.sessionId)throw new Error(`Tab ${t} is already part of browser session ${n}`);if((ja(this.browserFamily,r.url)||ja(this.browserFamily,r.pendingUrl))&&(r=await M_(t)),br(this.browserFamily,r.url)||br(this.browserFamily,r.pendingUrl))throw new Error(`${Te[this.browserFamily].shortDisplayName} internal tab ${t} cannot be claimed`);return this.activeTabId=r.id,n===this.sessionId?(await this.requireSessionTab(r.id,{trackOverlay:!0}),{...Yt(r),active:!0}):(await this.tabLeases.claimTab(this.sessionId,e.turn_id,r.id,"user",this.requestHeaderEnabled),await this.requireSessionTab(r.id,{trackOverlay:!0}),{...Yt(r),active:!0})})}async markTab(e,t,r){await this.runTurnMutation(e,async()=>{hn("markTab",t),H_(r),await this.requireSessionTab(t),await this.tabLeases.setTabMark(this.sessionId,e.turn_id,t,r)})}async nameSession(e,t){await this.runTurnMutation(e,async()=>{await this.tabGroups.setSessionGroupTitle(this.sessionId,t,await this.activeAgentTabIds())})}async setViewport(e,t){await this.runTurnMutation(e,async()=>{const r=(await this.listSessionTabs()).find(n=>n.active);await this.tabLeases.setViewportSize(this.sessionId,e.turn_id,r?.id??null,t),r!=null&&await El(r.id,t)})}async finalizeTabs(e,t){await this.runLifecycle(async()=>{await this.activateTurnUnlocked(e);const r=await this.listSessionTabs(),n=W_(t,new Set(r.map(i=>i.id)));await this.tabLeases.replaceTurnMarks(this.sessionId,e.turn_id,n),await this.endTurnUnlocked(e.turn_id)})}async endTurn(e){await this.runLifecycle(()=>this.endTurnUnlocked(e))}async endTurnUnlocked(e){if(this.currentTurnId!=null&&this.currentTurnId!==e)return;await this.tabLeases.clearPendingViewportSize(this.sessionId,e);const t=await this.tabLeases.getSessionActiveLeases(this.sessionId),r=new Map([...t].filter(([,h])=>h.turnId===e)),n=new Set((await this.listSessionTabs()).map(h=>h.id)),{handoff:i,deliverable:a,close:s,release:o}=$c([...r.values()].filter(h=>n.has(h.tabId))),l=[...i,...a,...s,...o];await he.stopSessions([this.sessionId]),await Promise.all([Promise.all([...a.map(async h=>this.tabFavicons.markFinalized(h,"deliverable").catch(()=>{})),...i.map(async h=>this.tabFavicons.markFinalized(h,"handoff").catch(()=>{}))]),this.detachAttachedDebuggersBestEffort(l)]),await Promise.allSettled([...l.map(gg),...l.map(eg)]),await this.tabGroups.releaseTabsFromManagedGroups(a),s.length>0&&(await this.tabFavicons.closeTabsWithFaviconRestore(s,()=>K_(s)),await this.tabGroups.refreshManagedGroupsFromChrome()),await Promise.all(l.map(async h=>he.untrackTab(this.sessionId,h))),await this.tabLeases.releaseTabs(this.sessionId,[...a,...s,...o]),i.length>0&&await this.tabLeases.handoffTabs(this.sessionId,e,i,{...this.activeTabId==null?{}:{activeTabId:this.activeTabId}}),this.activeTabId=null,this.currentTurnId=null,[...r.values()].some(h=>h.requestHeaderEnabled!==void 0)&&await this.tabLeases.reconcileRequestHeaders()}async resumeHandoffIfPresent(e){const t=await this.tabLeases.getSessionHandoffLeases(this.sessionId);if(t.size===0)return;const r=await Promise.all([...t.keys()].map(async l=>{try{return await Qe(l),{tabId:l,state:"reclaimed"}}catch{return{tabId:l,state:"stale"}}})),n=[],i=[];for(const l of r)l.state==="reclaimed"?n.push(l.tabId):i.push(l.tabId);if(i.length>0&&await this.tabLeases.releaseTabs(this.sessionId,i),n.length===0)return;const a=await this.tabLeases.resumeHandoffTabs(this.sessionId,e,n);if(a.length===0)return;const s=new Set(a),o=[...t.values()].find(l=>l.isActiveHandoff===!0&&s.has(l.tabId))?.tabId;this.activeTabId=o??a[0]??null}async detachAttachedDebuggersBestEffort(e){const t=new Set(e);await Promise.allSettled([...[...t].filter(r=>ft.has(r)).map(async r=>Al(r)),...Array.from(ln.entries()).filter(([,r])=>t.has(r)).map(async([r])=>Cl(r))])}async listSessionTabs(){const e=(await this.tabLeases.getSessionTabs(this.sessionId)).filter(t=>t.id!==void 0&&!br(this.browserFamily,t.url));return this.tabInfosWithLogicalActive(e)}async activeAgentTabIds(){return[...(await this.tabLeases.getSessionActiveLeases(this.sessionId)).values()].filter(e=>e.origin==="agent").map(e=>e.tabId)}tabInfosWithLogicalActive(e){const t=e.map(Yt),r=this.resolveLogicalActiveTabId(t);return r==null?t:t.map(n=>n.active===(n.id===r)?n:{...n,active:n.id===r})}resolveLogicalActiveTabId(e){return e.length===0?null:this.activeTabId!=null&&e.some(t=>t.id===this.activeTabId)?this.activeTabId:(this.activeTabId=e.find(t=>t.active)?.id??e[0]?.id??null,this.activeTabId)}async requireSessionTab(e,t={}){await this.requireOwnedTab(e);const r=t.trackOverlay===!0&&t.publishOverlay!==!1;await he.startSession(this.sessionId,this.currentTurnId,{publishTabs:r}),t.trackOverlay===!0&&await he.trackTab(this.sessionId,e,{publish:r}),mg(e),await Promise.all([Xo(e),Promise.resolve(this.requestHeaderEnabled===!0||this.agentPopupInterceptorEnabled).then(async n=>{if(!n)return;Qm(e);const i=await Ko(e);if(this.requestHeaderEnabled===!0&&!i&&(await chrome.tabs.get(e)).url!=="about:blank")throw new Error("Unable to prepare popup request headers. Retry the browser command.")})])}async requireOwnedTab(e){if(!await this.tabLeases.isClaimedBySession(this.sessionId,e))throw new Error(`Tab ${e} is not part of browser session ${this.sessionId}`)}async runLifecycle(e){const t=this.lifecycleQueue.then(e,e);return this.lifecycleQueue=t.then(()=>{},()=>{}),await t}async runTurnMutation(e,t){return await this.runLifecycle(async()=>(await this.activateTurnUnlocked(e),await t()))}async activateTurnUnlocked(e){if(e.session_context==="cached"&&this.requireActiveTurn(e.turn_id),e.agent_request_header_enabled!==void 0){if(typeof e.agent_request_header_enabled!="boolean")throw new Error("Invalid agent request-header policy: expected a boolean.");const r=await this.requestHeaderPolicy.applyDecision(e.agent_request_header_enabled);await this.tabLeases.setSessionRequestHeaderEnabled(this.sessionId,r),this.requestHeaderEnabled=r}const t=e.turn_id;this.currentTurnId!==t&&(await this.resumeHandoffIfPresent(t),await this.tabLeases.updateActiveSessionTurn(this.sessionId,t),this.currentTurnId=t)}};async function El(e,t){if(!chrome.debugger)throw new Error("Safari browser control is unavailable: the desktop runtime requires a CDP debugger, which Safari does not expose.");await oa(e,async()=>{if(ft.has(e)){t!==void 0&&await Il(e,t);return}try{await chrome.debugger.attach({tabId:e},"1.3")}catch(r){if(!Ml(r))throw r}await Il(e,t),ft.add(e)})}async function k_(e,t){if(!chrome.debugger)throw new Error("Safari browser control is unavailable: the desktop runtime requires a CDP debugger, which Safari does not expose.");await Pl(t,async()=>{if(!on.has(t)){try{await chrome.debugger.attach({targetId:t},"1.3")}catch(r){if(!Ml(r))throw r}on.add(t),ln.set(t,e)}})}async function Il(e,t){const r=t??R_(void 0);if(r==null){if(t===void 0)return;await la({target:{tabId:e},method:"Emulation.clearDeviceMetricsOverride",commandParams:{}});return}await la({target:{tabId:e},method:"Emulation.setDeviceMetricsOverride",commandParams:{...r,deviceScaleFactor:1,mobile:!1}})}function R_(e){if(typeof e!="string")return null;const t=/^(?<width>[1-9]\d*)x(?<height>[1-9]\d*)$/u.exec(e);return t?.groups==null?null:{width:Number.parseInt(t.groups.width,10),height:Number.parseInt(t.groups.height,10)}}async function Al(e){await oa(e,async()=>{try{await chrome.debugger.detach({tabId:e})}finally{ft.delete(e)}})}async function Cl(e){await Pl(e,async()=>{try{await chrome.debugger.detach({targetId:e})}finally{on.delete(e),ln.delete(e)}})}async function O_(e){await oa(e,async()=>{ft.delete(e);try{await chrome.debugger.detach({tabId:e})}catch{}})}async function P_(e){const t=await kl(e);if(t==null)return Yt(await Rl());let r;try{r=await sa(t)}catch(n){if(t!==e)throw n;const i=await kl(e);if(i===e)throw n;r=i==null?await Rl():await sa(i)}return Yt(r)}async function Qe(e){const t=await chrome.tabs.get(e);if(dn(t))return t;throw new Error(`Browser tab ${e} has no id`)}async function kl(e){const t=await chrome.windows.getAll({windowTypes:["normal"]}),r=t.find(i=>i.id===e);if(r?.id!==void 0)return r.id;const n=t.find(i=>i.focused&&i.id!==void 0);return n?.id!==void 0?n.id:t.find(i=>i.id!==void 0)?.id??null}async function Rl(){const e=await chrome.windows.create({focused:!1,type:"normal",url:It}),t=e?.tabs?.find(dn);if(t)return t;if(e?.id===void 0)throw new Error("Created browser window has no id");return await sa(e.id)}async function sa(e){const t=await chrome.tabs.create({active:!1,url:It,windowId:e});if(dn(t))return t;throw new Error("Created tab has no id")}async function M_(e){const t=await chrome.tabs.update(e,{url:It});if(t==null||!dn(t))throw new Error(`Browser tab ${e} has no id`);if(t.url===It)return t;const r=Date.now()+E_;let n=await Qe(e);for(;n.url!==It;){if(Date.now()>=r)throw new Error(`Browser tab ${e} did not navigate to ${It}`);await new Promise(i=>setTimeout(i,I_)),n=await Qe(e)}return n}function dn(e){return e.id!==void 0}function Yt(e){return{id:e.id,title:e.title,active:e.active,faviconUrl:e.favIconUrl,url:e.url}}async function L_(){const e=await sl({}),t=await $_(e.map(({tab:r})=>r));return e.map(({tab:r})=>j_(r,t))}async function D_(e){const t=U_(e.limit),r={text:"",maxResults:t},n=Ol(e.from,"from")??0,i=Ol(e.to,"to");return r.startTime=n,i!=null&&(r.endTime=i),N_(await Promise.all(x_(e).map(async a=>await chrome.history.search({...r,text:a}))),t)}function x_(e){if(e.queries==null)return[""];if(!Array.isArray(e.queries)||e.queries.length===0)throw new Error("getUserHistory requires queries to be a non-empty array of strings");const t=[];for(const r of e.queries){if(typeof r!="string")throw new Error("getUserHistory requires queries to be a non-empty array of strings");t.push(r)}return t}function N_(e,t){const r=e.flatMap(i=>i.flatMap(F_)).sort((i,a)=>a.dateVisited.localeCompare(i.dateVisited)),n=new Set;return r.filter(({url:i})=>n.has(i)?!1:(n.add(i),!0)).slice(0,t)}function U_(e){if(e==null)return 100;if(typeof e!="number"||!Number.isInteger(e)||e<=0)throw new Error("getUserHistory requires limit to be a positive integer");return e}function Ol(e,t){if(e!=null){if(typeof e!="string")throw new Error(`getUserHistory requires ${t} to be a valid date`);return B_(e,t)}}function F_(e){const t=e.url,r=e.lastVisitTime;return typeof t!="string"||typeof r!="number"||!Number.isFinite(r)?[]:[{url:t,...e.title==null?{}:{title:e.title},dateVisited:new Date(r).toISOString()}]}function B_(e,t){const r=Date.parse(e);if(Number.isNaN(r))throw new Error(`getUserHistory requires ${t} to be a valid date`);return r}async function $_(e){const t=new Set;for(const n of e)typeof n.groupId=="number"&&n.groupId!==-1&&t.add(n.groupId);const r=await Promise.all([...t].map(async n=>{try{const i=(await chrome.tabGroups.get(n)).title?.trim();return i?[n,i]:null}catch{return null}}));return new Map(r.filter(n=>n!=null))}function j_(e,t){const r=an(e),n=typeof e.groupId=="number"?t.get(e.groupId):void 0;return{id:e.id,...e.title==null?{}:{title:e.title},...e.url==null?{}:{url:e.url},...r<=0?{}:{lastOpened:new Date(r).toISOString()},...n==null?{}:{tabGroup:n}}}async function oa(e,t){const r=cn.get(e)??Promise.resolve();let n=()=>{};const i=new Promise(s=>{n=s}),a=r.catch(()=>{}).then(()=>i);cn.set(e,a);try{return await r.catch(()=>{}),await t()}finally{n(),cn.get(e)===a&&cn.delete(e)}}async function Pl(e,t){const r=un.get(e)??Promise.resolve();let n=()=>{};const i=new Promise(s=>{n=s}),a=r.catch(()=>{}).then(()=>i);un.set(e,a);try{return await r.catch(()=>{}),await t()}finally{n(),un.get(e)===a&&un.delete(e)}}function Ml(e){return Y_(e).includes("Another debugger")}function q_(e,t){if(hn(e,t.tabId),!Number.isFinite(t.x)||!Number.isFinite(t.y))throw new Error(`${e} requires finite x and y coordinates`)}async function G_(e){let t;try{t=await chrome.tabs.get(e)}catch{return!1}if(t.active!==!0||typeof t.windowId!="number")return!1;try{const r=await chrome.windows.get(t.windowId);return r.type==="normal"&&r.state!=="minimized"}catch{return!1}}function hn(e,t){if(!Number.isInteger(t))throw new Error(`${e} requires an integer tabId`)}function Ll(e){return typeof e=="number"&&Number.isInteger(e)&&e>=0}function z_(e,t){const r=e.filename?.current;return typeof r=="string"?r:t.get(e.id)}function V_(e){switch(e.state?.current){case"complete":return"complete";case"interrupted":return e.error?.current==="USER_CANCELED"?"canceled":"failed";case"in_progress":return"in_progress";case void 0:return}}function H_(e){if(e!=="handoff"&&e!=="deliverable")throw new Error(`markTab received invalid status ${String(e)}`)}function W_(e,t){const r=new Map;for(const n of e){if(n==null)throw new Error("finalizeTabs received invalid tab entry");const{tabId:i,status:a}=n;if(hn("finalizeTabs",i),!t.has(i))throw new Error(`finalizeTabs cannot keep unknown tab ${i}`);if(a!=="handoff"&&a!=="deliverable")throw new Error(`finalizeTabs received invalid status ${String(a)}`);if(r.has(i))throw new Error(`finalizeTabs received duplicate tab ${i}`);r.set(i,a)}return r}async function K_(e){const t=e[0];if(t!=null){if(e.length===1){await chrome.tabs.remove(t);return}await chrome.tabs.remove([t,...e.slice(1)])}}function la(e){if(e.method==="Target.getTargets")return chrome.debugger.getTargets().then(r=>({targetInfos:r}));const t=typeof e.target.targetId=="string"?{targetId:e.target.targetId}:e.target;return chrome.debugger.sendCommand(t,e.method,e.commandParams)}async function Z_(e){const t=J_(e.timeoutMs);let r;const n=new Promise((i,a)=>{r=setTimeout(()=>{a(new Dl(e.method,t))},t)});try{return await Promise.race([la(e),n])}finally{r!==void 0&&clearTimeout(r)}}function J_(e){return typeof e=="number"&&Number.isFinite(e)&&e>0?e:T_}var Dl=class extends Error{constructor(e,t){super(`Timed out after ${t}ms waiting for CDP command ${e}.`),this.name="CdpCommandTimeoutError"}};function X_(e){return e instanceof Dl}function Y_(e){if(e instanceof Error)return e.message;if(e&&typeof e=="object"&&"message"in e){const t=e.message;if(typeof t=="string")return t}return String(e??"")}var Q_="native-transport-reconnect",fn=5e3,ev=3e4/6e4,tv="native-host:",rv=/^native-host:\d+$/,nv=class extends Error{errorType;constructor(e,t){super(e),this.name="NativeHostRequestError",this.errorType=sv(t)}},iv=class extends Error{constructor(e,t){super(`Native host request ${e} timed out after ${t}ms`),this.method=e,this.timeoutMs=t,this.name="NativeHostRequestTimeoutError"}},pn=class extends Error{constructor(e){super(e),this.name="NativeTransportConnectionError"}},av=class{port=null;messageCallback=null;nextHostRequestId=0;pendingHostRequests=new Map;applicationCandidates;applicationIndex=0;failedApplications=new Set;reconnectAlarmName;reconnectTimeoutId=null;reconnectPending=!1;reconnectAttempt=0;status;handleReconnectAlarm=e=>{if(e.name===this.reconnectAlarmName){if(this.port){this.clearReconnectAlarm();return}this.runReconnectAttempt()}};constructor(e="com.openai.codexextension"){this.applicationCandidates=typeof e=="string"?[e]:[e[0],...e.slice(1)],this.reconnectAlarmName=`${Q_}:${this.application}`,this.status={state:"disconnected",hostName:this.application,lastChecked:Date.now(),reconnectAttempt:this.reconnectAttempt},chrome.alarms.onAlarm.addListener(this.handleReconnectAlarm),this.connect()||this.scheduleReconnect()}sendMessage(e){if(!this.port)throw this.scheduleReconnect(),new pn("Native transport is disconnected; reconnect is pending");this.port.postMessage(e)}requestHost(e,t,r={}){const n=this.port;if(!n)return this.scheduleReconnect(),Promise.reject(new pn("Native transport is disconnected; reconnect is pending"));const i=this.createHostRequestId(),a={jsonrpc:"2.0",id:i,method:e,...t===void 0?{}:{params:t}};return new Promise((s,o)=>{const l=r.timeoutMs,h=l==null?void 0:setTimeout(()=>{this.takePendingHostRequest(i)?.reject(new iv(e,l))},l);this.pendingHostRequests.set(i,{...h==null?{}:{timeoutId:h},reject:o,resolve:m=>s(m)});try{n.postMessage(a)}catch(m){this.takePendingHostRequest(i),o(m instanceof Error?m:new Error(String(m)))}})}setMessageCallback(e){this.messageCallback=e}getStatus(){return{...this.status}}refreshStatus(){return this.updateStatus(this.port?"connected":this.status.state,{error:this.status.error,nextRetryMs:this.status.nextRetryMs}),this.getStatus()}reconnectNow(e){const t=this.port;if(t!=null){this.port=null,this.rejectPendingHostRequests(new pn("Native transport reconnect requested"));try{t.disconnect()}catch{}}this.clearReconnectTimeout(),this.clearReconnectAlarm(),this.updateStatus("reconnecting",{...e==null?{}:{error:e},nextRetryMs:fn}),this.runReconnectAttempt()}connect(e={}){if(this.port)return!0;let t;for(;;)try{t=globalThis.ChatGPTSafariConnectNative(this.application);break}catch(r){const n=r instanceof Error?r.message:String(r),i=e.failureState??"disconnected";if(this.updateStatus(i,{error:n,...i==="reconnecting"?{nextRetryMs:fn}:{}}),!this.selectFallbackApplication(n))return!1}return this.port=t,this.reconnectPending=!1,this.reconnectAttempt=0,this.clearReconnectTimeout(),this.clearReconnectAlarm(),this.updateStatus("connected"),t.onMessage.addListener(r=>{this.port===t&&(this.failedApplications.clear(),!this.handleHostResponse(r)&&this.messageCallback?.(r))}),t.onDisconnect.addListener(()=>{if(this.port!==t)return;this.port=null,this.rejectPendingHostRequests(new pn("Native transport disconnected"));const r=chrome.runtime.lastError?.message;this.updateStatus("disconnected",{error:r}),!(this.selectFallbackApplication(r)&&this.connect({failureState:"reconnecting"}))&&this.scheduleReconnect()}),!0}createHostRequestId(){return this.nextHostRequestId+=1,`${tv}${this.nextHostRequestId}`}handleHostResponse(e){if(!("id"in e))return!1;const t=String(e.id),r=this.takePendingHostRequest(t);return r?("error"in e?r.reject(new nv(e.error.message,e.error.data)):"result"in e?r.resolve(e.result):r.reject(new Error("Native host returned an invalid response")),!0):rv.test(t)&&("error"in e||"result"in e)}rejectPendingHostRequests(e){for(const t of this.pendingHostRequests.keys())this.takePendingHostRequest(t)?.reject(e)}takePendingHostRequest(e){const t=this.pendingHostRequests.get(e);return this.pendingHostRequests.delete(e),t?.timeoutId!=null&&clearTimeout(t.timeoutId),t}scheduleReconnect(){this.port||(this.reconnectPending||(this.reconnectPending=!0,this.reconnectAttempt+=1),this.scheduleReconnectRetry(),this.updateStatus("reconnecting",{error:this.status.error,nextRetryMs:fn}))}scheduleReconnectTimeout(){this.port||this.reconnectTimeoutId!=null||(this.reconnectTimeoutId=setTimeout(()=>{this.reconnectTimeoutId=null,this.runReconnectAttempt()},fn))}clearReconnectTimeout(){this.reconnectTimeoutId!=null&&(clearTimeout(this.reconnectTimeoutId),this.reconnectTimeoutId=null)}scheduleReconnectRetry(){this.scheduleReconnectTimeout(),this.scheduleReconnectAlarm()}runReconnectAttempt(){this.port||(this.clearReconnectTimeout(),this.reconnectPending=!0,this.reconnectAttempt+=1,this.connect({failureState:"reconnecting"})||this.scheduleReconnectRetry())}async ensureReconnectAlarm(){if(this.port)return;const e=await chrome.alarms.get(this.reconnectAlarmName);this.port||e||await chrome.alarms.create(this.reconnectAlarmName,{periodInMinutes:ev})}clearReconnectAlarm(){chrome.alarms.clear(this.reconnectAlarmName).catch(()=>{})}scheduleReconnectAlarm(){this.ensureReconnectAlarm().catch(e=>{if(this.port)return;this.reconnectPending=!1;const t=e instanceof Error?e.message:String(e);this.updateStatus("disconnected",{error:t})})}updateStatus(e,t={}){this.status={state:e,hostName:this.application,lastChecked:Date.now(),reconnectAttempt:this.reconnectAttempt,...t.error?{error:t.error}:{},...t.error==="Specified native messaging host not found."?{errorType:"host_not_found"}:{},...t.nextRetryMs?{nextRetryMs:t.nextRetryMs}:{}}}selectFallbackApplication(e){if(e!=="Specified native messaging host not found."||this.applicationCandidates.length===1)return!1;this.failedApplications.add(this.application);const t=this.applicationCandidates.findIndex(r=>!this.failedApplications.has(r));return t===-1?(this.failedApplications.clear(),this.applicationIndex=0,!1):(this.applicationIndex=t,!0)}get application(){return this.applicationCandidates[this.applicationIndex]??this.applicationCandidates[0]}};function sv(e){if(e==null||typeof e!="object"||!("type"in e))return;const{type:t}=e;return typeof t=="string"?t:void 0}var iT="codex:page-event";function Qt(e,t){if(e.id!==chrome.runtime.id||e.frameId!==0||e.documentLifecycle!=null&&e.documentLifecycle!=="active"||typeof e.origin!="string"||typeof e.url!="string"||typeof e.tab?.id!="number"||typeof e.tab.windowId!="number")return!1;let r;try{r=new URL(e.url)}catch{return!1}return e.origin!==r.origin?!1:$n(r,t)}function ov(e,t,r){if(r.name!=="search_browser_tab_mentions")return;if(r.sender==null||r.sender.tab?.incognito===!0||!Nl(r.sender,t)){r.disconnect();return}const n=r.sender;let i=!1,a;const s=()=>{i||(i=!0,a?.(),r.onMessage.removeListener(l))},o=h=>{if(i)return!1;try{return r.postMessage(h),!0}catch{return s(),!1}},l=h=>{i||(r.onMessage.removeListener(l),xl(e,t,h,n,m=>{!o(m)||!m.ok||(a=e.subscribeCandidateUpdates(m.candidates,d=>{o({ok:!0,candidates:d})}))}))};r.onMessage.addListener(l),r.onDisconnect.addListener(s)}function xl(e,t,r,n,i){if(Dc(r)==null)return!1;if(!(n.tab?.incognito!==!0&&Nl(n,t)))return i({ok:!1,error:"Chrome tab mentions can only be accessed from ChatGPT"}),!0;const a=xc(r);if(a==null)return i({ok:!1,error:"Invalid Chrome tab mention search"}),!0;const s=n.tab?.id,o=Math.min(a.limit+(s!=null&&a.limit>0?1:0),100);return e.getUserTabs({includeFavicons:!0,query:a.query,limit:o}).then(l=>i({ok:!0,candidates:l.filter(({id:h})=>h!==s).slice(0,a.limit)})).catch(l=>i({ok:!1,error:lv(l)})),!0}function lv(e){return e instanceof Error?e.message:String(e)}function Nl(e,t){if(Qt(e,t))return!0;if(e.id!==chrome.runtime.id||e.tab!=null||e.documentLifecycle!=null&&e.documentLifecycle!=="active"||typeof e.url!="string"||typeof e.origin!="string")return!1;try{const r=new URL(e.url);return e.origin===r.origin&&$n(r,t)}catch{return!1}}var Ul="connector_openai_browser",ca={"OAI-Product-Sku":"TPP"};async function cv(e){const{plugin_id:t,plugin:r}=await e.request(`/ps/plugins/canonical-app/${Ul}`,{headers:ca});return t==null||r?.id!==t||r.status!=="ENABLED"||r.installation_policy==="NOT_AVAILABLE"||!(await e.request(`/ps/plugins/${encodeURIComponent(t)}/ensure`,{method:"POST",headers:ca})).enabled?!1:(await e.request("/aip/connectors/links/noauth",{method:"POST",headers:{...ca,"Content-Type":"application/json"},body:JSON.stringify({connector_id:Ul,name:"Browser",action_names:[],ensure_exists:!0})}),!0)}var mn="browserPluginSetupIdentity",er="browserPluginSetupNegativeResult",uv=30*6e4;function dv(){let e,t,r;return{async load(){e??=chrome.storage.session.get([mn,er]).catch(()=>({})).then(n=>{const i=n[mn];t=typeof i=="string"?i:void 0,r=hv(n[er])}),await e},isComplete(n){return t===tr(n)},shouldSkip(n){const i=tr(n);return t===i||r?.identity===i&&Date.now()<r.notBeforeMs},record(n,i){const a=tr(n);i?(t=a,chrome.storage.session.set({[mn]:a}).catch(()=>{})):(r={identity:a,notBeforeMs:Date.now()+uv},chrome.storage.session.set({[er]:r}).catch(()=>{}))},clear(){t=void 0,r=void 0,chrome.storage.session.remove([mn,er]).catch(()=>{})},clearNegative(){r=void 0,chrome.storage.session.remove(er).catch(()=>{})}}}function tr(e){return JSON.stringify([e.userId,e.id])}function hv(e){if(typeof e!="object"||e==null)return;const{identity:t,notBeforeMs:r}=e;if(typeof t=="string"&&typeof r=="number"&&Number.isFinite(r))return{identity:t,notBeforeMs:r}}var gn=1,ua=2e3,fv=2147483647,pv="chatgpt-work-browser-plugin";function mv(e){let t=!1,r,n=0,i=0,a,s,o;const l=dv();let h,m,d=!1;function f(y=hs()){if(t||Date.now()<i)return;const T=o;s?.abort();const E=new AbortController;s=E,c(E,y,T)}async function c(y,T,E){try{await l.load(),y.signal.throwIfAborted(),o==null&&a==null&&n>gn&&(n=0);const I=await T(y.signal);if(y.signal.throwIfAborted(),"error"in I&&I.status!==401&&I.status!==403)throw I.error==="http"?new Cr(I.status,I.retryAfterMs):new Error("Failed to read ChatGPT session.");const C="error"in I?null:I.session,O=C==null?void 0:tr(C.account);if((O!==r||C==null)&&(g(),h?.abort(),h=void 0,m=void 0,d=!1,(r!=null||C==null)&&(l.clear(),w()),r=O),C==null)return;if(l.isComplete(C.account)){w();return}if(m??=p(C.account.userId,T),await m,y.signal.throwIfAborted(),!d||a!=null||Date.now()<i||l.shouldSkip(C.account)||o!=null||E!=null&&tr(E.account)===O)return;u(new fs(C.accessToken,C.account))}catch(I){if(t||s!==y||y.signal.aborted)return;g(),v(I)}}async function p(y,T){const E=new AbortController;h=E;let I=!0;try{return await Vn(T,E.signal),await Rr(pv,(C,O,$)=>{if(t||h!==E)return;const G=d;d=O==="Ready"&&$===y&&C,d?!G&&!I&&n<=gn&&(l.clearNegative(),Date.now()<i?S(Math.max(ua,i-Date.now())):f()):(g(),$===y&&(clearTimeout(a),a=void 0)),O==="Ready"&&(I=!1)},E.signal)}catch(C){throw h===E&&(E.abort(),h=void 0,m=void 0,d=!1),C}}function u(y){o=y,cv(y).then(T=>{if(!(t||o!==y)&&(w(),l.record(y.account,T),T))try{e().catch(()=>{})}catch{}}).catch(T=>{!t&&o===y&&v(T)}).finally(()=>{y.dispose(),o===y&&(o=void 0)})}function g(){o?.dispose(),o=void 0}function w(){clearTimeout(a),a=void 0,n=0,i=0}function v(y){if(t)return;const T=y instanceof Cr?y.retryAfterMs??0:0;if(i=Math.max(i,Date.now()+T),y instanceof Cr&&(y.retryable===!1||![401,408,429,500,502,503,504].includes(y.status))){clearTimeout(a),a=void 0,n=gn+1;return}if(a==null&&n++>=gn){console.warn("[browser-plugin] failed to set up Browser");return}clearTimeout(a),a=void 0,S(Math.max(ua,i-Date.now())+Math.floor(Math.random()*ua))}function S(y){y>fv||(clearTimeout(a),a=setTimeout(()=>{a=void 0,f()},y))}return{refresh:f,stop(){t=!0,w(),s?.abort(),h?.abort(),g()}}}var da=new Map;async function Fl(e,t){const r=await chrome.tabs.query({url:Pu(e)});await Promise.allSettled(r.map(async n=>{if(n.id==null||n.discarded)return;const i=n.id,a=await chrome.webNavigation.getFrame({tabId:i,frameId:0});if(a==null||a.documentLifecycle!=="active"||!$n(new URL(a.url),e))return;const{documentId:s}=a;let o=da.get(s);o==null&&(o=gv(i,s).finally(()=>{da.delete(s)}),da.set(s,o)),!(!await o||!t)&&await chrome.tabs.sendMessage(i,{type:Rc},{documentId:s})}))}async function gv(e,t){const r=async()=>{const n=await ie(chrome.tabs.sendMessage(e,{type:kc},{documentId:t})).catch(()=>null);return typeof n=="object"&&n!=null&&"version"in n&&n.version===chrome.runtime.getManifest().version};return await r()?!0:await ie(chrome.scripting.executeScript({files:["content-scripts/chatgpt-website.js"],target:{tabId:e,documentIds:[t]}}))!=null&&await r()}var _v=String.raw`^https://(persistent\.oaistatic\.com/codex-app-prod/ChatGPT(-latest-x64)?\.dmg|get\.microsoft\.com/installer/download/9PLM9XGG6VKS\?cid=website_cta_psi)$`;async function Bl(){const[e]=await chrome.downloads.search({limit:1,orderBy:["-startTime"],urlRegex:_v});return e}function vv(e,t,r){return typeof e!="object"||e==null||!("type"in e)||e.type!=="SHOW_CODEX_INSTALLER"||!Qt(t,r)?!1:(Bl().then(n=>{n?.exists!==!1&&n?.state==="complete"&&chrome.downloads.show(n.id)}).catch(()=>{}),!0)}async function wv(){const e=await Bl();return e?.exists===!1||e?.state==="interrupted"||e?.paused===!0?{status:"idle"}:e?.state==="complete"?{status:"downloaded"}:e?.state!=="in_progress"?{status:"idle"}:{progressPercent:e.totalBytes>0?Math.min(Math.floor(e.bytesReceived/e.totalBytes*100),99):null,status:"downloading"}}var $l="codexSidePanelOpenWindowIds";function bv(e){return Array.isArray(e)?new Set(e.filter(t=>typeof t=="number"&&Number.isSafeInteger(t))):new Set}var jl=["#2563eb","#7c3aed","#db2777","#dc2626","#ea580c","#059669","#0891b2","#4f46e5"],yv=4,Sv=24,Tv=["alarms","bookmarks","debugger","declarativeNetRequestWithHostAccess","downloads","favicon","history","nativeMessaging","notifications","offscreen","scripting","sessions","storage","tabGroups","tabs","topSites","webNavigation"],aT=[...Tv,"contextMenus","sidePanel"],sT=`script-src 'self'; object-src 'none'; connect-src 'self' http://127.0.0.1:* http://localhost:* ws://127.0.0.1:* ws://localhost:* https://ab.chatgpt.com https://chatgpt.com https://api.openai.com https://api.openai.org ${ws.map(e=>`https://*${e}`).join(" ")}; font-src 'self' https://cdn.openai.com;`;function Ev(e){if(typeof e!="string")return null;const t=e.trim().replace(/\s+/gu," ");return t.length===0?null:t.slice(0,Sv)}function Iv(e){const t=Ev(e);return t==null?null:{backgroundColor:Av(t),text:Cv(t)}}function Av(e){let t=0;for(const r of e)t=t*31+r.charCodeAt(0)>>>0;return jl[t%jl.length]}function Cv(e){const t=e.match(/[A-Za-z0-9]+/gu)??[];return(t.length>1?t.map(r=>r[0]).join(""):t[0]??e).slice(0,yv).toUpperCase()}var rr={badgeBackgroundColor:"#0169cc",badgeText:"NEW",title:"Use the new ChatGPT side chat feature. Open the ChatGPT extension to continue.",version:1},nr="lastSeenExtensionActionCalloutVersion",ql=Promise.resolve();function kv(e){return ha(()=>zl(e))}function Rv(){return ha(async()=>{await Gl()||await Promise.all([chrome.browserAction.setTitle({title:rr.title}),chrome.browserAction.setBadgeBackgroundColor({color:rr.badgeBackgroundColor}),chrome.browserAction.setBadgeText({text:rr.badgeText})])})}function Ov(e=""){return ha(async()=>{if(await Gl())return;const t=chrome.runtime.getManifest();await Promise.all([chrome.browserAction.setTitle({title:t.action?.default_title??t.name}),zl(e)]),await chrome.storage.local.set({[nr]:rr.version})})}async function Gl(){const e=(await chrome.storage.local.get(nr))[nr];return typeof e=="number"&&e>=rr.version}async function zl(e){const t=Iv(e);if(t==null){await chrome.browserAction.setBadgeText({text:""});return}await Promise.all([chrome.browserAction.setBadgeBackgroundColor({color:t.backgroundColor}),chrome.browserAction.setBadgeText({text:t.text})])}function ha(e){const t=ql.then(e);return ql=t.catch(()=>{}),t}var ir="codexPendingUpdateVersion",Pv=class{pendingUpdateVersion=null;reloadInProgress=!1;currentVersion;isInUse;onUpdateAvailable;reload;storage;constructor(e,t={}){this.currentVersion=t.currentVersion??null,this.isInUse=e,this.onUpdateAvailable=t.onUpdateAvailable??chrome.runtime.onUpdateAvailable,this.reload=t.reload??(()=>chrome.runtime.reload()),this.storage=t.storage??chrome.storage.session}register(){this.onUpdateAvailable?.addListener(async e=>{await this.handleUpdateAvailable(e).catch(()=>{})}),this.maybeReloadForPendingUpdate().catch(()=>{})}get installedVersion(){return this.currentVersion??chrome.runtime.getManifest().version}async maybeReloadForPendingUpdate(){if(!this.reloadInProgress&&(this.pendingUpdateVersion==null&&await this.restorePendingUpdate(),this.pendingUpdateVersion!=null&&!this.isInUse())){this.reloadInProgress=!0;try{await this.clearPendingUpdate(),this.reload()}catch(e){throw this.reloadInProgress=!1,e}}}async handleUpdateAvailable(e){await this.storage.set({[ir]:e.version}),this.pendingUpdateVersion=e.version,await this.maybeReloadForPendingUpdate()}async restorePendingUpdate(){const e=(await this.storage.get(ir))[ir];if(typeof e=="string"){if(e===this.installedVersion){await this.clearPendingUpdate();return}this.pendingUpdateVersion=e}}async clearPendingUpdate(){this.pendingUpdateVersion=null,await this.storage.remove(ir)}};function Mv(e,t,r,n){if(n.name!=="chatgpt-extension-status")return;const i=n.sender,a=i?.tab?.id;if(i==null||typeof a!="number"||!Qt(i,r)){n.disconnect();return}const s={};let o=!1;const l=()=>{o||(o=!0,n.onDisconnect.removeListener(l),n.onMessage.removeListener(w),n.disconnect())},h=()=>{if(!o)try{n.postMessage({type:"update",status:s})}catch{l()}},m=(v,S)=>{let y=!1;return()=>{if(o||y)return;y=!0;const T=()=>{y=!1,h()};Promise.resolve().then(v).catch(E=>{if(o)throw E;return v()}).then(E=>{o||S(E)}).then(T,T)}},d=m(Ce,v=>{s.browserContext={instanceId:v}}),f=m(()=>chrome.storage.local.get(nr),v=>{const S=v[nr];s.sidePanel={...s.sidePanel,hasEverOpened:typeof S=="number"&&S>0}}),c=m(()=>Promise.all([chrome.storage.session.get([$l,ir]),chrome.tabs.get(a)]),([v,S])=>{s.sidePanel={...s.sidePanel,currentWindow:bv(v.codexSidePanelOpenWindowIds).has(S.windowId)?"open":"closed"},s.extension={...s.extension,updateAvailable:typeof v.codexPendingUpdateVersion=="string"&&v.codexPendingUpdateVersion!==t}}),p=m(()=>chrome.browserAction.getUserSettings(),v=>{s.toolbar={pin:v.isOnToolbar?"pinned":"unpinned"}}),u=m(wv,v=>{s.installer=v}),g=()=>{if(o)return;const v=e.refreshStatus(),S=typeof chrome.sidePanel?.open=="function";s.capabilities={[Fe.browserTabMentionsSearch]:!0,[Fe.browserControlStateRead]:!0,[Fe.extensionUpdateRead]:!0,[Fe.nativeHostStatus]:!0,...S?{[Fe.sidePanelOpen]:!0,[Fe.sidePanelPromptPrefill]:!0,[Fe.sidePanelStateRead]:!0}:{},[Fe.toolbarPinRead]:!0,[Fe.websiteActionRequest]:!0},s.extension={...s.extension,channel:r,version:t},s.browserControl={phase:he.isBrowserControlActive()?"active":"idle"},s.nativeHost={errorType:v.errorType,lastCheckedAt:v.lastChecked,transport:v.state},d(),f(),c(),p(),v.state!=="connected"&&u(),h()},w=v=>{v?.type==="refresh"&&g()};n.onDisconnect.addListener(l),n.onMessage.addListener(w),g()}var oT="GET_EXTENSION_INSTANCE_ID";function Lv(e,t,r){return e==null||typeof e!="object"||!("type"in e)||e.type!=="GET_EXTENSION_INSTANCE_ID"?!1:t.id!==chrome.runtime.id||t.url!==chrome.runtime.getURL("codex-work-sidepanel.html")?(r({instanceId:null}),!0):(Ce().then(n=>r({instanceId:n}),()=>r({instanceId:null})),!0)}var Dv="codex-app-chrome-extension-new-tab-onboarding-on-install";async function xv(){}var fa="codexSidePanelDestination",_n="codexSidePanelOpenDestinations",pa="codexWorkSidePanelTabIds",At={kind:"waiting_room"},te=At,ar,_e=new Map,Ct=new Set,pt=new Set,Vl,Hl,sr,vn=new AbortController,ma,ga=Promise.resolve();function or(){return te}function Wl(e){Ct.add(e)}function Kl(e){return te.kind!=="work_sidepanel"?Promise.resolve():chrome.sidePanel.setOptions({enabled:!0,path:ct,tabId:e})}async function _a(e,t){await lr(),t?pt.add(e):pt.delete(e),await Ta(),!t&&te.kind==="work_sidepanel"&&await chrome.sidePanel.setOptions({enabled:!1,path:ct,tabId:e})}async function va(e,t,r,n){if(await ya(),t){const a=await $v(e,r,n);return Ct.delete(e),_e.set(e,a),await Sa(),ar!=null&&(r==="side-panel-loading.html"||a.kind!==te.kind)?(await wa(te,!0),te):a}Ct.delete(e);const i=_e.get(e)??At;return _e.delete(e),await Sa(),_e.size===0&&Ct.size===0&&await Jl(),i}async function Nv(){ma??=Fv(vn.signal),await ma,await ga}function Uv(){if(sr!=null)return sr;const e=({tabId:i})=>{ba(i).catch(()=>{})},t=i=>{i.id!=null&&ba(i.id).catch(()=>{})},r=i=>{Gv(i).catch(()=>{})};chrome.tabs.onActivated.addListener(e),chrome.tabs.onCreated.addListener(t),chrome.tabs.onRemoved.addListener(r),Nv().catch(()=>{console.warn("Failed to initialize Chrome side panel destination.")});const n=vn;return sr=()=>{vn===n&&(n.abort(),chrome.tabs.onActivated.removeListener(e),chrome.tabs.onCreated.removeListener(t),chrome.tabs.onRemoved.removeListener(r),vn=new AbortController,ma=void 0,ar=void 0,sr=void 0)},sr}async function Fv(e){if(!e.aborted){await ec({kind:"work_sidepanel"});await wa({kind:"work_sidepanel"},!0)}}function Zl(e){return e?{kind:"work_sidepanel"}:{kind:"waiting_room"}}async function wa(e,t=!1){if(te=e.kind==="work_sidepanel"&&Zl(!0).kind!=="work_sidepanel"?{kind:"waiting_room"}:e,await ya(),_e.size>0||Ct.size>0){if(t){await Bv();for(const n of _e.keys())_e.set(n,te);await Sa()}const r=_e.values().next().value??te;await chrome.sidePanel.setPanelBehavior?.({openPanelOnActionClick:r.kind==="work_sidepanel"}).catch(()=>{});return}await Jl()}async function Bv(){const e=te.kind==="work_sidepanel"?ct:Nr,[t,r]=await Promise.all([chrome.sidePanel.getOptions({}),chrome.tabs.query(te.kind==="work_sidepanel"?{active:!0}:{})]);await Promise.all([(t.enabled||te.kind==="waiting_room")&&wn(t.path)!=null&&(!t.enabled||t.path!==e)?chrome.sidePanel.setOptions({enabled:!0,path:e}):Promise.resolve(),...r.map(async n=>{if(n.id==null)return;const i=await chrome.sidePanel.getOptions({tabId:n.id});i.tabId!==n.id||wn(i.path)==null||i.path===e||await chrome.sidePanel.setOptions({enabled:te.kind==="waiting_room"||i.enabled,path:e,tabId:n.id})})])}async function Jl(){try{await Xl(),te.kind==="work_sidepanel"?await Yl():await Ql()}catch{te=At,await ec(te),await Xl().catch(()=>{}),te.kind==="work_sidepanel"?await Yl().catch(()=>{}):await Ql().catch(()=>{})}await chrome.sidePanel.setPanelBehavior?.({openPanelOnActionClick:te.kind==="work_sidepanel"}).catch(()=>{})}async function Xl(){const e=te.kind==="waiting_room",t=Nr,r=await chrome.sidePanel.getOptions({});(r.enabled!==e||r.path!==t)&&await chrome.sidePanel.setOptions({enabled:e,path:t})}async function Yl(){await lr();const e=await chrome.tabs.query({});await Promise.all(e.map(t=>t.id==null?Promise.resolve():ba(t.id)))}async function Ql(){await lr(),pt.clear(),await Ta();const e=await chrome.tabs.query({});await Promise.all(e.map(async t=>{t.id!=null&&(await chrome.sidePanel.getOptions({tabId:t.id})).path==="codex-work-sidepanel.html"&&await chrome.sidePanel.setOptions({enabled:!0,path:Nr,tabId:t.id})}))}async function ba(e){if(te.kind==="work_sidepanel"){await ya();for(const t of _e.values())if(t.kind==="waiting_room")return;if(_e.size>0||Ct.size>0){const t=await chrome.sidePanel.getOptions({});if(t.enabled&&t.path==="codex-work-sidepanel.html"){const r=await chrome.sidePanel.getOptions({tabId:e});r.tabId===e&&r.path==="waiting-room.html"&&await chrome.sidePanel.setOptions({enabled:r.enabled,path:ct,tabId:e});return}}await lr(),await chrome.sidePanel.setOptions({enabled:pt.has(e),path:ct,tabId:e})}}async function $v(e,t,r){const n=wn(t);if(n!=null)return n;try{return wn((await chrome.sidePanel.getOptions(r==null?{}:{tabId:r})).path)??At}catch{return _e.get(e)??At}}function wn(e){if(e==="codex-work-sidepanel.html")return{kind:"work_sidepanel"};if(e==="waiting-room.html"||e==="side-panel-loading.html")return{kind:"waiting_room"}}async function ya(){Vl??=jv(),await Vl}async function jv(){const e=chrome.storage.session;if(e!=null)try{if(typeof chrome.runtime?.getContexts=="function"&&(await chrome.runtime.getContexts({contextTypes:["SIDE_PANEL"]})).length===0){await e.set({[_n]:{}});return}const t=(await e.get(_n))[_n];if(t==null||typeof t!="object")return;for(const[r,n]of Object.entries(t)){const i=Number(r);!Number.isSafeInteger(i)||i<0||(n==="waiting_room"||n==="work_sidepanel")&&_e.set(i,{kind:n})}}catch{}}async function Sa(){const e=chrome.storage.session;e!=null&&await e.set({[_n]:Object.fromEntries([..._e].map(([t,r])=>[t,r.kind]))}).catch(()=>{})}async function lr(){Hl??=qv(),await Hl}async function qv(){const e=chrome.storage.session;if(e!=null)try{const t=(await e.get(pa))[pa];if(!Array.isArray(t))return;for(const r of t)typeof r=="number"&&Number.isSafeInteger(r)&&r>=0&&pt.add(r)}catch{}}async function Ta(){await chrome.storage.session?.set({[pa]:[...pt]}).catch(()=>{})}async function Gv(e){await lr(),pt.delete(e)&&await Ta(),await chrome.storage.session?.remove?.([ih(e),Ks(e)]).catch(()=>{})}async function zv(){const e=chrome.storage.session;if(e==null)return{kind:"waiting_room"};try{const t=(await e.get(fa))[fa];return t==null?void 0:t==="waiting_room"||t==="work_sidepanel"?{kind:t}:{kind:"waiting_room"}}catch{return{kind:"waiting_room"}}}async function ec(e){const t=chrome.storage.session;if(t==null)return!1;try{return await t.set({[fa]:e.kind}),!0}catch{return!1}}var bn=new Set,yn=new Set,kt=new Map,tc=!1,rc="ask-chatgpt",Vv="codex_chrome_extension_sidechat_open";function Hv(){if(chrome.sidePanel==null){nc();return}Rv().catch(()=>{}),Xv(),nc(),Wv(),Jv()}function nc(){if(globalThis.ChatGPTSafariSidebar)return;chrome.browserAction.onClicked.addListener(e=>{if(typeof chrome.sidePanel?.open!="function"){const t=or().kind==="work_sidepanel"?"work_sidepanel":"waiting_room";chrome.tabs.create({url:chrome.runtime.getURL(t==="work_sidepanel"?ct:Nr)}).then(()=>{Ea("icon",t)}).catch(()=>{});return}or().kind==="work_sidepanel"&&e.windowId!=null&&oc(e.windowId,e.id)||ac(e,"icon").catch(()=>{})})}function Wv(){chrome.commands.onCommand.addListener((e,t)=>{e==="open-codex-side-panel"&&ac(t,"keyboard_shortcut").catch(()=>{})})}function Kv(e,t,r){const n=t.tab?.windowId,i=t.tab?.id;if(!tw(e)||e.type!=="OPEN_CODEX_SIDE_PANEL"||!Qt(t,r)||n==null||i==null||typeof chrome.sidePanel?.open!="function")return!1;const a=e.source===void 0?"chatgpt_website":e.source;return typeof a!="string"?!1:(ic(n,i,a,typeof e.prompt=="string"&&e.prompt.length<=8192&&e.prompt.trim().length>0?{createdAtMs:Date.now(),kind:"prompt",prompt:e.prompt}:void 0),!0)}function ic(e,t,r,n){const i=or().kind==="work_sidepanel"?t:void 0,a=i==null?Promise.resolve():Kl(i);Wl(e);const s=chrome.sidePanel.open(i==null?{windowId:e}:{tabId:i});Promise.all([a,s]).then(async()=>{const o=await cr(e,!0,void 0,i);if(Ea(r,sc(o)),o.kind==="work_sidepanel"&&n!=null&&(n.kind==="prompt"||n.selectedText.trim().length>0)){const l={type:Cc,createdAtMs:n.createdAtMs,prompt:n.kind==="prompt"?n.prompt:void 0,selectedText:n.kind==="selection"?n.selectedText.slice(0,Ac):void 0};await chrome.storage.session.set({[Ks(t)]:l}).catch(()=>{})}},async()=>{i!=null&&await _a(i,!1).catch(()=>{}),await va(e,!1).catch(()=>{})}).catch(()=>{})}function Zv(){chrome.sidePanel!=null&&chrome.contextMenus.create({contexts:["page","frame","selection","link","editable","image","video","audio"],id:rc,title:"Ask ChatGPT"})}function Jv(){chrome.contextMenus.onClicked.addListener((e,t)=>{if(e.menuItemId!==rc)return;const r=t?.id,n=t?.windowId,i=t?.url??t?.pendingUrl??e.pageUrl,a=e.frameUrl??e.pageUrl??i;r==null||n==null||i==null||a==null||ic(n,r,"context_menu",{createdAtMs:Date.now(),kind:"selection",selectedText:e.selectionText??"",tabId:r,tabUrl:i,url:a})})}function Xv(){if(tc)return;const e=chrome.sidePanel;e!=null&&(e.onOpened?.addListener(t=>{cr(t.windowId,!0,t.path,t.tabId).catch(()=>{})}),e.onClosed?.addListener(t=>{cr(t.windowId,!1,t.path,t.tabId).catch(()=>{})}),tc=!0)}async function ac(e,t){const r=e?.windowId??(await chrome.windows.getCurrent()).id;if(r==null)throw new Error(`Unable to find the current ${ew()} window`);const n=chrome.sidePanel;if(n==null||typeof n.open!="function")return;if(oc(r,e?.id)&&typeof n.close=="function"){const o=e?.id,l=o!=null&&kt.get(r)?.has(o)===!0?{tabId:o}:{windowId:r};try{await n.close(l)}finally{await cr(r,!1,void 0,"tabId"in l?l.tabId:void 0)}return}const i=or().kind==="work_sidepanel"?e?.id:void 0,a=i==null?Promise.resolve():Kl(i);Wl(r);const s=n.open(i==null?{windowId:r}:{tabId:i});try{await Promise.all([a,s])}catch(o){throw i!=null&&await _a(i,!1).catch(()=>{}),await va(r,!1).catch(()=>{}),o}Ea(t,sc(await cr(r,!0,void 0,i)))}function sc(e){return e.kind==="work_sidepanel"?"work_sidepanel":"waiting_room"}function Ea(e,t){zn(Vv,1,{destination:t,source:e}).catch(()=>{console.warn("Failed to report Chrome extension sidechat open.")})}function Yv(){return chrome.storage.session.set({[$l]:[...bn]})}async function cr(e,t,r,n){n!=null&&(r==="codex-work-sidepanel.html"||or().kind==="work_sidepanel")&&await _a(n,t),Qv(e,t,n);const i=await va(e,bn.has(e),r,n);return await Yv().catch(()=>{}),t&&await Ov().catch(()=>{}),i}function Qv(e,t,r){if(r==null)t?yn.add(e):yn.delete(e);else{const n=kt.get(e)??new Set;t?(n.add(r),kt.set(e,n)):(n.delete(r),n.size===0&&kt.delete(e))}yn.has(e)||kt.has(e)?bn.add(e):bn.delete(e)}function oc(e,t){return yn.has(e)||t!=null&&kt.get(e)?.has(t)===!0}function ew(){return Te[Ot(navigator.userAgent,"brave"in navigator)].shortDisplayName}function tw(e){return e!=null&&typeof e=="object"}var Ia="codexToolbarStateLastSnapshot",rw="codex_chrome_extension_toolbar_state",Aa="codex-toolbar-state-alarm",lc=1440*60*1e3,cc=Promise.resolve();function nw(){chrome.browserAction.onUserSettingsChanged?.addListener(({isOnToolbar:e})=>{e!=null&&Sn("changed",e)}),chrome.alarms.onAlarm.addListener(({name:e})=>{e===Aa&&Sn("alarm")}),chrome.alarms.get(Aa).then(e=>{if(!e)return chrome.alarms.create(Aa,{periodInMinutes:360})}).catch(()=>{console.warn("Failed to schedule Chrome extension toolbar state.")})}function Sn(e,t){cc=cc.then(()=>iw(e,t)).catch(()=>{console.warn("Failed to report Chrome extension toolbar state.")})}async function iw(e,t){const r=Date.now(),n=(await chrome.storage.local.get([Ia]))[Ia];typeof n=="number"&&(e==="update"||(e==="startup"||e==="alarm")&&Math.floor(n/lc)===Math.floor(r/lc))||(await zn(rw,t??(await chrome.browserAction.getUserSettings()).isOnToolbar?1:0,{trigger:e}),e!=="changed"&&await chrome.storage.local.set({[Ia]:r}))}function aw({buildChannel:e,sidePanelEnabled:t,browserPluginInstallation:r}){const n=o=>{xv(o).catch(()=>{}),t&&((o.reason==="install"||o.reason==="update")&&Sn(o.reason),Zv())},i=()=>{r.refresh(),t&&Sn("startup")},a=o=>{if(o.frameId===0&&new URL(o.url).origin==="https://chatgpt.com"){const l=hs();r.refresh(l),Vn(l).catch(()=>{})}},s=()=>r.refresh();return self.addEventListener("activate",s),chrome.runtime.onInstalled.addListener(n),chrome.runtime.onStartup.addListener(i),chrome.webNavigation.onCompleted.addListener(a,{url:[{hostEquals:new URL(qn).hostname}]}),Fl(e,!1).catch(()=>{}),()=>{self.removeEventListener("activate",s),chrome.runtime.onInstalled.removeListener(n),chrome.runtime.onStartup.removeListener(i),chrome.webNavigation.onCompleted.removeListener(a),r.stop()}}var Ca="client-heartbeat-alarm";async function sw(...e){await chrome.alarms.get(Ca)||await chrome.alarms.create(Ca,{periodInMinutes:.5}),chrome.alarms.onAlarm.addListener(async t=>{if(t.name!==Ca)return;ze.getInstance().reconcileRequestHeaders().catch(()=>{console.error("Failed to read tab leases for request-header reconciliation.")});try{const n=new Promise(i=>setTimeout(()=>i(!1),3e3));if(await Promise.any([n,...e.map(i=>i())]))return}catch{}await he.stopActiveSessions();if(chrome.debugger==null)return;const r=await chrome.debugger.getTargets();await Promise.allSettled(r.filter(n=>typeof n.tabId=="number").map(n=>chrome.debugger.detach({tabId:n.tabId}).catch(()=>{})))})}var uc={matches:["<all_urls>"],runAt:"document_start",world:"MAIN"},ow={...uc,world:"ISOLATED"},dc=[{...uc,id:"codex-webmcp",js:["content-scripts/webmcp.js"],persistAcrossSessions:!1},{...ow,id:"codex-webmcp-bridge",js:["content-scripts/webmcp-bridge.js"],persistAcrossSessions:!1}];async function hc(e){const t=await chrome.scripting.getRegisteredContentScripts({ids:dc.map(({id:i})=>i)});if(!e){t.length>0&&await chrome.scripting.unregisterContentScripts({ids:t.map(({id:i})=>i)});return}const r=new Set(t.map(({id:i})=>i)),n=dc.filter(({id:i})=>!r.has(i));n.length>0&&await chrome.scripting.registerContentScripts(n)}var lw="codex-app-webmcp";function cw(){let e,t,r=Promise.resolve();const n=a=>(t=a,r=r.then(async()=>{if(!(a!==t||a===e)){e=void 0;try{await hc(a),e=a}catch{try{await hc(!1),e=!1}catch{}console.warn("Failed to apply Chrome extension WebMCP gate.")}}}),r),i=Rr(lw,a=>{n(a)}).catch(()=>n(!1));return{async enabled(){await i;let a;do a=r,await a;while(a!==r);return t===!0&&e===!0}}}var lT="CODEX_WORK_SIDE_PANEL_LOAD_EVENT";function uw(e){if(typeof e!="object"||e==null)return!1;const t=e;return t.type==="CODEX_WORK_SIDE_PANEL_LOAD_EVENT"&&(t.event==="timeout"||t.event==="ready"||t.event==="retry"||t.event==="open_chatgpt")&&typeof t.attempt=="number"&&Number.isSafeInteger(t.attempt)&&t.attempt>=0&&typeof t.elapsedMs=="number"&&Number.isSafeInteger(t.elapsedMs)&&t.elapsedMs>=0&&typeof t.timedOut=="boolean"}function dw(e,t,r){return uw(e)?t.id!==chrome.runtime.id||t.url!==chrome.runtime.getURL("codex-work-sidepanel.html")?(r(),!0):(zn("codex_chrome_extension_work_sidepanel_load",e.event,{attempt:String(e.attempt),elapsed_ms:String(e.elapsedMs),timed_out:String(e.timedOut),extension_id:chrome.runtime.id,chromium_major:/(?:Chrome|Chromium)\/(\d+)/.exec(navigator.userAgent)?.[1]??"unknown"}).then(r,r),!0):!1}var cT="CODEX_WORK_SIDE_PANEL_AUTH_OPEN",hw="CODEX_WORK_SIDE_PANEL_AUTH_REVALIDATE",uT="CODEX_WORK_SIDE_PANEL_AUTH_STATE";function fc(e){if(typeof e!="object"||e==null)return!1;const t=e;return t.type==="CODEX_WORK_SIDE_PANEL_AUTH_OPEN"&&(t.action==="login"||t.action==="logout"||t.action==="open")&&mt(t.ownerTabId)&&mt(t.ownerWindowId)}function pc(e){if(typeof e!="object"||e==null)return!1;const t=e;return t.type==="CODEX_WORK_SIDE_PANEL_AUTH_STATE"&&(t.state==="signed_in"||t.state==="signed_out")&&mt(t.ownerTabId)&&mt(t.ownerWindowId)}function mt(e){return typeof e=="number"&&Number.isSafeInteger(e)&&e>=0}var ka="codexWorkSidePanelAuthOperations",fw=600*1e3;function pw(e,t){if(e==null)return()=>!1;const r=new URL(e).origin,n=chrome.runtime.getURL(ct);let i=Promise.resolve();const a=h=>{const m=i.then(h,h);return i=m.then(()=>{},()=>{}),m},s=async()=>{const h=(await chrome.storage.session.get(ka))[ka];return typeof h=="object"&&h!=null&&!Array.isArray(h)?Object.fromEntries(Object.entries(h).filter(([,m])=>gw(m))):{}},o=h=>chrome.storage.session.set({[ka]:h}),l=async h=>{if((await chrome.tabs.get(h.ownerTabId)).windowId!==h.ownerWindowId)return;await chrome.tabs.update(h.ownerTabId,{active:!0}),await chrome.windows.update(h.ownerWindowId,{focused:!0});const m={ownerTabId:h.ownerTabId,type:hw};await chrome.runtime.sendMessage(m).catch(()=>{})};return chrome.tabs.onUpdated.addListener((h,m,d)=>{const f=d.url;m.status!=="complete"||f==null||a(async()=>{const c=await s(),p=Object.values(c).find(g=>g.authTabId===h);if(p==null)return;if(p.expiresAt<=Date.now()){Reflect.deleteProperty(c,String(p.ownerTabId)),await o(c);return}let u;try{u=new URL(f)}catch{return}u.origin!==r||u.pathname.startsWith("/auth/")&&!(p.action==="logout"&&(u.pathname==="/auth/login"||u.pathname==="/auth/login/"))||await l(p).catch(()=>{})}).catch(()=>{})}),chrome.tabs.onRemoved.addListener(h=>{a(async()=>{const m=await s(),d=Object.values(m).find(f=>f.authTabId===h||f.ownerTabId===h);d!=null&&(Reflect.deleteProperty(m,String(d.ownerTabId)),await o(m),d.authTabId===h&&await l(d).catch(()=>{}))}).catch(()=>{})}),(h,m,d)=>!fc(h)&&!pc(h)?!1:m.id!==chrome.runtime.id||m.url!==n?(d({ok:!1}),!1):(pc(h)&&t?.(),a(async()=>{if(fc(h))await mw({getOperations:s,message:h,setOperations:o,workOrigin:r});else{const f=await s(),c=f[String(h.ownerTabId)];if(c==null||c.ownerWindowId!==h.ownerWindowId||c.expiresAt<=Date.now()||h.state!==(c.action==="logout"?"signed_out":"signed_in"))throw new Error("Work side-panel authentication is not complete");Reflect.deleteProperty(f,String(c.ownerTabId)),await o(f),await chrome.tabs.remove(c.authTabId).catch(()=>{})}d({ok:!0})}).catch(()=>d({ok:!1})),!0)}async function mw({getOperations:e,message:t,setOperations:r,workOrigin:n}){if((await chrome.tabs.get(t.ownerTabId)).windowId!==t.ownerWindowId)throw new Error("Work side panel no longer owns its browser tab");const i=await e(),a=i[String(t.ownerTabId)];if(a!=null&&(a.action===t.action||t.action==="open")&&a.ownerWindowId===t.ownerWindowId&&a.expiresAt>Date.now())try{if((await chrome.tabs.get(a.authTabId)).windowId===t.ownerWindowId){await chrome.tabs.update(a.authTabId,{active:!0}),await chrome.windows.update(t.ownerWindowId,{focused:!0});return}}catch{}const s=new URL(t.action==="open"?"/":t.action==="logout"?"/auth/logout":"/auth/login",n);t.action==="login"&&s.searchParams.set("next","/");const o=await chrome.tabs.create({active:!0,openerTabId:t.ownerTabId,url:s.href,windowId:t.ownerWindowId});if(o.id==null)throw new Error("The authentication tab has no browser tab identifier");i[String(t.ownerTabId)]={action:t.action,authTabId:o.id,expiresAt:Date.now()+fw,ownerTabId:t.ownerTabId,ownerWindowId:t.ownerWindowId},await r(i)}function gw(e){if(typeof e!="object"||e==null)return!1;const t=e;return(t.action==="login"||t.action==="logout"||t.action==="open")&&mt(t.authTabId)&&typeof t.expiresAt=="number"&&Number.isFinite(t.expiresAt)&&mt(t.ownerTabId)&&mt(t.ownerWindowId)}function _w(e,t){return vw(e)?ww(e)?(ie(yw(e)).then(r=>t({didSeek:r??!1,ok:!0})).catch(()=>t({error:"Unable to seek the YouTube video",ok:!1})),!0):(t({error:"Invalid YouTube timestamp request",ok:!1}),!0):!1}function vw(e){return mc(e)&&e.type==="seek_youtube_timestamp"}function ww(e){return mc(e)&&Object.keys(e).length===5&&e.type==="seek_youtube_timestamp"&&typeof e.tabId=="number"&&Number.isSafeInteger(e.tabId)&&e.tabId>=0&&typeof e.videoId=="string"&&xn.test(e.videoId)&&typeof e.timestampSeconds=="number"&&Number.isFinite(e.timestampSeconds)&&e.timestampSeconds>=0&&e.timestampSeconds<=604800&&typeof e.windowId=="number"&&Number.isSafeInteger(e.windowId)&&e.windowId>=0}function mc(e){return typeof e=="object"&&e!=null&&!Array.isArray(e)}function bw(e,t){let r=null;try{const i=new URL(window.location.href);if(i.protocol!=="https:"||i.username!==""||i.password!==""||i.port!=="")return!1;if(i.hostname==="youtube.com"||i.hostname==="www.youtube.com"||i.hostname==="m.youtube.com")if(i.pathname==="/watch"){const a=i.searchParams.getAll("v");r=a.length===1?a[0]??null:null}else{const a=i.pathname.split("/").filter(Boolean);a.length===2&&a[0]==="shorts"&&(r=a[1]??null)}else if(i.hostname==="youtu.be"){const a=i.pathname.split("/").filter(Boolean);a.length===1&&(r=a[0]??null)}}catch{return!1}if(r!==t)return!1;const n=document.querySelector("video");if(!(n instanceof HTMLVideoElement))return!1;try{return n.currentTime=e,!0}catch{return!1}}async function yw({tabId:e,timestampSeconds:t,videoId:r,windowId:n}){const i=await chrome.tabs.get(e);if(i.windowId!==n||i.url==null||qc(i.url)!==r)return!1;const[a]=await chrome.scripting.executeScript({args:[t,r],func:bw,target:{tabId:e}});return a?.result===!0}var Sw={dev:vr.dev,internal:vr.internal,prod:vr.production},Tw="codex-app-chrome-extension-background-popups",Ew="codex-app-chrome-extension-browser-management",Iw="chrome-standalone-js-kernel";function Aw(e){const t=Sw[e];return e==="prod"&&Ot(navigator.userAgent)==="edge"?[t,vr.internal]:[t]}async function Cw(){const e=Er("prod"),t=Aw(e),r=ah(),n=mv(()=>Fl(e,!0));kv("").catch(()=>{});const i=new Pv(()=>he.isBrowserControlActive()),a=new Map;let s=null;const o=()=>{if(s==null)return;const v=s,S=()=>{kw(v,chrome.runtime);for(const{browser:y}of a.values())y.sendBrowserTabMentionsInvalidated()};Qg(S),l.subscribeInvalidations(S)},l=new ol(e,Ji.getInstance(),o),h=new C_({buildChannel:e,browserTabMentionProvider:l,webMcpConfig:cw(),browserManagementEnabled:wt(Ew).catch(()=>!1),agentPopupInterceptorEnabled:wt(Tw).catch(()=>!1)}),m=new AbortController,d=()=>{m.signal.aborted||(m.abort(),Pd((v,S,y)=>{const T=new Qn(v);a.set(v,{browser:new Ga(S,h),control:new Ad(y,T),controlImpl:T})},v=>{a.delete(v)}),th(async(v,S)=>{const y=a.get(v);if(y==null){await h.turnEnded(S);return}try{await y.control.sendTurnEnded(S)}catch(T){throw await h.turnEnded(S),T}}).catch(eh))};Rr(Iw,v=>{safariTunnelState.kernelGate=v===!0;v&&d()},m.signal).catch(()=>{console.warn("Failed to observe Chrome extension kernel gate.")}),i.register(),he.setBrowserControlActivityChangeHandler(v=>{v||i.maybeReloadForPendingUpdate().catch(()=>{})});const f=new av(t);globalThis.ChatGPTSafariNativeManager=f;globalThis.ChatGPTSafariHooks={getInstanceId:Ce,getTabMentions:v=>l.getUserTabs(v),subscribeTabMentionsInvalidated:listener=>l.subscribeInvalidations(listener)};if(r){nw(),Hv();const v=Uv()}const c=r?pw("https://chatgpt.com/?surface=browser_side_chat",()=>{n.refresh(),wt(Ws).catch(()=>{})}):()=>!1,p=new Ga(f,h),u=v=>{for(const{browser:S}of a.values())v(S);v(p)};s=p;const g=ze.getInstance();g.ensureInit().catch(()=>{console.error("Failed to restore tab leases for request-header reconciliation.")}),chrome.runtime.onConnect.addListener(v=>{ov(l,e,v),Mv(f,chrome.runtime.getManifest().version,e,v)}),chrome.runtime.onMessage.addListener((v,S,y)=>{if(Lv(v,S,y))return!0;if(v?.type==="BROWSER_SETTINGS_UPDATED")return Qt(S,e)?(Promise.allSettled([...a.values()].map(({controlImpl:T})=>Qn.refreshBrowserSettings(T))).then(T=>y({ok:T.every(E=>E.status==="fulfilled")})),!0):!1;if(c(v,S,y))return!0;if(tg(v)){const T=S.tab?.id;return typeof T!="number"?!1:(h.handleAgentBackgroundPopup(T,v.url).then(()=>y({ok:!0})).catch(()=>y({ok:!1})),!0)}if(v?.type==="codex:page-event"&&Uc(v.event)){const T=S.tab?.id;return typeof T=="number"&&Number.isInteger(T)&&g.getActiveLease(T).then(E=>{E!=null&&u(I=>{I.sendPageEvent({...v.event,session_id:E.sessionId,tabId:T})})}).catch(()=>{}),!1}return xl(l,e,v,S,y)||_w(v,y)?!0:vv(v,S,e)?(y({ok:!0}),!1):dw(v,S,y)?!0:Kv(v,S,e)?(y({ok:!0}),!1):Rw(h,v,S,y)}),chrome.debugger?.onDetach?.addListener(v=>{u(S=>S.sendCdpDetach(v))}),chrome.debugger?.onEvent?.addListener((v,S,y)=>{u(T=>{T.sendCdpEvent({source:v,method:S,params:y})})}),h.addDownloadChangeListener(v=>{u(S=>S.sendDownloadChange(v))}),chrome.downloads?.onCreated?.addListener(v=>{h.handleDownloadCreated(v)}),Ce().catch(()=>{}),chrome.downloads?.onChanged?.addListener(v=>{h.handleDownloadChanged(v)}),chrome.webNavigation.onCreatedNavigationTarget?.addListener(v=>{h.handleCreatedNavigationTarget(v).catch(()=>{})});const w=aw({buildChannel:e,sidePanelEnabled:r,browserPluginInstallation:n});await nn.initialize(),await sw(()=>p.ping(),()=>Promise.any(Array.from(a.values(),({browser:v})=>v.ping())))}function kw(e,t){e.sendBrowserTabMentionsInvalidated(),t.sendMessage({type:Ic}).catch(()=>{})}function Rw(e,t,r,n){const i=r.tab?.id;switch(t?.type){case"GET_AGENT_CURSOR_STATE":return typeof i!="number"?(n({ok:!0,state:he.readCursorOverlayState(-1)}),!0):(n({ok:!0,state:he.readCursorOverlayState(i)}),!0);case"AGENT_CURSOR_ARRIVED":return typeof i!="number"||!("sessionId"in t)||!("turnId"in t)||!("moveSequence"in t)||typeof t.sessionId!="string"||typeof t.turnId!="string"||!Number.isInteger(t.moveSequence)?(n({ok:!1}),!0):(e.notifyCursorArrived({moveSequence:t.moveSequence,sessionId:t.sessionId,turnId:t.turnId}),n({ok:!0}),!0);default:return!1}}function Ow(e){return e==null||typeof e=="function"?{main:e}:e}var Pw=Ow(()=>{Cw()});function dT(){}var hT=globalThis.browser?.runtime?.id?globalThis.browser:globalThis.chrome,gc=class{constructor(e){if(e==="<all_urls>")this.isAllUrls=!0,this.protocolMatches=[...gc.PROTOCOLS],this.hostnameMatch="*",this.pathnameMatch="*";else{const t=/(.*):\/\/(.*?)(\/.*)/.exec(e);if(t==null)throw new Tn(e,"Incorrect format");const[r,n,i,a]=t;Mw(e,n),Lw(e,i),this.protocolMatches=n==="*"?["http","https"]:[n],this.hostnameMatch=i,this.pathnameMatch=a}}includes(e){if(this.isAllUrls)return!0;const t=typeof e=="string"?new URL(e):e instanceof Location?new URL(e.href):e;return!!this.protocolMatches.find(r=>{if(r==="http")return this.isHttpMatch(t);if(r==="https")return this.isHttpsMatch(t);if(r==="file")return this.isFileMatch(t);if(r==="ftp")return this.isFtpMatch(t);if(r==="urn")return this.isUrnMatch(t)})}isHttpMatch(e){return e.protocol==="http:"&&this.isHostPathMatch(e)}isHttpsMatch(e){return e.protocol==="https:"&&this.isHostPathMatch(e)}isHostPathMatch(e){if(!this.hostnameMatch||!this.pathnameMatch)return!1;const t=[this.convertPatternToRegex(this.hostnameMatch),this.convertPatternToRegex(this.hostnameMatch.replace(/^\*\./,""))],r=this.convertPatternToRegex(this.pathnameMatch);return!!t.find(n=>n.test(e.hostname))&&r.test(e.pathname)}isFileMatch(e){throw Error("Not implemented: file:// pattern matching. Open a PR to add support")}isFtpMatch(e){throw Error("Not implemented: ftp:// pattern matching. Open a PR to add support")}isUrnMatch(e){throw Error("Not implemented: urn:// pattern matching. Open a PR to add support")}convertPatternToRegex(e){const t=this.escapeForRegex(e).replace(/\\\*/g,".*");return RegExp(`^${t}$`)}escapeForRegex(e){return e.replace(/[.*+?^${}()|[\]\\]/g,"\\$&")}},Ra=gc;Ra.PROTOCOLS=["http","https","file","ftp","urn"];var Tn=class extends Error{constructor(e,t){super(`Invalid match pattern "${e}": ${t}`)}};function Mw(e,t){if(!Ra.PROTOCOLS.includes(t)&&t!=="*")throw new Tn(e,`${t} not a valid protocol (${Ra.PROTOCOLS.join(", ")})`)}function Lw(e,t){if(t.includes(":"))throw new Tn(e,"Hostname cannot include a port");if(t.includes("*")&&t.length>1&&!t.startsWith("*."))throw new Tn(e,"If using a wildcard (*), it must go at the start of the hostname")}function fT(e,t){}function En(e,...t){}var Dw={debug:(...e)=>En(console.debug,...e),log:(...e)=>En(console.log,...e),warn:(...e)=>En(console.warn,...e),error:(...e)=>En(console.error,...e)},Oa;try{Oa=Pw.main(),Oa instanceof Promise&&console.warn("The background's main() function return a promise, but it must be synchronous")}catch(e){throw Dw.error("The background crashed on startup!"),e}var xw=Oa;return xw})();

@@ -18,6 +18,57 @@
     if (!result.length || result.length > 50) throw new Error("Organize between 1 and 50 explicitly selected tabs");
     return result;
   };
+  const auditKey = "safariManagementAuditTrail", auditLimit = 50, auditLifetime = 72 * 60 * 60 * 1000;
+  let auditQueue = Promise.resolve();
+  function auditScope(owner) {
+    if (typeof owner.accountScope !== "string" || !/^[a-z0-9_-]{1,128}$/iu.test(owner.accountScope)) {
+      throw new Error("The verified ChatGPT account scope is unavailable for Safari's management audit");
+    }
+    return { profileId: owner.profileId, accountScope: owner.accountScope };
+  }
+  const sameAuditScope = (left, right) => left.profileId === right.profileId && left.accountScope === right.accountScope;
+  function serializedAudit(operation) {
+    const result = auditQueue.then(operation);
+    auditQueue = result.catch(() => {});
+    return result;
+  }
+  async function readAuditEntries(api) {
+    if (typeof api.storage?.session?.get !== "function" || typeof api.storage.session.set !== "function") {
+      throw new Error("Safari's browser-session management audit storage is unavailable");
+    }
+    const stored = (await api.storage.session.get(auditKey))[auditKey];
+    const cutoff = Date.now() - auditLifetime;
+    return (Array.isArray(stored) ? stored : []).filter(entry => record(entry) && record(entry.change)
+      && typeof entry.profileId === "string" && typeof entry.accountScope === "string"
+      && Array.isArray(entry.change.args) && record(entry.change.before)
+      && typeof entry.change.namespace === "string" && typeof entry.change.method === "string"
+      && Number.isFinite(entry.change.createdAt) && entry.change.createdAt >= cutoff).slice(-auditLimit);
+  }
+  const windowState = value => ({ id: value.id, focused: value.focused, left: value.left,
+    top: value.top, width: value.width, height: value.height, state: value.state });
+  function windowCreationOptions(args) {
+    if (args.length > 1) throw new Error("windows.create accepts at most one argument");
+    const value = options(args.length ? args[0] : {}, ["focused", "height", "left", "state", "tabId", "top", "type", "width"], true);
+    if (value.type !== undefined && value.type !== "normal") throw new Error("windows.create supports only normal, non-private Safari windows");
+    if (value.focused !== undefined && typeof value.focused !== "boolean") throw new Error("focused must be a boolean");
+    if (value.state !== undefined && !["normal", "minimized", "maximized", "fullscreen"].includes(value.state)) throw new Error("Unsupported Safari window state");
+    for (const key of ["left", "top", "width", "height"]) {
+      if (value[key] !== undefined && (!Number.isSafeInteger(value[key]) || (["width", "height"].includes(key) && value[key] <= 0))) {
+        throw new Error("Safari window bounds require integer coordinates and positive dimensions");
+      }
+    }
+    if (value.state !== undefined && value.state !== "normal" && ["left", "top", "width", "height"].some(key => value[key] !== undefined)) {
+      throw new Error("Use state normal when setting Safari window bounds");
+    }
+    if (Object.hasOwn(value, "tabId")) id(value.tabId);
+    return { ...value, type: "normal" };
+  }
+  function uncertainWindowCreation(error) {
+    error.message += ". Safari window creation was delivered once and was not retried. Inspect current windows before continuing; do not repeat a possibly completed creation or tab move.";
+    error.doNotReplay = true;
+    error.data = { ...(record(error.data) ? error.data : {}), doNotReplay: true };
+    return error;
+  }
   function readableNativeFailure(error) {
     // The upstream kernel serializes only Error.message. Carry the bounded
     // native outcome through that boundary without copying private error data.
@@ -40,18 +91,34 @@
     if (Object.keys(safe).length) error.message += ` Native result: ${JSON.stringify(safe)}.`;
     return error;
   }
-  function createManagement(api, companion) {
+  function createManagement(api, companion, personalData = root.ChatGPTSafariPersonalData) {
     const sessions = new Map();
     let nextGroup = 1;
     let busy = false;
     async function execute(command, session, metadata, owner, assertCurrent) {
+      owner = { ...owner };
+      const authorize = assertCurrent;
+      assertCurrent = async () => {
+        const current = await authorize();
+        if (owner.accountScope !== undefined && (!current || !sameAuditScope(current, owner))) {
+          throw new Error("The ChatGPT account changed during this Safari management command");
+        }
+        return current;
+      };
+      await assertCurrent();
       let state = sessions.get(metadata.session_id);
-      if (!state || state.owner !== owner.instanceId || state.profile !== owner.profileId) {
-        state = { owner: owner.instanceId, profile: owner.profileId, groups: new Map(), changes: [] };
+      if (!state || state.owner !== owner.instanceId || state.profile !== owner.profileId || state.accountScope !== owner.accountScope) {
+        state = { owner: owner.instanceId, profile: owner.profileId, accountScope: owner.accountScope, groups: new Map() };
         sessions.set(metadata.session_id, state);
       }
-      await assertCurrent();
-      if (command.type === "browser_management_get_audit_trail") return { changes: state.changes.slice().reverse() };
+      if (command.type === "browser_management_get_audit_trail") {
+        const scope = auditScope(owner);
+        return serializedAudit(async () => {
+          const entries = await readAuditEntries(api);
+          await assertCurrent();
+          return { changes: entries.filter(entry => sameAuditScope(entry, scope)).map(entry => entry.change).reverse() };
+        });
+      }
       const { namespace, method, args } = command;
       if (!Array.isArray(args) || args.length > 2) throw new Error("Safari management requires explicit method arguments");
       const tab = async tabId => {
@@ -70,9 +137,21 @@
       const audit = async (before, operation) => {
         await assertCurrent();
         const value = await operation();
-        state.changes.push({ namespace, method, args, before, createdAt: Date.now(),
-          ...(typeof value === "number" ? { result: value } : {}) });
-        state.changes = state.changes.slice(-50);
+        const result = typeof value === "number" ? value
+          : namespace === "windows" && method === "create" && Number.isSafeInteger(value?.id) ? value.id
+          : namespace === "bookmarks" && typeof value?.id === "string" ? { id: value.id } : undefined;
+        // Like upstream, an unavailable audit store does not turn a completed
+        // mutation into a failure. Queries explicitly report unavailability.
+        try {
+          const scope = auditScope(owner);
+          await serializedAudit(async () => {
+            const entries = await readAuditEntries(api);
+            await assertCurrent();
+            entries.push({ ...scope, change: { namespace, method, args, before, createdAt: Date.now(),
+              ...(result === undefined ? {} : { result }) } });
+            await api.storage.session.set({ [auditKey]: entries.slice(-auditLimit) });
+          });
+        } catch { /* Never replay a completed mutation because audit storage failed. */ }
         return value;
       };
       // The upstream audit's tabLayout schema requires Chrome-only group/color
@@ -126,7 +205,61 @@
       };
 
       let value;
-      if (namespace === "tabs" && method === "query") {
+      if (namespace === "bookmarks") {
+        if (typeof personalData?.bookmarks !== "function") throw new Error("Safari's native bookmark capability is unavailable");
+        const bookmark = async (operation, arguments_) => {
+          await assertCurrent();
+          return personalData.bookmarks(operation, arguments_, owner);
+        };
+        const handle = value => {
+          if (typeof value !== "string" || !value || value.length > 256) throw new Error("Use a current native Safari bookmark handle");
+          return value;
+        };
+        if (method === "getTree" && args.length === 0) value = await bookmark(method, []);
+        else if (method === "search" && args.length === 1) {
+          const query = typeof args[0] === "string" ? args[0] : options(args[0], ["query", "title", "url"], true);
+          if (record(query) && Object.values(query).some(item => typeof item !== "string")) throw new Error("Bookmark search fields must be strings");
+          value = await bookmark(method, [query]);
+        } else if (method === "get" && args.length === 1) {
+          const handles = Array.isArray(args[0]) ? args[0].map(handle) : handle(args[0]);
+          if (Array.isArray(handles) && (!handles.length || handles.length > 100)) throw new Error("Read between 1 and 100 explicit bookmark handles");
+          value = await bookmark(method, [handles]);
+        } else if (["getChildren", "getSubTree"].includes(method) && args.length === 1) value = await bookmark(method, [handle(args[0])]);
+        else if (method === "update" && args.length === 2) {
+          const identifier = handle(args[0]), changes = options(args[1], ["title", "url"]);
+          if (Object.values(changes).some(item => typeof item !== "string")) throw new Error("Bookmark changes must be strings");
+          const previous = await bookmark("get", [identifier]);
+          if (!Array.isArray(previous) || previous.length !== 1 || previous[0].id !== identifier) throw new Error("The current bookmark identity could not be read before updating it");
+          const before = Object.fromEntries(["id", "index", "parentId", "title", "url"].filter(key => previous[0][key] !== undefined).map(key => [key, previous[0][key]]));
+          value = await audit({ bookmarks: [before] }, () => bookmark("update", [identifier, changes]));
+        } else if (method === "create" && args.length === 1) {
+          const properties = options(args[0], ["title", "url", "parentId"]);
+          if (properties.title !== undefined && typeof properties.title !== "string") throw new Error("A bookmark title must be a string");
+          if (properties.parentId !== undefined) handle(properties.parentId);
+          if (Object.hasOwn(properties, "url")) {
+            let parsed;
+            try { parsed = new URL(properties.url); } catch { /* Report invalid input before opening Safari UI. */ }
+            if (typeof properties.url !== "string" || !parsed || !["http:", "https:"].includes(parsed.protocol)
+              || parsed.username || parsed.password) throw new Error("Bookmark URLs require HTTP or HTTPS without credentials");
+            value = await audit({}, () => bookmark("create", [properties]));
+          } else {
+            if (typeof properties.title !== "string" || !properties.title.trim()) throw new Error("A native bookmark folder needs a nonempty title");
+            value = await audit({}, () => bookmark("createFolder", [properties]));
+          }
+        } else if (method === "move" && args.length === 2) {
+          const identifier = handle(args[0]), properties = options(args[1], ["parentId"]);
+          handle(properties.parentId);
+          const previous = await bookmark("get", [identifier]);
+          if (!Array.isArray(previous) || previous.length !== 1 || previous[0].id !== identifier) throw new Error("The current bookmark identity could not be read before moving it");
+          const before = Object.fromEntries(["id", "index", "parentId", "title", "url"].filter(key => previous[0][key] !== undefined).map(key => [key, previous[0][key]]));
+          value = await audit({ bookmarks: [before] }, () => bookmark("move", [identifier, properties]));
+        } else if (["remove", "removeTree"].includes(method) && args.length === 1) {
+          const identifier = handle(args[0]), previous = await bookmark("get", [identifier]);
+          if (!Array.isArray(previous) || previous.length !== 1 || previous[0].id !== identifier) throw new Error("The current bookmark identity could not be read before deleting it");
+          const before = Object.fromEntries(["id", "index", "parentId", "title", "url"].filter(key => previous[0][key] !== undefined).map(key => [key, previous[0][key]]));
+          value = await audit({ bookmarks: [before] }, () => bookmark(method, [identifier]));
+        } else throw new Error(`Safari does not support management.bookmarks.${method} with these arguments. Native bookmark movement requires an explicit destination folder; insertion indices and root drops are unavailable`);
+      } else if (namespace === "tabs" && method === "query") {
         const query = options(args[0] ?? {}, ["windowId", "active", "pinned", "title", "url", "currentWindow", "lastFocusedWindow"], true);
         value = (await api.tabs.query(query)).filter(item => !item.incognito && /^https?:\/\//iu.test(item.url || ""));
       } else if (namespace === "tabs" && method === "get") value = await tab(args[0]);
@@ -241,6 +374,55 @@
           options(args[0] ?? {}, ["populate", "windowTypes"], true);
           value = (await api.windows.getAll(args[0] ?? {})).filter(item => !item.incognito && item.type === "normal");
         } else value = await window((await tab(owner.tabId)).windowId);
+      } else if (namespace === "windows" && method === "create") {
+        const create = windowCreationOptions(args);
+        if (typeof api.windows.create !== "function") throw new Error("This Safari version does not expose native windows.create; no window or tab was changed");
+        // Even blank creation belongs to the current ordinary-profile owner.
+        await window((await tab(owner.tabId)).windowId);
+        let target, sourceTabs;
+        if (Object.hasOwn(create, "tabId")) {
+          target = await owned(create.tabId);
+          if (target.id === owner.tabId) throw new Error("Keep the active sidebar tab outside this window creation. Move only another explicitly claimed tab");
+          if (target.pinned) throw new Error("windows.create cannot move a pinned tab without changing its pinning");
+          await window(target.windowId);
+          const observed = await organize(target, "inspect");
+          if (observed.currentGroupTitle !== null && observed.currentGroupSharingState !== "unshared") {
+            throw new Error("Safari did not verify that the source tab collection is unshared. No window was created and no tab was moved");
+          }
+          sourceTabs = await api.tabs.query({ windowId: target.windowId });
+          const fresh = await owned(target.id);
+          if (fresh.windowId !== target.windowId || fresh.url !== target.url || fresh.title !== target.title || fresh.pinned) {
+            throw new Error("The claimed Safari tab changed before its requested window transfer");
+          }
+        }
+        const before = (await api.windows.getAll({ windowTypes: ["normal"] })).filter(item => !item.incognito && item.type === "normal");
+        value = await audit({ windows: before.map(windowState) }, async () => {
+          let delivered = false;
+          try {
+            await assertCurrent();
+            delivered = true;
+            const created = await api.windows.create(create);
+            await assertCurrent();
+            if (!Number.isSafeInteger(created?.id) || created.id <= 0 || before.some(item => item.id === created.id)) {
+              throw new Error("Safari did not return a unique newly created window ID");
+            }
+            const confirmed = await window(created.id);
+            if (target) {
+              const moved = await tab(target.id);
+              if (moved.windowId !== confirmed.id || moved.url !== target.url || moved.title !== target.title || moved.pinned) {
+                throw new Error("Safari did not confirm the exact claimed tab in its new window");
+              }
+              const expected = sourceTabs.filter(item => item.id !== target.id).sort((a, b) => a.index - b.index).map(item => item.id);
+              const sourceExists = (await api.windows.getAll({ windowTypes: ["normal"] })).some(item => item.id === target.windowId);
+              const remaining = sourceExists ? await api.tabs.query({ windowId: target.windowId }) : [];
+              if (!sourceExists && expected.length) throw new Error("Safari closed a source window that still had unrelated original tabs");
+              if (JSON.stringify(remaining.sort((a, b) => a.index - b.index).map(item => item.id)) !== JSON.stringify(expected)) {
+                throw new Error("Safari's source window no longer contains exactly its unrelated original tabs in their original order");
+              }
+            }
+            return confirmed;
+          } catch (error) { throw delivered ? uncertainWindowCreation(error) : error; }
+        });
       } else if (namespace === "windows" && method === "update") {
         const target = await window(args[0]), changes = options(args[1], ["focused", "left", "top", "width", "height", "state"]);
         if (changes.state !== undefined && !["normal", "minimized", "maximized", "fullscreen"].includes(changes.state)) throw new Error("Unsupported Safari window state");

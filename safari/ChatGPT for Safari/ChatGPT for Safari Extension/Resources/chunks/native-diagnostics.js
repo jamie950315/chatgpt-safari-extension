@@ -38,3 +38,41 @@ document.querySelector("#test").addEventListener("click", async () => {
     if (connectionId) await request({ operation: "close", connectionId }).catch(() => {});
   }
 });
+
+const notificationRefresh = document.querySelector("#notifications-refresh");
+const notificationEnable = document.querySelector("#notifications-enable");
+const notificationOutput = document.querySelector("#notifications-result");
+let notificationBusy = false, canRequestNotifications = false;
+function notificationState(settings) {
+  canRequestNotifications = settings.authorization === "not_determined" && settings.permissionRequestAvailable === true;
+  switch (settings.authorization) {
+  case "not_determined": return "Notifications are not enabled. Choose Enable notifications to request permission.";
+  case "denied": return "Notifications are blocked. Allow ChatGPT for Safari in System Settings > Notifications, then check again.";
+  case "authorized":
+  case "provisional":
+    if (!settings.alertsEnabled && !settings.notificationCenterEnabled) return "Alerts and Notification Center are disabled. Enable either for ChatGPT for Safari in System Settings > Notifications.";
+    return settings.authorization === "provisional" ? "Notifications are allowed quietly." : "Notifications are allowed.";
+  default: return "macOS did not return a supported notification permission state.";
+  }
+}
+async function refreshNotifications(requestPermission = false) {
+  if (notificationBusy || (requestPermission && !canRequestNotifications)) return;
+  notificationBusy = true;
+  notificationRefresh.disabled = true; notificationEnable.disabled = true;
+  notificationOutput.textContent = requestPermission ? "Waiting for your choice in the macOS permission prompt…" : "Checking notification permission…";
+  try {
+    const response = await runtime.sendMessage({ type: requestPermission
+      ? "chatgpt-safari:notification-request-permission" : "chatgpt-safari:notification-status" });
+    if (!response?.ok) throw new Error(response?.error?.message || "The app notification service is unavailable. Open the signed-in ChatGPT sidebar and try again.");
+    notificationOutput.textContent = notificationState(response.result);
+  } catch (error) {
+    canRequestNotifications = false;
+    notificationOutput.textContent = error.message;
+  } finally {
+    notificationBusy = false;
+    notificationRefresh.disabled = false; notificationEnable.disabled = !canRequestNotifications;
+  }
+}
+notificationRefresh.addEventListener("click", () => refreshNotifications());
+notificationEnable.addEventListener("click", () => refreshNotifications(true));
+void refreshNotifications();

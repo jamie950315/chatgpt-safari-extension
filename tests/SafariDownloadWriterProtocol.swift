@@ -143,6 +143,49 @@ import Darwin
         precondition((deniedCreate["error"] as? [String: Any])?["code"] as? String == "DOWNLOAD_ACCESS_DENIED",
                      "An actual filesystem access denial must be returned, not bypassed")
         precondition(chmod(createOnlyDirectory.path, 0o700) == 0)
+
+        let bundleOperation = UUID().uuidString
+        let bundle = result(writer.handle(["action": "bundleBegin"], operationID: bundleOperation))
+        let bundleID = bundle["bundleId"] as! String
+        let bundleDirectory = URL(fileURLWithPath: bundle["directoryPath"] as! String, isDirectory: true)
+        var bundleAttributes = stat()
+        precondition(lstat(bundleDirectory.path, &bundleAttributes) == 0 && bundleAttributes.st_mode & 0o777 == 0o700)
+        let bundleTransfer = result(writer.handle(["action": "begin", "filename": "asset.svg", "bundleId": bundleID], operationID: bundleOperation))["transferId"] as! String
+        _ = result(writer.handle(["action": "append", "transferId": bundleTransfer, "sequence": 0,
+                                  "data": content.base64EncodedString()], operationID: bundleOperation))
+        let bundleAsset = result(writer.handle(["action": "finish", "transferId": bundleTransfer, "sequence": 1,
+                                                 "expectedBytes": content.count], operationID: bundleOperation))
+        let bundleAssetURL = URL(fileURLWithPath: bundleAsset["path"] as! String)
+        precondition(bundleAssetURL.deletingLastPathComponent() == bundleDirectory)
+        let bundleAssetData = try Data(contentsOf: bundleAssetURL)
+        precondition(bundleAssetData == content)
+        precondition(getxattr(bundleAssetURL.path, "com.apple.quarantine", nil, 0, 0, 0) > 0)
+        let manifest = ["assets": [["id": "observed-image", "path": bundleAssetURL.path]], "failures": []] as [String: Any]
+        let completeBundle = result(writer.handle(["action": "bundleFinish", "bundleId": bundleID, "manifest": manifest], operationID: bundleOperation))
+        let manifestURL = URL(fileURLWithPath: completeBundle["manifestPath"] as! String)
+        let manifestObject = try JSONSerialization.jsonObject(with: Data(contentsOf: manifestURL)) as! [String: Any]
+        precondition((manifestObject["assets"] as? [[String: Any]])?.first?["path"] as? String == bundleAssetURL.path)
+        precondition(lstat(manifestURL.path, &attributes) == 0 && attributes.st_mode & 0o777 == 0o600)
+        precondition(writer.handle(["action": "bundleFinish", "bundleId": bundleID, "manifest": manifest], operationID: bundleOperation)["ok"] as? Bool == false,
+                     "Completed bundles cannot be replayed")
+
+        let cancelledBundle = result(writer.handle(["action": "bundleBegin"], operationID: bundleOperation))
+        let cancelledBundleID = cancelledBundle["bundleId"] as! String
+        let cancelledDirectory = URL(fileURLWithPath: cancelledBundle["directoryPath"] as! String)
+        let retainedTransfer = result(writer.handle(["action": "begin", "filename": "retained.txt", "bundleId": cancelledBundleID], operationID: bundleOperation))["transferId"] as! String
+        let retained = result(writer.handle(["action": "finish", "transferId": retainedTransfer, "sequence": 0, "expectedBytes": 0], operationID: bundleOperation))
+        let bundlePartial = result(writer.handle(["action": "begin", "filename": "partial.txt", "bundleId": cancelledBundleID], operationID: bundleOperation))["transferId"] as! String
+        _ = result(writer.handle(["action": "bundleCancel", "bundleId": cancelledBundleID], operationID: bundleOperation))
+        precondition(FileManager.default.fileExists(atPath: retained["path"] as! String), "Cancelling a bundle preserves its completed files")
+        precondition(!FileManager.default.fileExists(atPath: cancelledDirectory.appendingPathComponent(".chatgpt-\(bundlePartial).download").path),
+                     "Cancelling a bundle removes only its own incomplete files")
+
+        let forgedBundle = result(writer.handle(["action": "bundleBegin"], operationID: bundleOperation))
+        let forgedBundleID = forgedBundle["bundleId"] as! String
+        precondition(writer.handle(["action": "begin", "filename": "stolen.txt", "bundleId": forgedBundleID], operationID: otherOperation)["ok"] as? Bool == false)
+        let badManifest: [String: Any] = ["assets": [["path": original.path]], "failures": []]
+        precondition(writer.handle(["action": "bundleFinish", "bundleId": forgedBundleID, "manifest": badManifest], operationID: bundleOperation)["ok"] as? Bool == false,
+                     "A manifest cannot claim an unrelated file was downloaded")
         writer.close()
         let remaining = try FileManager.default.contentsOfDirectory(atPath: directory.path)
         precondition(remaining.allSatisfy { !$0.hasPrefix(".chatgpt-") }, "No partial downloads may survive completion or rejection")

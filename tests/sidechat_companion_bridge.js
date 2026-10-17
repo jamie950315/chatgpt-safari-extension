@@ -8,6 +8,8 @@ class MockCustomEvent extends MockEvent {}
 function fixture(options = {}) {
   const listeners = new Map(), documentListeners = new Map(), attributes = new Map();
   const requests = [], messages = [], events = [];
+  const publishedCandidates = [];
+  const composer = { textContent: "", isConnected: true };
   const actualOrigin = options.relay ? "http://chatgpt-provider-test.localhost:1234" : "https://chatgpt.com";
   const on = (map, type, callback) => { if (!map.has(type)) map.set(type, []); map.get(type).push(callback); };
   const off = (map, type, callback) => map.set(type, (map.get(type) || []).filter(item => item !== callback));
@@ -45,11 +47,13 @@ function fixture(options = {}) {
     emit(listeners, { type: "message", data, source: window, origin: actualOrigin, isTrusted: true });
   };
   const document = {
+    querySelector: selector => selector === "#prompt-textarea" ? composer : null,
     documentElement: {
-      setAttribute: (name, value) => attributes.set(name, value),
+      setAttribute: (name, value) => { attributes.set(name, value); if (name === "data-chatgpt-extension-browser-tabs") publishedCandidates.push(JSON.parse(value)); },
       removeAttribute: name => attributes.delete(name),
     },
     addEventListener: (type, callback) => on(documentListeners, type, callback),
+    removeEventListener: (type, callback) => off(documentListeners, type, callback),
   };
   const sandbox = { window, document, location: { origin: actualOrigin, href: actualOrigin + "/?surface=browser_side_chat" },
     URL, Event: MockEvent, CustomEvent: MockCustomEvent, Date, console: { ...console }, setTimeout, clearTimeout, setInterval, clearInterval, queueMicrotask,
@@ -57,12 +61,79 @@ function fixture(options = {}) {
   const runtimeImport = 'import(relayMode ? relay.importURL(runtimeURL) : runtimeURL)';
   const input = options.runtime ? source.replace(runtimeImport, "Promise.resolve({ __webpack_require__: globalThis.__testRuntime })") : source;
   vm.runInNewContext(input, sandbox);
-  return { window, document, requests, messages, events, attributes,
+  return { window, document, composer, requests, messages, events, attributes, publishedCandidates,
     ready: sandbox.__CHATGPT_SAFARI_ADAPTER_READY__,
     emitMessage: event => emit(listeners, { type: "message", ...event }),
+    input: () => emit(documentListeners, new MockEvent("input", { isTrusted: true })),
     gesture: trusted => emit(documentListeners, new MockEvent("pointerdown", { isTrusted: trusted })) };
 }
 const flush = () => new Promise(resolve => setImmediate(resolve));
+
+async function invocationFixture() {
+  const runtime = { m: {}, c: {}, d(exports, getters) {
+    for (const [name, get] of Object.entries(getters)) Object.defineProperty(exports, name, { get });
+  } };
+  const f = fixture({ relay: true, runtime });
+  await f.ready;
+  const relay = f.window.ChatGPTSafariProviderRelay, sent = [];
+  const port = { close() {}, postMessage(message) {
+    sent.push(message);
+    if (message.type === "request" && message.method !== "openInvocation") queueMicrotask(() => {
+      port.onmessage({ data: { type: "reply", id: message.id, result: message.method === "tabMentions" ? { candidates: f.candidates || [] } : { ok: true } } });
+    });
+  } };
+  f.emitMessage({ source: f.window.parent, origin: relay.parentExtensionOrigin,
+    data: { type: "chatgpt-safari-provider:connect", token: relay.bridgeToken }, ports: [port] });
+  runtime.m.Kxt = () => {};
+  const exports = {};
+  runtime.m.Kxt({}, exports, runtime);
+  let account = "account-a";
+  const connection = new exports.BrowserSideChatConnection({ pageWindow: f.window, getAuthScope: () => account });
+  return { ...f, sent, connection, setAccount(value) { account = value; }, setCandidates(value) { f.candidates = value; },
+    respond(invocation) {
+      const request = sent.filter(item => item.method === "openInvocation").at(-1);
+      assert.ok(request);
+      port.onmessage({ data: { type: "reply", id: request.id, result: { invocation } } });
+    },
+    cleanup() { connection.dispose(); f.window.dispatchEvent(new MockEvent("pagehide")); } };
+}
+
+test("the original invocation callback receives one signed-in prefill without submitting or overwriting drafts", async () => {
+  const f = await invocationFixture(), received = [];
+  const value = { type: "browser_side_chat_prompt_prefill", createdAtMs: Date.now(), prompt: "Original website prompt", selectedText: "Context-menu selection" };
+  try {
+    f.composer.textContent = "Existing user draft";
+    f.connection.subscribeOpenInvocation(item => received.push(item));
+    await flush();
+    assert.equal(f.sent.some(item => item.method === "openInvocation"), false);
+    f.connection.setAuthState("signed_in");
+    await flush(); f.respond(value); await flush();
+    assert.equal(received.length, 0);
+    assert.equal(f.composer.textContent, "Existing user draft");
+    f.composer.textContent = ""; f.input();
+    assert.equal(received.length, 1);
+    assert.equal(received[0].prompt, value.prompt);
+    assert.equal(received[0].selectedText, value.selectedText);
+    f.input(); assert.equal(received.length, 1, "manual input never replays consumed prefill");
+    assert.deepEqual([...new Set(f.sent.filter(item => item.type === "request").map(item => item.method))], ["authStateChanged", "openInvocation"]);
+  } finally { f.cleanup(); }
+});
+
+test("pending and in-flight invocation payloads cannot cross an account change", async () => {
+  const f = await invocationFixture(), received = [];
+  const value = { type: "browser_side_chat_prompt_prefill", createdAtMs: Date.now(), prompt: "Account A only" };
+  try {
+    f.connection.subscribeOpenInvocation(item => received.push(item));
+    f.connection.setAuthState("signed_in");
+    await flush();
+    f.setAccount("account-b"); f.respond(value); await flush();
+    assert.equal(received.length, 0);
+    f.connection.setAuthState("signed_in"); await flush();
+    f.composer.textContent = "Account B draft"; f.respond(value); await flush();
+    f.setAccount("account-c"); f.composer.textContent = ""; f.input();
+    assert.equal(received.length, 0);
+  } finally { f.cleanup(); }
+});
 test("original stream observations preserve iterators, arguments, live exports and cancellation", async () => {
   const runtime = { m: {}, c: {}, d(exports, getters) {
     for (const [name, get] of Object.entries(getters)) Object.defineProperty(exports, name, { get, enumerable: true });
@@ -166,7 +237,14 @@ test("isolated provider uses its real parent/origin and a capability-bound chann
   f.window.dispatchEvent(new MockEvent("pagehide"));
 });
 test("tab mentions require a recent trusted gesture and publish the upstream temporary DOM contract", async () => {
-  const f = fixture();
+  const runtime = { m: {}, c: {}, d(exports, getters) {
+    for (const [name, get] of Object.entries(getters)) Object.defineProperty(exports, name, { get });
+  } };
+  const f = fixture({ runtime });
+  await f.ready;
+  runtime.m.Kxt = () => {};
+  const exports = {}; runtime.m.Kxt({}, exports, runtime);
+  const connection = new exports.BrowserSideChatConnection({ pageWindow: f.window, getAuthScope: () => "account-a" });
   f.window.dispatchEvent(new MockEvent("chatgpt-extension-request-status"));
   await flush();
   const search = () => f.window.dispatchEvent(new MockCustomEvent("chatgpt-extension-request-browser-tab-mentions", {
@@ -181,6 +259,29 @@ test("tab mentions require a recent trusted gesture and publish the upstream tem
   assert.equal(f.requests.filter(item => item.method === "tabMentions").length, 1);
   assert.ok(f.events.includes("chatgpt-extension-browser-tabs"));
   assert.equal(f.attributes.has("data-chatgpt-extension-browser-tabs"), false);
+  connection.dispose();
+});
+
+test("open tab-mention queries refresh on real tab changes and stop with their owner, account or dropdown", async () => {
+  const f = await invocationFixture();
+  f.window.__CHATGPT_SAFARI_SIDECAR__.receive({ type: "browser_side_chat_capabilities", capabilities: { "browserTabMentions.search": true } });
+  const search = () => f.window.dispatchEvent(new MockCustomEvent("chatgpt-extension-request-browser-tab-mentions", { detail: { query: "Research", limit: 5 } }));
+  const invalidate = () => f.window.__CHATGPT_SAFARI_SIDECAR__.receive({ type: "browser_tab_mentions_invalidated" });
+  try {
+    f.setCandidates([{ tabId: 1, title: "Before" }]); f.gesture(true); search(); await flush();
+    assert.equal(f.publishedCandidates.at(-1)[0].title, "Before");
+    f.setCandidates([{ tabId: 1, title: "After" }]); invalidate(); await flush();
+    assert.equal(f.publishedCandidates.at(-1)[0].title, "After");
+    f.window.dispatchEvent(new MockEvent("chatgpt-extension-stop-browser-tabs"));
+    const stopped = f.sent.filter(item => item.method === "tabMentions").length;
+    invalidate(); await flush();
+    assert.equal(f.sent.filter(item => item.method === "tabMentions").length, stopped);
+    f.gesture(true); search(); await flush();
+    f.setAccount("account-b"); invalidate(); await flush();
+    assert.equal(f.sent.filter(item => item.method === "tabMentions").length, stopped + 1);
+    f.connection.dispose(); invalidate(); await flush();
+    assert.equal(f.sent.filter(item => item.method === "tabMentions").length, stopped + 1);
+  } finally { f.cleanup(); }
 });
 test("invalid protocol messages do not reach native tab operations", async () => {
   const f = fixture();

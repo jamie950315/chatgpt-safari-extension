@@ -27,6 +27,7 @@ final class CompanionControlServer {
         let document: Data
     }
     private var kernelResource: KernelResource?
+    private var utilityResource: KernelResource?
     private let kernelSource: Data?
     var commandHandler: CommandHandler?
 
@@ -74,6 +75,7 @@ final class CompanionControlServer {
             for connection in connections.values { connection.cancel() }
             connections.removeAll()
             kernelResource = nil
+            utilityResource = nil
             removeDescriptor()
         }
         if DispatchQueue.getSpecific(key: queueKey) == true { finish() }
@@ -165,7 +167,7 @@ final class CompanionControlServer {
             }
             fields[name] = value
         }
-        if let kernel = kernelResource, fields["host"] == kernel.host {
+        if let kernel = [kernelResource, utilityResource].compactMap({ $0 }).first(where: { fields["host"] == $0.host }) {
             guard lines.first == "GET \(kernel.target) HTTP/1.1" else { return .reject(404, "Unknown kernel resource") }
             guard fields["origin"] == nil || fields["origin"]?.lowercased() == kernel.parent,
                   fields["transfer-encoding"] == nil,
@@ -243,6 +245,22 @@ final class CompanionControlServer {
             let value = KernelResource(parent: parent, host: host, target: target, url: "http://\(host)\(target)",
                                        policy: policy, document: Data(html.utf8))
             kernelResource = value
+            return value.url
+        }
+    }
+
+    /// An inert, capability-addressed page used only in a temporary ordinary-
+    /// profile window while Safari's own bookmarks editor occupies that tab.
+    func utilityEntry() throws -> String {
+        try queue.sync {
+            guard let port = listener?.port, started else { throw SideChatError("The Safari companion is not ready") }
+            if let utilityResource { return utilityResource.url }
+            let host = "chatgpt-utility-\(UUID().uuidString.lowercased()).localhost:\(port.rawValue)"
+            let target = "/bookmarks/\(UUID().uuidString.lowercased())"
+            let value = KernelResource(parent: "", host: host, target: target, url: "http://\(host)\(target)",
+                policy: "sandbox; default-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'",
+                document: Data("<!doctype html><meta charset=utf-8><title>ChatGPT Safari bookmark operation</title><p>Safari bookmark operation. This temporary window closes when the command finishes.</p>".utf8))
+            utilityResource = value
             return value.url
         }
     }

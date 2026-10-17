@@ -50,6 +50,12 @@ struct CompanionServerSmoke {
         guard case .reject(400, _) = server.parse(Data(duplicate.utf8)) else { fatalError("Duplicate length accepted") }
         guard case .reject(413, _) = server.parse(Data(repeating: 65, count: 2_000_000)) else { fatalError("Oversized body accepted") }
         let parent = "safari-web-extension://test-extension"
+        let utility = URL(string: try server.utilityEntry())!
+        let utilityRequest = "GET \(utility.path) HTTP/1.1\r\nHost: \(utility.host!):\(utility.port!)\r\n\r\n"
+        guard case .kernel(let utilityDocument, let utilityPolicy) = server.parse(Data(utilityRequest.utf8)) else { fatalError("Utility page rejected") }
+        precondition(!String(data: utilityDocument, encoding: .utf8)!.contains("<script") && utilityPolicy.contains("default-src 'none'") && !utilityPolicy.contains("unsafe-eval"))
+        let wrongOriginUtility = utilityRequest.replacingOccurrences(of: "\r\n\r\n", with: "\r\nOrigin: https://example.test\r\n\r\n")
+        guard case .reject(403, _) = server.parse(Data(wrongOriginUtility.utf8)) else { fatalError("Foreign origin accepted for utility page") }
         let kernel = URL(string: try server.kernelEntry(parentOrigin: parent))!
         precondition(kernel.host!.hasPrefix("chatgpt-kernel-") && kernel.host!.hasSuffix(".localhost"))
         let sameKernel = try server.kernelEntry(parentOrigin: parent)

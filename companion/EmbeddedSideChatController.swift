@@ -9,6 +9,7 @@ final class EmbeddedSideChatController {
     private var context: [String: Any]?
     private var parentOrigin: String?
     private var liveProfileId: String?
+    private var authorizationEpoch = UUID()
     private var agentCommands: [String: Int] = [:]
     private var cloudTunnel: [String: Any] = [:]
     var liveCommand: (([String: Any], @escaping ([String: Any]) -> Void) -> Void)?
@@ -16,8 +17,34 @@ final class EmbeddedSideChatController {
     var kernelEntry: ((String) throws -> String)?
     private var conversationURL = URL(string: "https://chatgpt.com/?surface=browser_side_chat")!
     private var initialized = false
+    private var authenticationState: String?
+    private var preparation = UUID()
+    private var preparing = false
     private var lastError: String?
     private var profileProbe: ProviderProfileDeploymentProbe?
+    private let relayResources: () throws -> (Data, Data)
+    private let installProfileSession: (ChatGPTProviderRelay, @escaping (Result<Void, Error>) -> Void) -> Void
+    private let openAuthentication: (Bool) -> Void
+
+    init(relayResources: @escaping () throws -> (Data, Data) = {
+        guard let browserURL = Bundle.main.url(forResource: "ProviderBrowser", withExtension: "js"),
+              let hostURL = Bundle.main.url(forResource: "SideChatBridge", withExtension: "js") else {
+            throw SideChatError("The embedded ChatGPT resources are missing. Rebuild the app.")
+        }
+        return (try Data(contentsOf: browserURL), try Data(contentsOf: hostURL))
+    }, installProfileSession: @escaping (ChatGPTProviderRelay, @escaping (Result<Void, Error>) -> Void) -> Void = { service, completion in
+        // Explicitly authorized: only this app's own profile, minimum session,
+        // official validation, memory only. Never Safari or Margina stores.
+        WKWebsiteDataStore.default().httpCookieStore.getAllCookies { cookies in
+            service.installOwnSessionCookies(cookies, completion: completion)
+        }
+    }, openAuthentication: @escaping (Bool) -> Void = { logout in
+        SideChatCompanionController.shared.showAuthentication(logout: logout)
+    }) {
+        self.relayResources = relayResources
+        self.installProfileSession = installProfileSession
+        self.openAuthentication = openAuthentication
+    }
 
     func handle(command: [String: Any], reply: @escaping ([String: Any]) -> Void) {
         precondition(Thread.isMainThread)
@@ -57,9 +84,14 @@ final class EmbeddedSideChatController {
                 if let parentOrigin, parentOrigin != origin {
                     relay?.stop(); relay = nil; initialized = false
                 }
-                if let previous = ownerToken, previous != token { cancelAgentCommands?(previous) }
+                if let previous = ownerToken, previous != token {
+                    authorizationEpoch = UUID()
+                    cancelAgentCommands?(previous)
+                    cancelPreparation()
+                }
                 ownerToken = token; context = value; parentOrigin = origin
                 if !isOpen { reply(["ok": true, "state": state()]); return }
+                if authenticationState != nil { reply(["ok": true, "state": state()]); return }
                 prepareRelay { result in
                     guard self.ownerToken == token else {
                         reply(["ok": false, "error": "The embedded side chat owner changed"]); return
@@ -67,13 +99,20 @@ final class EmbeddedSideChatController {
                     switch result {
                     case .success: reply(["ok": true, "state": self.state()])
                     case .failure(let error):
-                        self.lastError = error.localizedDescription
-                        self.ownerToken = nil; self.context = nil
-                        reply(["ok": false, "error": error.localizedDescription])
+                        if Self.requiresAuthentication(error) {
+                            self.authenticationState = "signed_out"
+                            reply(["ok": true, "state": self.state()])
+                        } else {
+                            self.lastError = error.localizedDescription
+                            reply(["ok": false, "error": error.localizedDescription])
+                        }
                     }
                 }
             case "embeddedEntry":
                 try requireOwner(command)
+                if let authenticationState {
+                    reply(["ok": true, "entry": ["authentication": ["state": authenticationState]]]); return
+                }
                 guard let relay, initialized else { throw SideChatError("The ChatGPT provider is not ready") }
                 relay.entry(conversationURL: conversationURL) { result in
                     DispatchQueue.main.async {
@@ -95,6 +134,7 @@ final class EmbeddedSideChatController {
                 reply(["ok": true])
             case "embeddedBrowserSession":
                 try requireOwner(command)
+                if authenticationState != nil || !initialized { reply(["ok": true, "session": NSNull()]); return }
                 guard let relay, initialized else { throw SideChatError("The ChatGPT provider is not ready") }
                 let token = ownerToken
                 relay.readBrowserSession { result in
@@ -115,23 +155,63 @@ final class EmbeddedSideChatController {
                 guard let profile = liveProfileId, command["profileId"] as? String == profile,
                       let request = command["command"] as? [String: Any],
                       let action = request["action"] as? String,
-                      ["read_page", "interact", "navigate", "history", "select_tab", "close_tab", "organize", "download_link_inspect", "download_link"].contains(action),
+                      ["read_page", "interact", "navigate", "history", "select_tab", "close_tab", "organize", "download_link_inspect", "download_link", "dom_query", "screenshot", "dialog", "asset_bundle", "content_export", "create_tab", "filechooser", "viewport"].contains(action),
                       let args = request["arguments"] as? [String: Any],
-                      let handle = args["handle"] as? String, SafariLiveBroker.profile(from: handle) == profile,
+                      (action == "create_tab" ? args["profileId"] as? String == profile
+                        : (args["handle"] as? String).flatMap(SafariLiveBroker.profile(from:)) == profile),
                       let liveCommand else { throw SideChatError("The side-chat browser command has no matching Safari profile") }
                 agentCommands[action, default: 0] += 1
                 liveCommand(["action": "live", "command": request, "agentOwner": ownerToken!], reply)
             case "embeddedAuth":
                 try requireOwner(command)
+                if let operation = command["authOperation"] as? String {
+                    guard ["open", "resume", "logout"].contains(operation), command["state"] == nil else {
+                        throw SideChatError("Invalid ChatGPT authentication operation")
+                    }
+                    if operation != "resume" {
+                        if operation == "logout" {
+                            authorizationEpoch = UUID()
+                            if let ownerToken { cancelAgentCommands?(ownerToken) }
+                            cancelPreparation()
+                            relay?.clearOwnSession()
+                            initialized = false
+                            authenticationState = "logout_requested"
+                        }
+                        openAuthentication(operation == "logout")
+                        reply(["ok": true, "authentication": ["state": authenticationState ?? "signed_out"]]); return
+                    }
+                    guard !preparing else { throw SideChatError("The app-owned ChatGPT login is already being checked") }
+                    authorizationEpoch = UUID()
+                    let token = ownerToken
+                    initialized = false
+                    prepareRelay { result in
+                        guard token == self.ownerToken else {
+                            reply(["ok": false, "error": "The embedded side chat owner changed"]); return
+                        }
+                        switch result {
+                        case .success: reply(["ok": true])
+                        case .failure(let error):
+                            if Self.requiresAuthentication(error) {
+                                self.authenticationState = "signed_out"
+                                reply(["ok": false, "error": "Sign in in the app window, then choose Continue."])
+                            } else { reply(["ok": false, "error": error.localizedDescription]) }
+                        }
+                    }
+                    return
+                }
                 guard let value = command["state"] as? String,
                       ["expired", "logout_requested", "signed_in", "signed_out"].contains(value) else {
                     throw SideChatError("Invalid ChatGPT authentication state")
                 }
                 if value != "signed_in" {
+                    authorizationEpoch = UUID()
                     if let ownerToken { cancelAgentCommands?(ownerToken) }
+                    cancelPreparation()
                     relay?.clearOwnSession()
+                    initialized = false
+                    authenticationState = value
                 }
-                reply(["ok": true])
+                reply(["ok": true, "authentication": authenticationState.map { ["state": $0] as Any } ?? NSNull()])
             case "embeddedPoll":
                 if ownerToken == nil { reply(["ok": true, "closed": true, "requests": [], "state": state()]); return }
                 try requireOwner(command)
@@ -140,6 +220,7 @@ final class EmbeddedSideChatController {
             case "embeddedClose":
                 if ownerToken != nil { try requireOwner(command) }
                 if let ownerToken { cancelAgentCommands?(ownerToken) }
+                cancelPreparation()
                 ownerToken = nil; context = nil; liveProfileId = nil
                 reply(["ok": true])
             default: throw SideChatError("Unknown embedded side chat command")
@@ -158,42 +239,60 @@ final class EmbeddedSideChatController {
             throw SideChatError("The embedded side chat owner changed")
         }
     }
+    func authorization(owner: String, profile: String) -> UUID? {
+        precondition(Thread.isMainThread)
+        guard ownerToken == owner, liveProfileId == profile, initialized, authenticationState == nil else { return nil }
+        return authorizationEpoch
+    }
     private func state() -> [String: Any] {
         var result: [String: Any] = ["visible": ownerToken != nil, "ownerAvailable": context != nil,
                                    "embedded": true, "relayReady": initialized, "agentCommands": agentCommands, "cloudTunnel": cloudTunnel]
         if let ownerToken { result["ownerToken"] = ownerToken }
         if let lastError { result["error"] = lastError }
+        if let authenticationState { result["authentication"] = ["state": authenticationState] }
         return result
     }
     private func prepareRelay(completion: @escaping (Result<Void, Error>) -> Void) {
         if initialized { completion(.success(())); return }
+        let operation = UUID()
+        preparation = operation
+        preparing = true
         do {
-            guard let browserURL = Bundle.main.url(forResource: "ProviderBrowser", withExtension: "js"),
-                  let hostURL = Bundle.main.url(forResource: "SideChatBridge", withExtension: "js"),
-                  let parentOrigin else { throw SideChatError("The embedded ChatGPT resources are missing. Rebuild the app.") }
-            let service = ChatGPTProviderRelay(browserShim: try Data(contentsOf: browserURL), sideChatHostScript: try Data(contentsOf: hostURL))
+            guard let parentOrigin else { throw SideChatError("The embedded side chat has no extension origin") }
+            let finish: (Result<Void, Error>) -> Void = { result in
+                guard self.preparation == operation else { completion(.failure(ProviderRelayError.sessionChanged)); return }
+                self.preparing = false
+                if case .success = result { self.initialized = true; self.authenticationState = nil; self.lastError = nil }
+                completion(result)
+            }
+            if let relay { installProfileSession(relay, finish); return }
+            let (browser, host) = try relayResources()
+            let service = ChatGPTProviderRelay(browserShim: browser, sideChatHostScript: host)
             relay = service
             service.start(parentExtensionOrigin: parentOrigin, conversationURL: conversationURL) { result in
                 DispatchQueue.main.async {
+                    guard self.preparation == operation, self.relay === service else {
+                        completion(.failure(ProviderRelayError.sessionChanged)); return
+                    }
                     switch result {
-                    case .failure(let error): completion(.failure(error))
-                    case .success:
-                        // Explicitly authorized exception: only this containing app's own profile,
-                        // minimal verified HTTP-only session, memory only. Never Safari/Margina.
-                        WKWebsiteDataStore.default().httpCookieStore.getAllCookies { cookies in
-                            service.installOwnSessionCookies(cookies) { installed in
-                                DispatchQueue.main.async {
-                                    switch installed {
-                                    case .success: self.initialized = true; self.lastError = nil; completion(.success(()))
-                                    case .failure(let error): completion(.failure(error))
-                                    }
-                                }
-                            }
-                        }
+                    case .failure(let error): finish(.failure(error))
+                    case .success: self.installProfileSession(service, finish)
                     }
                 }
             }
-        } catch { completion(.failure(error)) }
+        } catch { preparing = false; completion(.failure(error)) }
+    }
+    private func cancelPreparation() {
+        preparation = UUID()
+        if preparing { relay?.clearOwnSession(); initialized = false }
+        preparing = false
+    }
+    private static func requiresAuthentication(_ error: Error) -> Bool {
+        guard let error = error as? ProviderRelayError else { return false }
+        switch error {
+        case .missingSession, .invalidSession, .ambiguousSession, .sessionUnconfirmed, .invalidBrowserSession: return true
+        default: return false
+        }
     }
     private static func safeTunnelStatus(_ source: [String: Any]) -> [String: Any] {
         var result: [String: Any] = [:]
@@ -225,7 +324,9 @@ final class EmbeddedSideChatController {
     }
     func stop() {
         if let ownerToken { cancelAgentCommands?(ownerToken) }
+        cancelPreparation()
         relay?.stop(); relay = nil; initialized = false; context = nil; ownerToken = nil; liveProfileId = nil
+        authenticationState = nil
     }
 }
 

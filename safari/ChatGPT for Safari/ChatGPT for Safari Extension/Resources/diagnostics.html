@@ -1,6 +1,6 @@
 <!doctype html>
 <html lang="en"><meta charset="utf-8"><title>Safari native bridge diagnostics</title>
-<style>body{font:16px system-ui;max-width:760px;margin:60px auto;padding:24px;background:#181818;color:#eee}button{font:inherit;padding:10px 18px}pre{white-space:pre-wrap;overflow-wrap:anywhere;line-height:1.5}</style>
+<style>body{font:16px system-ui;max-width:760px;margin:60px auto;padding:24px;background:#181818;color:#eee}button{font:inherit;padding:10px 18px}pre{white-space:pre-wrap;overflow-wrap:anywhere;line-height:1.5}.actions{display:flex;flex-wrap:wrap;gap:12px}button:disabled{opacity:.6}button:focus-visible{outline:3px solid #9fc5ff;outline-offset:3px}p{line-height:1.5}</style>
 <h1>Native bridge diagnostics</h1>
 <p>Test the installed Safari extension, its XPC service, and the registered OpenAI native host. No page content is sent.</p>
 <button id="test">Test connection</button><pre id="result">Ready.</pre>
@@ -8,4 +8,10 @@
 <h2>Safari native automation</h2>
 <p>Desktop control uses the <code>safari_native</code> MCP server and Apple's isolated Safari automation session. Ordinary Safari tabs and logins stay separate.</p>
 <button id="automation">Refresh native automation status</button><pre id="automation-result">Ready.</pre>
+<section aria-labelledby="notifications-heading">
+<h2 id="notifications-heading">App notifications</h2>
+<p>Open the ChatGPT sidebar in an ordinary Safari tab and sign in first. Enable notifications opens the macOS permission prompt only when you choose it.</p>
+<div class="actions"><button id="notifications-refresh">Check notification permission</button><button id="notifications-enable" disabled>Enable notifications…</button></div>
+<p id="notifications-result" role="status" aria-live="polite">Checking notification permission…</p>
+</section>
 <script src="chunks/native-diagnostics.js"></script></html>

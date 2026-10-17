@@ -8,6 +8,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     private let downloads = SafariDownloadWriter()
     private let downloadQueue = DispatchQueue(label: "dev.jamie.chatgpt-safari.download-io")
     private let tabOrganization = SafariTabOrganization()
+    private let personalData = SafariPersonalData()
+    private let notifications = SafariNotifications()
+    private let fileChooser = SafariFileChooser()
+    private let viewport = SafariViewport()
     private lazy var live = SafariLiveBroker(download: { [weak self] input, operation, authorized, reply in
         guard let self else { reply(["ok": false, "error": ["code": "APP_CLOSED", "message": "The Safari companion was closed."]]); return }
         self.downloadQueue.async {
@@ -23,6 +27,23 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     organize: { [weak self] input, authorized, reply in
         guard let self else { reply(["ok": false, "error": ["code": "APP_CLOSED", "message": "The Safari companion was closed."]]); return }
         self.tabOrganization.handle(input, isAuthorized: authorized) { result in DispatchQueue.main.async { reply(result) } }
+    }, capture: { [weak self] input, authorized, reply in
+        guard let self else { reply(["ok": false, "error": ["code": "APP_CLOSED", "message": "The Safari companion was closed."]]); return }
+        self.liveInput.capture(input, isAuthorized: authorized) { result in DispatchQueue.main.async { reply(result) } }
+    }, guardedInput: { [weak self] input, authorized, reply in
+        guard let self else { reply(["ok": false, "error": ["code": "APP_CLOSED", "message": "The Safari companion was closed."]]); return }
+        self.liveInput.handle(input, isAuthorized: authorized) { result in DispatchQueue.main.async { reply(result) } }
+    }, fileChooser: { [weak self] input, authorized, reply in
+        guard let self else { reply(["ok": false, "error": ["code": "APP_CLOSED", "message": "The Safari companion was closed."]]); return }
+        self.fileChooser.handle(input, isAuthorized: authorized) { result in DispatchQueue.main.async { reply(result) } }
+    }, viewport: { [weak self] input, authorized, reply in
+        guard let self else { reply(["ok": false, "error": ["code": "APP_CLOSED", "message": "The Safari companion was closed."]]); return }
+        self.viewport.handle(input, isAuthorized: authorized) { result in DispatchQueue.main.async { reply(result) } }
+    }, cancelViewport: { [weak self] owner in
+        self?.viewport.cancel(owner: owner)
+    }, viewportStatus: { [weak self] reply in
+        guard let self else { reply(["leaseActive": false, "restoration": "unconfirmed"]); return }
+        self.viewport.status { result in DispatchQueue.main.async { reply(result) } }
     }) { [weak self] command, reply in
         guard let self else { reply(["ok": false, "error": ["code": "APP_CLOSED", "message": "The Safari companion was closed."]]); return }
         self.liveInput.handle(command) { result in DispatchQueue.main.async { reply(result) } }
@@ -57,7 +78,36 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                     reply(["ok": false, "error": "Invalid Safari automation command"]); return
                 }
                 self.automation.handle(action, reply: reply)
-            } else if ["live", "livePoll", "liveResolve", "liveInput", "liveDownload", "liveOrganize"].contains(command["action"] as? String ?? ""), let self {
+            } else if command["action"] as? String == "personalData", let self {
+                let controller = EmbeddedSideChatController.shared
+                let nativeProfile = (command["_nativeSafariProfile"] as? String).flatMap(UUID.init(uuidString:))
+                guard let owner = command["ownerToken"] as? String, let profile = command["profileId"] as? String,
+                      command["_nativeSafariProfileObserved"] as? Bool == true,
+                      self.live.isProfileBound(profile, nativeProfile: nativeProfile),
+                      let epoch = controller.authorization(owner: owner, profile: profile),
+                      let request = command["command"] as? [String: Any], request["profileId"] as? String == profile else {
+                    reply(["ok": false, "error": ["code": "STALE_OWNER", "message": "The personal-data request has no verified Safari profile and signed-in sidebar owner."]]); return
+                }
+                let authorized = { [weak self] in
+                    controller.authorization(owner: owner, profile: profile) == epoch
+                      && self?.live.isProfileBound(profile, nativeProfile: nativeProfile) == true
+                }
+                if request["action"] as? String == "utilityEntry" {
+                    do { reply(["ok": true, "result": ["url": try self.companionServer.utilityEntry()]]) }
+                    catch { reply(["ok": false, "error": ["code": "UTILITY_UNAVAILABLE", "message": "The temporary Safari bookmark page is unavailable."]]) }
+                } else if request["action"] as? String == "bookmarks" {
+                    guard let expected = try? self.companionServer.utilityEntry(), request["expectedUrl"] as? String == expected else {
+                        reply(["ok": false, "error": ["code": "INVALID_UTILITY_PAGE", "message": "Bookmarks must use the app's temporary operation page."]]); return
+                    }
+                    let deadline = Date().addingTimeInterval(20)
+                    self.liveInput.manageBookmarks(request, profileIdentity: profile + ":" + epoch.uuidString,
+                        isAuthorized: { Date() < deadline && authorized() }) { result in DispatchQueue.main.async { reply(result) } }
+                } else if request["action"] as? String == "notification" {
+                    self.notifications.handle(request, isAuthorized: authorized) { result in DispatchQueue.main.async { reply(result) } }
+                } else {
+                    self.personalData.handle(request, nativeProfileUUID: nativeProfile, isAuthorized: authorized) { result in DispatchQueue.main.async { reply(result) } }
+                }
+            } else if ["live", "livePoll", "liveResolve", "liveInputAck", "liveInputCallbackTimeout", "liveInput", "liveDownload", "liveOrganize", "liveCapture", "liveDialog", "liveModal", "liveFileChooser", "liveViewport"].contains(command["action"] as? String ?? ""), let self {
                 self.live.handle(command, reply: reply)
             } else if (command["action"] as? String)?.hasPrefix("embedded") == true {
                 EmbeddedSideChatController.shared.handle(command: command, reply: reply)

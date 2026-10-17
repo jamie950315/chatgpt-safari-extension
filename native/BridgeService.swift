@@ -196,15 +196,23 @@ final class BridgeService: NSObject, SafariNativeBridge {
                     sessions.removeValue(forKey: id)
                 }
                 if operation == "companion" {
-                    guard let command = command["command"] as? [String: Any],
-                          let action = command["action"] as? String,
-                          ["open", "update", "close", "status", "poll", "resolve", "automation", "livePoll", "liveResolve", "liveInput", "liveDownload", "liveOrganize",
+                    guard var forwarded = command["command"] as? [String: Any],
+                          let action = forwarded["action"] as? String,
+                          ["open", "update", "close", "status", "poll", "resolve", "automation", "livePoll", "liveResolve", "liveInputAck", "liveInputCallbackTimeout", "liveInput", "liveDownload", "liveOrganize", "liveCapture", "liveDialog", "liveModal", "liveFileChooser", "liveViewport", "personalData",
                            "embeddedOpen", "embeddedUpdate", "embeddedClose", "embeddedStatus", "embeddedPoll",
                            "embeddedEntry", "embeddedLocation", "embeddedAuth", "embeddedBrowserSession", "embeddedKernel", "embeddedLive"].contains(action) else {
                         reply(encode(failure("INVALID_COMPANION_COMMAND", "Unknown Safari companion operation.")))
                         return
                     }
-                    companion.handle(command) { reply(encode($0)) }
+                    // Only the Safari extension handler supplies native profile
+                    // identity; never accept a JavaScript-provided binding.
+                    forwarded.removeValue(forKey: "_nativeSafariProfile")
+                    forwarded.removeValue(forKey: "_nativeSafariProfileObserved")
+                    if ["livePoll", "personalData"].contains(action), command["_nativeSafariProfileObserved"] as? Bool == true {
+                        forwarded["_nativeSafariProfileObserved"] = true
+                        if let profile = command["_nativeSafariProfile"] as? String { forwarded["_nativeSafariProfile"] = profile }
+                    }
+                    companion.handle(forwarded) { reply(encode($0)) }
                     return
                 }
                 if operation == "open" {

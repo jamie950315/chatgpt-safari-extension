@@ -170,6 +170,32 @@ final class SideChatCompanionController: NSObject, WKScriptMessageHandlerWithRep
         updateOwner()
     }
 
+    /// Official authentication stays in the app's existing profile. This window
+    /// has no Safari context, host bridge, or access to another browser's store.
+    func showAuthentication(logout: Bool = false) {
+        precondition(Thread.isMainThread)
+        let configuration = WKWebViewConfiguration()
+        configuration.websiteDataStore = .default()
+        let view = WKWebView(frame: NSRect(x: 0, y: 0, width: 520, height: 700), configuration: configuration)
+        view.navigationDelegate = self
+        view.uiDelegate = self
+        let auth = SideChatInputPanel(contentRect: view.frame, styleMask: [.titled, .closable, .resizable, .nonactivatingPanel],
+                                      backing: .buffered, defer: false)
+        auth.title = logout ? "Log out of ChatGPT" : "Sign in to ChatGPT"
+        auth.isReleasedWhenClosed = false
+        auth.isFloatingPanel = false
+        auth.level = .normal
+        auth.hidesOnDeactivate = false
+        auth.becomesKeyOnlyIfNeeded = false
+        auth.collectionBehavior = [.moveToActiveSpace, .fullScreenAuxiliary, .canJoinAllApplications]
+        auth.delegate = self
+        auth.contentView = view
+        auth.center()
+        authWindows.append(auth)
+        auth.makeKeyAndOrderFront(nil)
+        view.load(URLRequest(url: URL(string: logout ? "https://chatgpt.com/auth/logout" : "https://chatgpt.com/auth/login")!))
+    }
+
     private func createWindow() {
         let frame = NSScreen.main?.visibleFrame ?? NSRect(x: 100, y: 100, width: 1280, height: 800)
         let size = NSSize(width: min(460, frame.width), height: max(460, frame.height - 48))
@@ -570,7 +596,7 @@ final class SideChatCompanionController: NSObject, WKScriptMessageHandlerWithRep
         let double = number.doubleValue
         return double.isFinite && double >= 0 && double <= 9007199254740991 && double.rounded() == double
     }
-    static func validatePromptPrefill(_ value: Any) throws -> [String: Any] {
+    nonisolated static func validatePromptPrefill(_ value: Any) throws -> [String: Any] {
         guard let value = value as? [String: Any], Set(value.keys).isSubset(of: ["prompt", "selectedText", "createdAtMs"]) else {
             throw SideChatError("Invalid side chat prompt prefill")
         }
@@ -581,7 +607,7 @@ final class SideChatCompanionController: NSObject, WKScriptMessageHandlerWithRep
         }
         var payload = value
         payload["type"] = "browser_side_chat_prompt_prefill"
-        payload["createdAtMs"] = Date().timeIntervalSince1970 * 1000
+        payload["createdAtMs"] = Int64(Date().timeIntervalSince1970 * 1000)
         return payload
     }
 }

@@ -70,12 +70,33 @@ The app's own ChatGPT session authenticates only the agent tunnel; page logins
 remain in ordinary Safari and are never copied out. No separate MCP client or
 API key is needed for this path.
 
-The executor supports top-level visible DOM, click, focused typing, page keys,
-scrolling, existing-tab navigation/history/reload, and tab closing. This includes
-filling forms and sending a message through the page's own controls, subject to
-the original agent's consent and confirmation checks. Unimplemented screenshot,
-Playwright, and clipboard APIs stay disabled. Stale targets and uncertain input outcomes
-require a fresh page read; delivered input is never automatically replayed.
+The executor supports visible DOM, Playwright locators, open shadow roots,
+same-origin and cross-origin iframe targeting, new tabs, navigation/history,
+double-clicks, pointer movement/dragging, focused Unicode typing, page-editing
+keys, native option selection, and real viewport/cropped/full-page screenshots.
+Full-page capture restores the original scroll position and excludes the hosting
+ChatGPT sidebar. Native application/system shortcuts are not page input.
+Stale targets and uncertain input outcomes require a fresh read; delivered input
+is never automatically replayed.
+
+JavaScript alerts, confirms, prompts, and file choosers use actual Safari native
+dialogs. File uploads retain the original approval and require explicit existing
+local files. Multiple files must share one directory. Custom `showPicker()`-only
+controls without a verifiable input click are rejected. A modal retains only its
+exact source selection until a response or cancellation; manual focus changes
+abort rather than stealing focus back.
+
+The original clipboard is a **session-local virtual clipboard**, not the Mac's
+clipboard. Console logs are captured from the first claim, bounded to the current
+turn and five minutes; earlier logs cannot be recovered. The `pageAssets`
+capability inventories observed page assets and saves selected assets with a
+manifest in a private Downloads subdirectory, retaining the original download
+and cross-origin fallback approval checks.
+
+Right-click **Ask ChatGPT** and website side-panel invocations can prefill the
+original composer without submitting or replacing an existing draft. Open tab
+mentions refresh when their real tabs change. Expired sessions have an explicit
+sign-in/Continue path using only this app's existing official WebKit profile.
 
 ### Download files using the page's existing login
 
@@ -103,12 +124,60 @@ Safari groups are separate named tab collections, not Chrome's colored inline
 groups. Moving a tab can remove it from the currently displayed collection.
 Group handles are session-local and resolve to an observed native title/window;
 duplicate names and shared or unverifiable groups cannot be changed. Chrome
-group colors/collapse state and bookmark management are not emulated. Read the
+group colors/collapse state are not emulated. Read the
 capability's Safari-specific documentation before invoking its methods.
 Safari may replace source tab IDs during creation. A batch resolves only its
 already-claimed pending tabs against unique observed source identities; later
 commands must query and claim their current real IDs again. A group created by
 the same sidebar session can be renamed from its source collection.
+
+Normal windows can be created empty or from an explicitly claimed, unpinned,
+non-sidebar tab. Management audit records survive task changes in the same
+browser session, scoped to the current ChatGPT account and Safari profile
+(50 successful changes, 72 hours).
+
+### History, bookmarks, and notifications
+
+History search reads a profile-bound Safari database read-only, using bounded
+parameterized queries. Native profile metadata must match; an unknown profile
+never falls back to another profile's history. macOS may require Safari-data
+access for this containing app. Permission failures remain explicit.
+
+Bookmark tree/search/read, title/URL updates, and folder creation use Safari's
+own editor in a temporary ordinary-profile window, then restore the sidebar
+owner. Native row handles expire when their identity becomes stale or ambiguous.
+URL creation uses the official Add Bookmark sheet for an inert local utility
+page, verifies its exact destination, then replaces the temporary URL and title
+in Safari's editor. It never visits the bookmarked website. The destination
+folder must have a unique native name; root placement requires Safari's actual
+root label to match its menu and selected destination. Missing official button
+identities or an unconfirmed destination stop the operation before Add.
+Deletion uses the selected native row's real context menu. Built-in collections
+are protected; deleting a nonempty folder requires `removeTree`. All mutations
+verify the resulting hierarchy and preservation of unrelated bookmarks. An
+active native editor search must be cleared before complete-tree operations.
+Bookmark movement uses a trusted native drag into an explicit visible folder,
+then verifies its actual parent, appended index, entire subtree, and unchanged
+unrelated hierarchy. A delivered but unconfirmed drag is never replayed.
+Explicit insertion indices, root drops, and obscured/offscreen drag targets are
+unsupported.
+
+System notifications use `UNUserNotificationCenter`. Open **connection
+diagnostics → App notifications → Enable notifications** to request the Mac's
+permission. A successful request returns a real scheduling ID, not proof that a
+banner was displayed.
+
+### Remaining platform differences
+
+The original read-only `evaluate`/`evaluateAll` sandbox freezes JavaScript realm
+intrinsics and requires Chrome's isolated world. Safari's public AppleEvents
+JavaScript command has no isolated-world option; running that sandbox in the
+page's main world would damage the page. Use the supported DOM read methods.
+
+Raw desktop CDP control, browser viewport overrides, WebMCP, Chrome group
+color/collapse/reordering, Top Sites, and the recently closed session inventory
+remain unavailable. Top Sites and recently closed sessions return explicit
+errors rather than unrelated history data or fabricated restore handles.
 
 Safari lacks Chrome's manifest sandbox pages. The packaged original JavaScript
 worker therefore runs at a dedicated local origin with no extension APIs,

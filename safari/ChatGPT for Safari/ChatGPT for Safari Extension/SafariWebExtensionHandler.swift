@@ -38,10 +38,25 @@ class SafariWebExtensionHandler: NSObject, NSExtensionRequestHandling {
             context.completeRequest(returningItems: [response], completionHandler: nil)
         }
         guard let item = context.inputItems.first as? NSExtensionItem,
-              let message = item.userInfo?[SFExtensionMessageKey] as? [String: Any],
-              let data = try? JSONSerialization.data(withJSONObject: message) else {
+              var message = item.userInfo?[SFExtensionMessageKey] as? [String: Any] else {
             complete(["ok": false, "error": ["code": "INVALID_REQUEST", "message": "Expected a native transport request."]])
             return
+        }
+        message.removeValue(forKey: "_nativeSafariProfile")
+        message.removeValue(forKey: "_nativeSafariProfileObserved")
+        if #available(macOS 14.0, *) {
+            let profile = item.userInfo?[SFExtensionProfileKey]
+            if profile == nil { message["_nativeSafariProfileObserved"] = true }
+            else if let uuid = profile as? UUID {
+                message["_nativeSafariProfile"] = uuid.uuidString
+                message["_nativeSafariProfileObserved"] = true
+            } else if let value = profile as? String, let uuid = UUID(uuidString: value) {
+                message["_nativeSafariProfile"] = uuid.uuidString
+                message["_nativeSafariProfileObserved"] = true
+            }
+        }
+        guard let data = try? JSONSerialization.data(withJSONObject: message) else {
+            complete(["ok": false, "error": ["code": "INVALID_REQUEST", "message": "Expected a serializable native transport request."]]); return
         }
         let proxy = Self.connection().remoteObjectProxyWithErrorHandler { error in
             complete(["ok": false, "error": ["code": "BRIDGE_UNAVAILABLE", "message": error.localizedDescription]])
