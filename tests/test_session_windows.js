@@ -4,15 +4,16 @@ const { createSessionWindows } = require("../safari/ChatGPT for Safari/ChatGPT f
 
 function fixture(failCreate = false, browserActionOnly = false) {
   const tabs = new Map([[1, { id: 1, windowId: 1 }]]);
-  const data = {}, titles = [], removed = [], removedListeners = [];
+  const data = {}, titles = [], removed = [], removedListeners = [], updatedListeners = [], attachedListeners = [], created = [];
   let nextWindow = 10, nextTab = 11;
   const api = {
     storage: { session: { async get(key) { return { [key]: data[key] }; }, async set(value) { Object.assign(data, value); } } },
     tabs: {
       onRemoved: { addListener(listener) { removedListeners.push(listener); } },
+      onUpdated: { addListener(listener) { updatedListeners.push(listener); } }, onAttached: { addListener(listener) { attachedListeners.push(listener); } },
       async get(id) { if (!tabs.has(id)) throw new Error("Missing tab"); return { ...tabs.get(id) }; },
       async query() { return Array.from(tabs.values()); },
-      async create({ windowId }) { const tab = { id: nextTab++, windowId }; tabs.set(tab.id, tab); return { ...tab }; },
+      async create(value) { created.push(value); const tab = { id: nextTab++, windowId: value.windowId }; tabs.set(tab.id, tab); return { ...tab }; },
       async remove(id) { tabs.delete(id); removed.push(id); },
     },
     windows: { async create() {
@@ -23,7 +24,7 @@ function fixture(failCreate = false, browserActionOnly = false) {
     action: { async setTitle(value) { titles.push(value); } },
   };
   if (browserActionOnly) { api.browserAction = api.action; delete api.action; }
-  return { manager: createSessionWindows(api), tabs, data, titles, removed, api, removedListeners };
+  return { manager: createSessionWindows(api), tabs, data, titles, removed, api, removedListeners, updatedListeners, attachedListeners, created };
 }
 
 test("persistent Safari session labels use native browserAction", async () => {
@@ -79,4 +80,29 @@ test("a manually closed session window does not leave a stale creation target", 
   for (const listener of f.removedListeners) listener(first.id);
   const second = await f.manager.createTab("session");
   assert.equal(second.windowId, 11);
+});
+test("native creation receipts are exact, owner/turn bound, once-only and invalidated without rewriting unknown URLs", async () => {
+  const f = fixture(), scope = { profileId: "profile", ownerId: "owner", accountScope: "account", sessionId: "session", turnId: "turn" };
+  const created = await f.manager.createTab("session", 2, "turn");
+  assert.equal(f.created[0].url, "about:blank"); assert.equal(created.url, undefined);
+  assert.equal(f.manager.bindCreatedTab(1, scope), false, "existing unknown user tabs have no creation authority");
+  assert.equal(f.manager.bindCreatedTab(created.id, { ...scope, turnId: "other" }), false);
+  assert.equal(f.manager.bindCreatedTab(created.id, scope), true);
+  const receipt = await f.manager.createdTabReceipt(created.id, scope);
+  assert.match(receipt.id, /^[0-9a-f-]{36}$/i); assert.equal(created.url, undefined);
+  for (const key of Object.keys(scope)) assert.equal(await f.manager.createdTabReceipt(created.id, { ...scope, [key]: "other" }), null);
+  assert.equal(f.manager.validateCreatedTabReceipt({ ...receipt, windowId: 99 }, scope, created), false);
+  assert.equal(f.manager.validateCreatedTabReceipt(receipt, scope, created, true), true);
+  assert.equal(f.manager.validateCreatedTabReceipt(receipt, scope, created, true), false, "a delivered navigation/close is never replayed");
+  for (const invalidate of [
+    id => f.manager.releaseCreatedTabs("session", "turn"),
+    id => f.updatedListeners.forEach(listener => listener(id, { url: "https://other.test/" }, f.tabs.get(id))),
+    id => f.attachedListeners.forEach(listener => listener(id)),
+    id => f.removedListeners.forEach(listener => listener(id)),
+    id => { f.tabs.get(id).pendingUrl = "https://pending.test/"; },
+  ]) {
+    const tab = await f.manager.createTab("session", 2, "turn"); f.manager.bindCreatedTab(tab.id, scope);
+    invalidate(tab.id); assert.equal(await f.manager.createdTabReceipt(tab.id, scope), null);
+  }
+  assert.equal(JSON.stringify(f.data).includes(receipt.id), false, "creation capabilities never persist with session labels");
 });

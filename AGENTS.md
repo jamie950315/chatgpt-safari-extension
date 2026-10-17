@@ -136,7 +136,10 @@ This is a development-signed conversion of Chrome extension 1.26.1005.11759.
   files and the actual multiple attribute. Recheck document/node/file inode
   after approval. Both default to and allow at most 10 seconds. A source/window/
   origin/type/message mismatch or focus change leaves the modal untouched;
-  never replay the click. Ordinary click/getJsDialog and filechooser-event
+  never replay the click. Alert response first moves and verifies the native
+  cursor, then rechecks the exact button before one down/up; preserve native
+  cursor tracking rather than adding another click after an uncertain result.
+  Ordinary click/getJsDialog and filechooser-event
   contracts remain, but unarmed modal round trips can stall and may require
   manual dismissal. Do not claim them as installed working from native-only proof.
 - Notifications use the containing app's real UserNotifications authorization
@@ -226,6 +229,12 @@ This is a development-signed conversion of Chrome extension 1.26.1005.11759.
   and use the actual `browserAction` API. Do not assign over Safari API objects.
 - Upstream calls `ChatGPTSafariConnectNative` directly. Assigning Safari's
   built-in `runtime.connectNative` did not replace that host method.
+- New blank tabs keep Safari's actual empty URL/title. A memory-only receipt
+  comes only from a successful native create callback and binds the exact tab,
+  window, profile, account, owner, session and turn. It authorizes only the first
+  navigation or close, never DOM/read/input. Consume or invalidate it on
+  nonblank navigation, removal/attachment, owner/turn teardown or background
+  reload; never retroactively authorize an observed blank tab.
 - Session windows replace the upstream internal Chrome tab-group manager.
   Preserve preferred windows and stable tab IDs; automatic session management
   never moves user tabs. Explicit organization moves only requested claimed tabs
@@ -240,6 +249,12 @@ unsandboxed for its native runtime; the Safari extension stays sandboxed.
 Register only the canonical dist extension with PlugInKit. Xcode's intermediate
 app must not remain registered/running alongside it: duplicate copies create
 different extension origins/backgrounds and can bind the toolbar to stale code.
+Use `python3 scripts/restart-companion.py` after a rebuild, then reopen the
+inline sidebar. Never restart Safari. The helper matches executable paths
+independently of launch arguments and refuses pending clipboard recovery or
+multiple app instances. The original kernel checks its owner-bound native
+resource before execution: only an actual service/capability change replaces
+the offscreen document, rejecting old delivered work without replay.
 
 Native hello and desktop discovery/tab listing/creation passed. The installed
 embedded route passed official session validation, real settings requests,
@@ -267,9 +282,10 @@ Build artifacts, private configuration backups, and probe reports stay ignored.
 Use only owned synthetic bookmarks for acceptance; do not send private bookmark
 inventories to the cloud agent.
 
-Current installed acceptance remains open for dialog responses, uploads,
-bookmark CRUD, YouTube transcript export, new blank-tab lifecycle, and updated
-website prompt prefill/provider-reload lifecycle. Keep source/protocol checks separate from
+Current installed acceptance remains open for bookmark CRUD and updated
+website prompt prefill. Native prompt response and two-file upload passed
+through the original Work agent with exact page readback and no replay.
+Keep source/protocol checks separate from
 original Work completion and retain still-valid accepted results below.
 
 Installed native Ask ChatGPT passed selected-text attachment in the same
@@ -322,5 +338,21 @@ one editor image. Native status confirmed restoration with no pending recovery.
 
 Installed original Work Google Sheets CSV export passed with 1,408 real bytes,
 30 data rows, mode 0600 and quarantine. Ordinary windows.create passed once for
-an existing claimed scratch tab, retaining its native tab ID and URL. Blank-tab
-create/claim/goto remains a separate acceptance gate.
+an existing claimed scratch tab, retaining its native tab ID and URL.
+The original Work agent also created a fresh blank tab, navigated it once without re-claiming,
+read the actual page and retained session, then closed only that new tab.
+
+Installed original Work YouTube export passed with 20,649 UTF-8 bytes of real
+English captions for aircAruvnKk, mode 0600 and quarantine. Native readback
+confirmed the prior captions toggle state and paused playback were retained.
+
+Installed original Work alert and confirm responses passed once each, with
+verified closure, null subsequent dialog inspection, and actual confirm
+readback `false`.
+
+An installed official provider Reload first produced the inert missing-capability
+401, then automatically recovered the same owner/provider homepage without
+closing the sidebar, restarting the app, signing out or refreshing the session.
+A separate root-page reload retained its exact Work draft, conversation and
+enabled Send. The earlier disabled-Send state is currently not reproduced; do
+not add speculative composer/adoption mutations.

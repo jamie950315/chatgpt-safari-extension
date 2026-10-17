@@ -64,8 +64,8 @@ struct ProviderRelayRequest {
 
 enum ProviderRelayDiagnostics {
     static let maximumBytes = 8 * 1024
-    static let counters: Set<String> = ["usedOrigin", "usedConnection", "connections", "contexts", "streamCalls", "failures", "scriptErrors", "unhandledRejections", "connectMessages", "trustedInputCounter"]
-    static let booleans: Set<String> = ["channelConnected", "readyPosted", "parentSourceMatched", "parentTokenMatched", "composerHasText", "composerFocused", "composerEditable", "sendDisabled"]
+    static let counters: Set<String> = ["usedOrigin", "usedConnection", "connections", "contexts", "streamCalls", "failures", "scriptErrors", "unhandledRejections", "connectMessages", "trustedInputCounter", "composerCandidateCount"]
+    static let booleans: Set<String> = ["channelConnected", "readyPosted", "parentSourceMatched", "parentTokenMatched", "composerHasText", "composerFocused", "composerEditable", "composerPendingInput", "composerComposing", "sendDisabled"]
     static let kinds: Set<String> = ["Error", "TypeError", "ReferenceError", "RangeError", "SyntaxError", "SecurityError", "DOMException", "UnhandledRejection", "ModuleLoadError", "UnknownError"]
     static let reasons: Set<String> = ["The side-chat extension is unavailable", "The Safari owner tab is no longer available", "The Safari side-chat context request timed out", "The ChatGPT account changed", "Load failed"]
 

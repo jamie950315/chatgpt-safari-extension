@@ -104,9 +104,9 @@ automatically or replaces an existing draft. Open tab mentions refresh when
 their real tabs change. Expired sessions have an explicit sign-in/Continue path
 using only this app's existing official WebKit profile.
 
-Current installed acceptance is still open for dialog responses, uploads,
-bookmark CRUD, YouTube transcript export, the blank-tab lifecycle, and the
-updated website prompt prefill/provider-reload lifecycle. Completed installed checks are listed
+Current installed acceptance is still open for bookmark CRUD and the updated
+website prompt prefill lifecycle. Native dialogs, two-file upload, and clean
+provider-document reload have passed installed checks. Completed checks are listed
 under [Installed acceptance](#installed-acceptance).
 
 ### Complete known native dialogs and uploads in one operation
@@ -332,6 +332,26 @@ adapter and `safari_live` target existing tabs; `safari_native` is for isolated 
 
 Completed installed checks:
 
+- The official provider **Reload** button recovered automatically after the
+  expected missing-capability document response, without closing the sidebar or
+  restarting the app. A separate root-page reload retained the exact Work draft,
+  conversation and enabled Send.
+
+- The original **Work** agent accepted an exact native alert and dismissed an
+  exact native confirm, once each. Both returned `responseVerified: true`,
+  subsequent dialog inspection was empty, and the confirm page read back
+  `false`. The original response finished normally without replay.
+
+- After replacing the containing app, the original **Work** kernel initialized
+  successfully in the still-running Safari background. It created a fresh blank
+  tab, navigated it once without re-claiming, read its actual page and retained
+  session, then closed only that new tab and finished normally.
+
+- The original **Work** agent completed a known native prompt once and read back
+  its exact entered value. A separate two-file native upload returned both
+  approved filenames and a trusted change event. Both operations completed
+  normally without repeating their opening clicks.
+
 - In the original **Chat** mode, attaching two ordinary Safari tabs with **@**
   returned both exact session-only DOM markers. Neither marker was included in
   the prompt. The original Safari consent prompt was retained and the response
@@ -384,6 +404,12 @@ Completed installed checks:
   30 data rows, after its normal download approval. The file had mode 0600 and
   quarantine; the original reply finished normally. Approval waiting time no
   longer consumes the 30-second transfer deadline.
+
+- The original **Work** agent exported a public YouTube video
+  (`aircAruvnKk`) to **20,649 bytes** of UTF-8, including the exact video ID,
+  English language metadata and timestamped real captions. The file had mode
+  0600 and quarantine. Native UI readback confirmed the captions toggle retained
+  its prior state and the video stayed paused; the original reply finished normally.
 
 - The original **Work** management capability moved one explicitly claimed,
   unpinned scratch tab into a new normal window with a single `windows.create`
@@ -441,6 +467,11 @@ node --test tests/test_safari_agent_background.js tests/test_safari_agent_kernel
 Requirements: full Xcode, macOS, and the local Apple Development identity for
 team `N3JN8G9YWK`. The build creates Universal arm64/x86_64 binaries, verifies
 signatures, and retains the previous app under `dist/previous-*`.
+
+After a rebuild, run `python3 scripts/restart-companion.py` to restart only this
+checkout's containing app, then reopen the inline sidebar. Safari stays running.
+The helper refuses pending clipboard recovery or multiple app instances; it
+waits for the old process to exit before starting its replacement.
 
 The containing app is not sandboxed so it can own the Apple driver and private
 local IPC service; the Safari extension remains sandboxed. IPC binds only to

@@ -125,6 +125,38 @@ final class SafariFileChooser {
         return result
     }
 
+    static func modalChromeTraversal<Node>(_ root: Node, role: (Node) -> String?, children: (Node) -> [Node],
+                                           sheets: (Node) -> [Node], same: (Node, Node) -> Bool,
+                                           visit: (Node) -> Void = { _ in }) throws -> [Node] {
+        var pending = [(root, 0)], index = 0
+        while index < pending.count {
+            let (node, depth) = pending[index]; index += 1; visit(node)
+            // Identity controls live outside website content and file rows.
+            // Keep each container so its selection can later be read directly.
+            if ["AXWebArea", "AXOutline", "AXTable", "AXList", "AXRow", "AXCell", "AXCollection"].contains(role(node) ?? "") { continue }
+            var added: [Node] = []
+            for child in children(node) + sheets(node)
+                where !pending.contains(where: { same($0.0, child) }) && !added.contains(where: { same($0, child) }) { added.append(child) }
+            guard pending.count + added.count <= 512, depth < 32 || added.isEmpty else {
+                throw Failure(code: "NATIVE_MODAL_CHROME_UNVERIFIABLE", message: "The complete native modal chrome exceeded its bounded identity traversal.")
+            }
+            pending += added.map { ($0, depth + 1) }
+        }
+        return pending.map(\.0)
+    }
+
+    static func nativeModalChromeNodes(_ root: AXUIElement, visit: (AXUIElement) -> Void = { _ in }) throws -> [AXUIElement] {
+        func attribute(_ node: AXUIElement, _ name: String) -> CFTypeRef? {
+            var value: CFTypeRef?
+            return AXUIElementCopyAttributeValue(node, name as CFString, &value) == .success ? value : nil
+        }
+        return try modalChromeTraversal(root, role: { attribute($0, kAXRoleAttribute) as? String },
+            children: { attribute($0, kAXChildrenAttribute) as? [AXUIElement] ?? [] },
+            sheets: { attribute($0, "AXSheets") as? [AXUIElement] ?? [] }, same: { CFEqual($0, $1) }, visit: visit)
+    }
+
+    func nativeDiagnostics() -> [String: Any] { (driver as? NativeDriver)?.diagnostics ?? [:] }
+
     static func files(_ raw: Any?, multiple: Bool) throws -> [LocalFile] {
         guard let paths = raw as? [String], !paths.isEmpty, paths.count <= 128, multiple || paths.count == 1 else {
             throw Failure(code: "INVALID_FILES", message: "Choose at least one file; multiple files require the observed input's multiple attribute (maximum 128 files).")
@@ -189,6 +221,10 @@ final class SafariFileChooser {
     private final class NativeDriver: Driver {
         private struct Context { let pid: pid_t; let app: AXUIElement; let window: AXUIElement; let panel: AXUIElement }
         private var identities: [(node: AXUIElement, id: String)] = []
+        private var started = ProcessInfo.processInfo.systemUptime
+        private var stage = "idle", chromeScans = 0, chromeVisited = 0, fullScans = 0, fullVisited = 0
+        var diagnostics: [String: Any] { ["stage": stage, "elapsedMs": max(0, Int((ProcessInfo.processInfo.systemUptime - started) * 1000)),
+            "chromeScans": chromeScans, "chromeNodesVisited": chromeVisited, "fileScans": fullScans, "fileNodesVisited": fullVisited] }
 
         init() { Self.onMain { _ = NSWorkspace.shared.runningApplications } }
         private static func onMain<T>(_ body: () -> T) -> T { Thread.isMainThread ? body() : DispatchQueue.main.sync(execute: body) }
@@ -202,10 +238,16 @@ final class SafariFileChooser {
             guard let value = attribute(node, name), CFGetTypeID(value) == AXUIElementGetTypeID() else { return nil }
             return (value as! AXUIElement)
         }
-        private func nodes(_ root: AXUIElement) throws -> [AXUIElement] {
+        private func nodes(_ root: AXUIElement, chromeOnly: Bool = false) throws -> [AXUIElement] {
+            if chromeOnly {
+                chromeScans += 1
+                return try SafariFileChooser.nativeModalChromeNodes(root) { _ in self.chromeVisited += 1 }
+            }
+            fullScans += 1
             var pending = [(root, 0)], index = 0
             while index < pending.count {
                 let (node, depth) = pending[index]; index += 1
+                fullVisited += 1
                 if string(node, kAXRoleAttribute) == "AXWebArea" { continue }
                 // Safari's attached open/Go-to panels can be exposed through
                 // AXSheets without appearing in AXChildren. Traverse both
@@ -272,7 +314,7 @@ final class SafariFileChooser {
             // unique source; bounds alone cannot identify the upload window.
             let matching = try windows.filter { candidate in
                 guard bounds(candidate).map({ sameBounds($0, target.bounds) }) == true else { return false }
-                let addresses = try nodes(candidate).filter { string($0, kAXIdentifierAttribute) == "WEB_BROWSER_ADDRESS_AND_SEARCH_FIELD" }
+                let addresses = try nodes(candidate, chromeOnly: true).filter { string($0, kAXIdentifierAttribute) == "WEB_BROWSER_ADDRESS_AND_SEARCH_FIELD" }
                     .compactMap { string($0, kAXValueAttribute) }
                 return addresses.count == 1 && SafariFileChooser.matchesPageAddress(addresses[0], expected: target.url)
             }
@@ -284,7 +326,7 @@ final class SafariFileChooser {
         }
         private func context(_ target: Target, expected: Observation?, authorized: () -> Bool) throws -> Context? {
             let (pid, app, window) = try window(target, authorized: authorized)
-            let panels = try nodes(window).filter { string($0, kAXRoleAttribute) == kAXSheetRole && string($0, kAXIdentifierAttribute) == "open-panel" }
+            let panels = try nodes(window, chromeOnly: true).filter { string($0, kAXRoleAttribute) == kAXSheetRole && string($0, kAXIdentifierAttribute) == "open-panel" }
             guard panels.count <= 1 else { throw Failure(code: "FILE_CHOOSER_UNVERIFIABLE", message: "Safari exposed more than one upload panel.") }
             guard let panel = panels.first else { return nil }
             if let expected, expected != Observation(window: identity(window), panel: identity(panel)) {
@@ -293,6 +335,7 @@ final class SafariFileChooser {
             return Context(pid: pid, app: app, window: window, panel: panel)
         }
         func observe(_ target: Target, authorized: () -> Bool) throws -> Observation? {
+            started = ProcessInfo.processInfo.systemUptime; stage = "observe"; chromeScans = 0; chromeVisited = 0; fullScans = 0; fullVisited = 0
             guard let current = try context(target, expected: nil, authorized: authorized) else { return nil }
             return Observation(window: identity(current.window), panel: identity(current.panel))
         }
@@ -303,7 +346,7 @@ final class SafariFileChooser {
             return value
         }
         private func button(_ identifier: String, in panel: AXUIElement) throws -> AXUIElement {
-            let matches = try nodes(panel).filter { string($0, kAXRoleAttribute) == kAXButtonRole && string($0, kAXIdentifierAttribute) == identifier }
+            let matches = try nodes(panel, chromeOnly: true).filter { string($0, kAXRoleAttribute) == kAXButtonRole && string($0, kAXIdentifierAttribute) == identifier }
             guard matches.count == 1, let match = matches.first, attribute(match, kAXEnabledAttribute) as? Bool == true else {
                 throw Failure(code: "FILE_CHOOSER_CONTROL_UNAVAILABLE", message: "The upload panel's exact enabled native control was not available.")
             }
@@ -332,7 +375,7 @@ final class SafariFileChooser {
         }
         private func selectedPaths(_ panel: AXUIElement) throws -> Set<String> {
             var paths = Set<String>()
-            for node in try nodes(panel) {
+            for node in try nodes(panel, chromeOnly: true) {
                 for attributeName in [kAXSelectedChildrenAttribute, kAXSelectedRowsAttribute] {
                     if let selected = attribute(node, attributeName) as? [AXUIElement] {
                         for item in selected { paths.formUnion(try fileURLs(item)) }
@@ -342,29 +385,33 @@ final class SafariFileChooser {
             return paths
         }
         private func goTo(_ path: String, target: Target, observed: Observation, authorized: () -> Bool) throws {
+            stage = "go_to_open"
             try key(5, flags: [.maskCommand, .maskShift]) { _ = try self.current(target, observed, authorized) }
             let deadline = Date().addingTimeInterval(2)
             var field: AXUIElement?
             repeat {
                 let current = try self.current(target, observed, authorized)
-                let sheets = try nodes(current.window).filter { string($0, kAXRoleAttribute) == kAXSheetRole && string($0, kAXIdentifierAttribute) == "GoToWindow" }
+                stage = "go_to_observe"
+                let sheets = try nodes(current.window, chromeOnly: true).filter { string($0, kAXRoleAttribute) == kAXSheetRole && string($0, kAXIdentifierAttribute) == "GoToWindow" }
                 if sheets.count == 1 {
-                    let fields = try nodes(sheets[0]).filter { string($0, kAXIdentifierAttribute) == "PathTextField" && string($0, kAXRoleAttribute) == kAXTextFieldRole }
+                    let fields = try nodes(sheets[0], chromeOnly: true).filter { string($0, kAXIdentifierAttribute) == "PathTextField" && string($0, kAXRoleAttribute) == kAXTextFieldRole }
                     if fields.count == 1 { field = fields[0]; break }
                 }
                 Thread.sleep(forTimeInterval: 0.025)
             } while Date() < deadline
             guard let field else { throw Failure(code: "FILE_CHOOSER_PATH_UNAVAILABLE", message: "The native Go to Folder path field did not appear. No upload was submitted.") }
+            stage = "go_to_path"
             _ = try self.current(target, observed, authorized)
             guard AXUIElementSetAttributeValue(field, kAXValueAttribute as CFString, path as CFString) == .success,
                   string(field, kAXValueAttribute) == path else {
                 throw Failure(code: "FILE_CHOOSER_PATH_REJECTED", message: "The native path field rejected the explicit local path. No upload was submitted.")
             }
             try key(36) { _ = try self.current(target, observed, authorized) }
+            stage = "go_to_commit"
             let closedDeadline = Date().addingTimeInterval(2)
             repeat {
                 let current = try self.current(target, observed, authorized)
-                if !(try nodes(current.window)).contains(where: { string($0, kAXIdentifierAttribute) == "GoToWindow" }) { return }
+                if !(try nodes(current.window, chromeOnly: true)).contains(where: { string($0, kAXIdentifierAttribute) == "GoToWindow" }) { return }
                 Thread.sleep(forTimeInterval: 0.025)
             } while Date() < closedDeadline
             throw Failure(code: "FILE_CHOOSER_PATH_UNCONFIRMED", message: "The native path navigation did not finish. No upload was submitted; inspect the open panel before continuing.")
@@ -374,9 +421,10 @@ final class SafariFileChooser {
             try goTo(files.count == 1 ? files[0].path : URL(fileURLWithPath: files[0].path).deletingLastPathComponent().path,
                      target: target, observed: observed, authorized: authorized)
             if files.count > 1 {
+                stage = "select_files"
                 let current = try self.current(target, observed, authorized)
                 var candidates: [(AXUIElement, String, [AXUIElement])] = []
-                for node in try nodes(current.panel) {
+                for node in try nodes(current.panel, chromeOnly: true) {
                     for name in [kAXSelectedChildrenAttribute, kAXSelectedRowsAttribute] {
                         var settable = DarwinBoolean(false)
                         guard AXUIElementIsAttributeSettable(node, name as CFString, &settable) == .success, settable.boolValue else { continue }
@@ -395,6 +443,7 @@ final class SafariFileChooser {
                 }
             }
             let deadline = Date().addingTimeInterval(2)
+            stage = "verify_selection"
             var selectionVerified = false
             repeat {
                 let current = try self.current(target, observed, authorized)
@@ -407,10 +456,12 @@ final class SafariFileChooser {
             let upload = try button("OKButton", in: current.panel)
             guard try selectedPaths(current.panel) == wanted else { throw Failure(code: "FILE_CHOOSER_SELECTION_CHANGED", message: "The native file selection changed before submission. No upload was submitted.") }
             _ = try self.current(target, observed, authorized)
+            stage = "submit"
             guard AXUIElementPerformAction(upload, kAXPressAction as CFString) == .success else {
                 throw Failure(code: "FILE_CHOOSER_UPLOAD_UNCERTAIN", message: "The native Upload action did not return a confirmed result. Do not repeat it.", mutationApplied: true, doNotReplay: true)
             }
             try confirmClosed(target, observed: observed, authorized: authorized)
+            stage = "done"
         }
         func cancel(_ target: Target, observed: Observation, authorized: () -> Bool) throws {
             let current = try self.current(target, observed, authorized)
@@ -422,6 +473,7 @@ final class SafariFileChooser {
             try confirmClosed(target, observed: observed, authorized: authorized)
         }
         private func confirmClosed(_ target: Target, observed: Observation, authorized: () -> Bool) throws {
+            stage = "confirm_closed"
             let deadline = Date().addingTimeInterval(2)
             do {
                 repeat {

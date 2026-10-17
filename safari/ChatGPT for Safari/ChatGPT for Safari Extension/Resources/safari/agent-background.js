@@ -7,7 +7,7 @@
     "browser_management_call", "browser_management_get_audit_trail", "safari_download_inspect", "dom_cua_download_media",
     "browser_viewport_set", "browser_viewport_reset",
     "tab_screenshot", "tab_get_js_dialog", "tab_handle_js_dialog", "tab_clipboard_read", "tab_clipboard_read_text", "tab_clipboard_write", "tab_clipboard_write_text",
-    "safari_logs_start", "tab_dev_logs",
+    "safari_logs_start", "safari_created_tab_bind", "tab_dev_logs",
     "tab_page_assets_list", "tab_page_assets_bundle", "safari_assets_inspect",
     "cua_click", "cua_double_click", "cua_drag", "cua_move", "cua_keypress", "cua_scroll", "cua_type", "cua_download_media",
     "playwright_dom_snapshot", "playwright_locator_click", "playwright_locator_dblclick", "playwright_locator_fill",
@@ -83,6 +83,11 @@
       await session.requireOwnedTab(tabId);
       const handle = `live:${owner.profileId}:${tabId}`;
       const key = scopeKey(metadata, tabId);
+      const creationScope = { profileId: owner.profileId, ownerId: owner.instanceId, accountScope: owner.accountScope,
+        sessionId: metadata.session_id, turnId: metadata.turn_id };
+      if (command.type === "safari_created_tab_bind") {
+        root.ChatGPTSafariSessionWindows?.bindCreatedTab?.(tabId, creationScope); return {};
+      }
       const run = async (action, args) => {
         if (session.currentTurnId !== metadata.turn_id) throw new Error("The Safari agent turn ended before delivery");
         await session.requireOwnedTab(tabId);
@@ -376,12 +381,15 @@
       if (command.type.startsWith("navigate_tab_") || command.type === "close_tab") {
         const tab = await api.tabs.get(tabId);
         snapshots.delete(key);
-        let expectedUrl = tab.url;
+        let expectedUrl = tab.url, createdTab;
         if (expectedUrl == null || expectedUrl === "") {
-          if (typeof root.ChatGPTSafariLive?.navigationSourceUrl !== "function") throw new Error("Safari did not expose this tab's committed URL or native navigation-source verifier. Its source was not assumed to be blank");
-          expectedUrl = await root.ChatGPTSafariLive.navigationSourceUrl(tabId);
+          if (["navigate_tab_url", "close_tab"].includes(command.type)) createdTab = await root.ChatGPTSafariSessionWindows?.createdTabReceipt?.(tabId, creationScope);
+          if (!createdTab) {
+            if (typeof root.ChatGPTSafariLive?.navigationSourceUrl !== "function") throw new Error("Safari did not expose this tab's committed URL or native navigation-source verifier. Its source was not assumed to be blank");
+            expectedUrl = await root.ChatGPTSafariLive.navigationSourceUrl(tabId);
+          }
         }
-        const args = { expectedUrl };
+        const args = createdTab ? { createdTab, creationScope } : { expectedUrl };
         const result = command.type === "navigate_tab_url" ? await run("navigate", { ...args, url: command.url })
           : command.type === "close_tab" ? await run("close_tab", args)
           : await run("history", { ...args, direction: command.type.slice("navigate_tab_".length) });
@@ -451,6 +459,7 @@
       return {};
     }
     function release(sessionId, turnId, keepOwnerGuards = false) {
+      root.ChatGPTSafariSessionWindows?.releaseCreatedTabs?.(sessionId, turnId);
       root.ChatGPTSafariLive?.releaseFileChoosers({ sessionId, turnId });
       for (const [key, waiter] of fileChooserWaiters) {
         const [session, turn] = JSON.parse(key);

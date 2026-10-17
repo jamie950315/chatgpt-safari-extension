@@ -109,8 +109,9 @@ import Foundation
         precondition(!ProviderRelaySessionCookies.validSessionResponse(status: 200, data: Data("{}".utf8)))
         let diagnostic: [String: Any] = ["state": "installed", "usedOrigin": 1, "usedConnection": 2,
             "channelConnected": true, "readyPosted": true, "connectMessages": 1, "parentSourceMatched": true,
-            "parentTokenMatched": true, "parentOriginKind": "expected", "trustedInputCounter": 2,
+            "parentTokenMatched": true, "parentOriginKind": "expected", "trustedInputCounter": 2, "composerCandidateCount": 1,
             "composerHasText": true, "composerFocused": true, "composerEditable": true, "sendDisabled": false,
+            "composerPendingInput": true, "composerComposing": false,
             "errors": [["kind": "TypeError", "frames": ["/cdn/assets/async/637745.14f70978dc.js:12:34"]]]]
         precondition(ProviderRelayDiagnostics.validate(diagnostic) != nil)
         var unsafe = diagnostic; unsafe["message"] = "private raw error"; precondition(ProviderRelayDiagnostics.validate(unsafe) == nil)
@@ -121,10 +122,13 @@ import Foundation
         unsafe = diagnostic; unsafe["connectMessages"] = -1; precondition(ProviderRelayDiagnostics.validate(unsafe) == nil)
         unsafe = diagnostic; unsafe["trustedInputCounter"] = true; precondition(ProviderRelayDiagnostics.validate(unsafe) == nil)
         unsafe = diagnostic; unsafe["trustedInputCounter"] = -1; precondition(ProviderRelayDiagnostics.validate(unsafe) == nil)
+        unsafe = diagnostic; unsafe["composerCandidateCount"] = "private editor text"; precondition(ProviderRelayDiagnostics.validate(unsafe) == nil)
         unsafe = diagnostic; unsafe["composerHasText"] = "private draft text"; precondition(ProviderRelayDiagnostics.validate(unsafe) == nil)
         unsafe = diagnostic; unsafe["composerFocused"] = 1; precondition(ProviderRelayDiagnostics.validate(unsafe) == nil)
         unsafe = diagnostic; unsafe["composerEditable"] = "true"; precondition(ProviderRelayDiagnostics.validate(unsafe) == nil)
         unsafe = diagnostic; unsafe["sendDisabled"] = "false"; precondition(ProviderRelayDiagnostics.validate(unsafe) == nil)
+        unsafe = diagnostic; unsafe["composerPendingInput"] = "private draft"; precondition(ProviderRelayDiagnostics.validate(unsafe) == nil)
+        unsafe = diagnostic; unsafe["composerComposing"] = 1; precondition(ProviderRelayDiagnostics.validate(unsafe) == nil)
         unsafe = diagnostic; unsafe["parentOriginKind"] = "https://private.invalid/"; precondition(ProviderRelayDiagnostics.validate(unsafe) == nil)
         unsafe = diagnostic; unsafe["errors"] = [["kind": "Error", "frames": ["https://chatgpt.com/c/private-conversation"]]]; precondition(ProviderRelayDiagnostics.validate(unsafe) == nil)
         unsafe = diagnostic; unsafe["errors"] = [["kind": "Error", "frames": ["/cdn/assets/fixture-123.js?secret=private"]]]; precondition(ProviderRelayDiagnostics.validate(unsafe) == nil)

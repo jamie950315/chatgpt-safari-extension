@@ -44,7 +44,7 @@ import signal
 import subprocess
 import sys
 
-for line in subprocess.check_output(["ps", "-axo", "pid=,command="], text=True).splitlines():
+for line in subprocess.check_output(["ps", "-axo", "pid=,comm="], text=True).splitlines():
     fields = line.strip().split(None, 1)
     if len(fields) == 2 and fields[1] == sys.argv[1]:
         os.kill(int(fields[0]), signal.SIGTERM)

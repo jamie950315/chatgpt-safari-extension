@@ -3,13 +3,18 @@ const assert = require("node:assert/strict");
 const vm = require("node:vm");
 const fs = require("node:fs");
 const source = fs.readFileSync("companion/SideChatBridge.js", "utf8");
-class MockEvent { constructor(type, options = {}) { this.type = type; Object.assign(this, options); } }
+class MockEvent {
+  constructor(type, options = {}) { this.type = type; Object.assign(this, options); }
+  stopPropagation() { this.cancelBubble = true; }
+}
 class MockCustomEvent extends MockEvent {}
 function fixture(options = {}) {
   const listeners = new Map(), documentListeners = new Map(), attributes = new Map();
   const requests = [], messages = [], events = [], reports = [], intervals = new Map();
   const publishedCandidates = [];
-  const composer = { textContent: "", isConnected: true };
+  const rect = { left: 10, top: 100, right: 900, bottom: 200, width: 890, height: 100 };
+  const composer = { textContent: "", isConnected: true, isContentEditable: true, tagName: "DIV", parentElement: null,
+    getClientRects: () => [rect], contains: () => false };
   const actualOrigin = options.relay ? "http://chatgpt-provider-test.localhost:1234" : "https://chatgpt.com";
   const on = (map, type, callback) => { if (!map.has(type)) map.set(type, []); map.get(type).push(callback); };
   const off = (map, type, callback) => map.set(type, (map.get(type) || []).filter(item => item !== callback));
@@ -17,6 +22,8 @@ function fixture(options = {}) {
   const context = { instanceId: "safari-test", tabId: 10, windowId: 20, url: "https://example.com" };
   const capabilities = { "browserSideChat.tabContext.read": true, "browserTabMentions.search": true };
   const window = {
+    innerWidth: 1000, innerHeight: 800,
+    getComputedStyle: element => ({ display: "block", visibility: "visible", opacity: "1", ...element.style }),
     addEventListener: (type, callback) => on(listeners, type, callback),
     removeEventListener: (type, callback) => off(listeners, type, callback),
     dispatchEvent: event => { events.push(event.type); emit(listeners, event); },
@@ -29,6 +36,7 @@ function fixture(options = {}) {
       return { ok: true };
     } } } },
   };
+  if (options.stopInputAtWindow) window.addEventListener("input", event => event.stopPropagation(), true);
   window.top = window;
   window.parent = window;
   if (options.relay) {
@@ -48,6 +56,7 @@ function fixture(options = {}) {
   };
   const document = {
     querySelector: selector => selector === "#prompt-textarea" ? composer : null,
+    querySelectorAll: selector => selector === "textarea, [contenteditable]" ? [composer] : [],
     documentElement: {
       setAttribute: (name, value) => { attributes.set(name, value); if (name === "data-chatgpt-extension-browser-tabs") publishedCandidates.push(JSON.parse(value)); },
       removeAttribute: name => attributes.delete(name),
@@ -70,7 +79,10 @@ function fixture(options = {}) {
     ready: sandbox.__CHATGPT_SAFARI_ADAPTER_READY__,
     emitMessage: event => emit(listeners, { type: "message", isTrusted: true, ...event }),
     input: () => emit(documentListeners, new MockEvent("input", { isTrusted: true })),
-    emitInput: event => emit(documentListeners, event instanceof MockEvent ? event : new MockEvent("input", event)),
+    emitInput: value => {
+      const event = value instanceof MockEvent ? value : new MockEvent("input", value);
+      emit(listeners, event); if (!event.cancelBubble) emit(documentListeners, event);
+    },
     tickReport: () => { for (const item of intervals.values()) if (item.milliseconds === 2000) item.callback(); },
     gesture: trusted => emit(documentListeners, new MockEvent("pointerdown", { isTrusted: trusted })) };
 }
@@ -395,13 +407,13 @@ test("untrusted or regressing checkpoint data cannot authorize a provider reload
 test("provider reports reveal only composer health and trusted native input counts, never draft or event contents", async t => {
   const f = await invocationFixture({ manualIntervals: true });
   t.after(() => f.cleanup());
-  const nested = {}, unrelated = {}, send = { disabled: true, isConnected: true };
+  const nested = {}, unrelated = {}, send = { ...f.composer, disabled: true, getAttribute: () => null };
   f.composer.textContent = "Synthetic private draft never reported";
   f.composer.isContentEditable = true;
   f.composer.contains = value => value === nested;
   f.document.activeElement = nested;
-  const query = f.document.querySelector;
-  f.document.querySelector = selector => selector.startsWith("button[") ? send : query(selector);
+  const query = f.document.querySelectorAll;
+  f.document.querySelectorAll = selector => selector.startsWith("button[") ? [send] : query(selector);
   const input = (target, isTrusted) => Object.defineProperty(new MockEvent("input", { target, isTrusted }), "data", {
     get() { throw new Error("Diagnostic code must never read input contents"); },
   });
@@ -413,25 +425,77 @@ test("provider reports reveal only composer health and trusted native input coun
   f.tickReport();
   const observed = f.reports.at(-1);
   assert.equal(observed.trustedInputCounter, 1);
+  assert.equal(observed.composerCandidateCount, 1);
   assert.equal(observed.composerHasText, true);
   assert.equal(observed.composerFocused, true);
   assert.equal(observed.composerEditable, true);
+  assert.equal(observed.composerPendingInput, false);
+  assert.equal(observed.composerComposing, false);
   assert.equal(observed.sendDisabled, true);
   assert.equal(JSON.stringify(observed).includes("Synthetic private draft"), false);
   assert.equal(Object.hasOwn(observed, "draft"), false);
-  f.composer.textContent = "   "; f.composer.isContentEditable = false;
+  f.composer.textContent = "   ";
   f.document.activeElement = unrelated; send.disabled = false;
   f.tickReport();
   assert.equal(f.reports.at(-1).composerHasText, false);
   assert.equal(f.reports.at(-1).composerFocused, false);
-  assert.equal(f.reports.at(-1).composerEditable, false);
+  assert.equal(f.reports.at(-1).composerEditable, true);
   assert.equal(f.reports.at(-1).sendDisabled, false);
   f.composer.isConnected = false;
   f.emitInput({ target: f.composer, isTrusted: true }); f.tickReport();
   const disconnected = f.reports.at(-1);
-  assert.equal(disconnected.trustedInputCounter, 1);
-  for (const key of ["composerHasText", "composerFocused", "composerEditable", "sendDisabled"]) assert.equal(Object.hasOwn(disconnected, key), false);
+  assert.equal(disconnected.trustedInputCounter, 0);
+  assert.equal(disconnected.composerCandidateCount, 0);
+  for (const key of ["composerHasText", "composerFocused", "composerEditable", "composerPendingInput", "composerComposing", "sendDisabled"]) assert.equal(Object.hasOwn(disconnected, key), false);
   const count = f.reports.length;
   f.window.dispatchEvent(new MockEvent("pagehide", { isTrusted: true })); f.tickReport();
   assert.equal(f.reports.length, count, "Unloaded documents stop their diagnostic observer");
+});
+
+test("composer health requires one connected visible semantic editing host and an exact unique send marker", async t => {
+  const f = await invocationFixture({ manualIntervals: true }); t.after(() => f.cleanup());
+  const hidden = { ...f.composer, getClientRects: () => [] };
+  const offscreen = { ...f.composer, getClientRects: () => [{ left: 0, top: 900, right: 100, bottom: 1000, width: 100, height: 100 }] };
+  const readonly = { ...f.composer, tagName: "TEXTAREA", readOnly: true };
+  const nested = { ...f.composer, parentElement: f.composer };
+  const transparent = { ...f.composer, parentElement: { style: { opacity: "0" }, parentElement: null } };
+  const textarea = { ...f.composer, tagName: "TEXTAREA", isContentEditable: false, value: "Owned textarea draft" };
+  const send = { ...f.composer, disabled: true, getAttribute: () => null };
+  let candidates = [f.composer, hidden, offscreen, readonly, nested, transparent], sends = [];
+  f.document.querySelector = () => null; // Work has no normal Chat composer ID.
+  f.document.querySelectorAll = selector => selector === "textarea, [contenteditable]" ? candidates : sends;
+  f.tickReport();
+  assert.equal(f.reports.at(-1).composerCandidateCount, 1);
+  assert.equal(f.reports.at(-1).composerEditable, true);
+  assert.equal(Object.hasOwn(f.reports.at(-1), "sendDisabled"), false, "No arbitrary button stands in for Send");
+  candidates.push(textarea); f.emitInput({ target: f.composer, isTrusted: true }); f.tickReport();
+  const ambiguous = f.reports.at(-1);
+  assert.equal(ambiguous.composerCandidateCount, 2); assert.equal(ambiguous.trustedInputCounter, 0);
+  for (const key of ["composerHasText", "composerFocused", "composerEditable", "sendDisabled"]) assert.equal(Object.hasOwn(ambiguous, key), false);
+  candidates = [textarea]; sends = [send, { ...send }]; f.document.activeElement = textarea;
+  f.emitInput({ target: f.composer, isTrusted: true }); f.tickReport();
+  assert.equal(f.reports.at(-1).trustedInputCounter, 0, "The previously observed editor cannot supply input evidence for its replacement");
+  assert.equal(f.reports.at(-1).composerHasText, true); assert.equal(f.reports.at(-1).composerFocused, true);
+  assert.equal(Object.hasOwn(f.reports.at(-1), "sendDisabled"), false, "Duplicate actual Send markers remain ambiguous");
+  sends = [send]; f.emitInput({ target: textarea, isTrusted: true }); f.tickReport();
+  assert.equal(f.reports.at(-1).trustedInputCounter, 1); assert.equal(f.reports.at(-1).sendDisabled, true);
+  assert.equal(JSON.stringify(f.reports.at(-1)).includes("Owned textarea draft"), false);
+});
+
+test("window-capture diagnostics observe real pending input without changing its propagation or composition lifecycle", async t => {
+  const f = await invocationFixture({ manualIntervals: true, stopInputAtWindow: true }); t.after(() => f.cleanup());
+  f.composer.tagName = "TEXTAREA"; f.composer.isContentEditable = false;
+  f.composer.dataset = { pendingInputInitialized: "true", composition: "active" };
+  let reachedDocument = 0; f.document.addEventListener("input", () => reachedDocument++);
+  const event = new MockEvent("input", { target: f.composer, isTrusted: true, defaultPrevented: false });
+  Object.defineProperty(event, "data", { get() { throw new Error("Input contents cannot be inspected"); } });
+  f.emitInput(event); f.tickReport();
+  assert.equal(f.reports.at(-1).trustedInputCounter, 1, "Original pending-input window stopPropagation must not hide trusted input evidence");
+  assert.equal(reachedDocument, 0); assert.equal(event.defaultPrevented, false);
+  assert.equal(f.reports.at(-1).composerPendingInput, true); assert.equal(f.reports.at(-1).composerComposing, true);
+  f.composer.dataset.composition = "ending"; f.tickReport();
+  assert.equal(f.reports.at(-1).composerComposing, true);
+  delete f.composer.dataset.composition; f.tickReport();
+  assert.equal(f.reports.at(-1).composerComposing, false);
+  assert.equal(f.composer.dataset.pendingInputInitialized, "true", "Observation never releases or alters the original hydration gate");
 });

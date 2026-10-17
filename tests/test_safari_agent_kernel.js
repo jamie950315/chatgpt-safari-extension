@@ -64,6 +64,50 @@ test("new-tab URL omissions retain original create/claim and use actual native b
     }
   } finally { globalThis.ChatGPTSafariLive = previous; }
 });
+test("actual native create provenance completes new/claim/goto and blank close when Safari reports no URL or blank frame", async () => {
+  const { createAgent } = require("../safari/ChatGPT for Safari/ChatGPT for Safari Extension/Resources/safari/agent-background.js");
+  const { createLive } = require("../safari/ChatGPT for Safari/ChatGPT for Safari Extension/Resources/safari/live-background.js");
+  const { createSessionWindows } = require("../safari/ChatGPT for Safari/ChatGPT for Safari Extension/Resources/safari/session-windows.js");
+  const previous = { live: globalThis.ChatGPTSafariLive, manager: globalThis.ChatGPTSafariSessionWindows };
+  try {
+    const profileId = "55555555-5555-4555-8555-555555555555", tabs = new Map(), leased = new Set(), changes = [], removed = [];
+    let nextId = 12, frameReads = 0;
+    const api = { runtime: { onMessage: { addListener() {} }, async sendNativeMessage() { return { ok: true, requests: [] }; } },
+      storage: { local: { async get() { return { safariLiveProfileId: profileId }; } }, session: { async get() { return {}; }, async set() {} } },
+      browserAction: { async setTitle() {} },
+      tabs: { onRemoved: { addListener() {} }, async get(id) { return { ...tabs.get(id) }; },
+        async create(value) { assert.equal(value.url, "about:blank"); const tab = { id: nextId++, windowId: value.windowId, url: "", title: "", status: "complete" }; tabs.set(tab.id, tab); return { ...tab }; },
+        async update(id, value) { changes.push([id, value]); Object.assign(tabs.get(id), value); return { ...tabs.get(id) }; },
+        async remove(id) { removed.push(id); tabs.delete(id); } },
+      webNavigation: { async getAllFrames() { frameReads++; return []; } },
+      scripting: { async executeScript() { return [{ result: { ok: true, result: { token: "logs" } } }]; } } };
+    const owner = { instanceId: "owner", profileId, accountScope: "account" }, metadata = { session_id: "session", turn_id: "turn" };
+    const session = { currentTurnId: "turn", async requireOwnedTab(id) { assert.equal(leased.has(id), true, "the original claim gate must stay active"); } };
+    const manager = createSessionWindows(api), live = createLive(api, { crypto: require("node:crypto"), ChatGPTSafariSessionWindows: manager,
+      setInterval() {}, clearInterval() {}, setTimeout });
+    globalThis.ChatGPTSafariSessionWindows = manager; globalThis.ChatGPTSafariLive = live; await live.start();
+    const agent = createAgent(api, { async agentOwner() { return owner; }, async runAgentCommand(command) {
+      return live.execute({ id: "owned-command", agentOwner: owner.instanceId, deadline: Date.now() + 10000, command });
+    } });
+    const context = { clientInfo: { family: "safari" }, api: { async executeUnhandledCommand(request) {
+      return request.type === "browser_safari_context" ? agent.authorize(session, metadata) : agent.execute(request.command, session, metadata);
+    } } };
+    async function create() {
+      return dispatch(context, { type: "create_tab", browser_id: "0" }, async () => {
+        const tab = await manager.createTab("session", 8, "turn"); leased.add(tab.id); return { id: String(tab.id) };
+      });
+    }
+    const fresh = await create();
+    await dispatch(context, { type: "browser_user_claim_tab", browser_id: "0", tab_id: fresh.id }, async () => ({ id: fresh.id }));
+    await agent.execute({ type: "navigate_tab_url", browser_id: "0", tab_id: fresh.id, url: "https://example.test/new" }, session, metadata);
+    assert.deepEqual(changes, [[12, { url: "https://example.test/new" }]]); assert.equal(frameReads, 0);
+    const blank = await create(); await agent.execute({ type: "close_tab", browser_id: "0", tab_id: blank.id }, session, metadata);
+    assert.deepEqual(removed, [13]); assert.equal(frameReads, 0);
+    const ended = await create(); await agent.release("session", "turn");
+    await assert.rejects(agent.execute({ type: "close_tab", browser_id: "0", tab_id: ended.id }, session, metadata), /native top frame did not prove/);
+    assert.deepEqual(removed, [13], "an ended turn cannot replay creation authority against an unknown tab");
+  } finally { globalThis.ChatGPTSafariLive = previous.live; globalThis.ChatGPTSafariSessionWindows = previous.manager; }
+});
 test("non-Safari clients retain their existing executor", async () => {
   assert.equal(await dispatch({ clientInfo: { family: "chrome" } }, { type: "tab_cdp_call" }, async () => "original Chrome result"), "original Chrome result");
 });
@@ -174,6 +218,81 @@ test("the original worker accepts only its dedicated capability-bound local sand
       set(invalid); assert.throws(sandboxURL, /Invalid isolated/);
     }
   } finally { globalThis.location = previous; }
+});
+function kernelLifecycleFixture() {
+  const source = fs.readFileSync("safari/ChatGPT for Safari/ChatGPT for Safari Extension/Resources/safari/agent-kernel-bridge.js", "utf8");
+  const origin = "safari-web-extension://actual-extension";
+  const fixture = { frames: [], checks: 0, autoReply: true,
+    url: "http://chatgpt-kernel-55555555-5555-4555-8555-555555555555.localhost:1234/sandbox?cap=" + "a".repeat(64) };
+  const window = { addEventListener(type, callback) { this.listener = callback; } }; window.parent = window;
+  const document = { body: { append(frame) { fixture.frames.push(frame); queueMicrotask(() => frame.events.get("load")()); } },
+    createElement() {
+      const frame = { events: new Map(), children: [], messages: [], setAttribute() {},
+        addEventListener(type, callback) { this.events.set(type, callback); },
+        removeEventListener(type) { this.events.delete(type); }, remove() { this.removed = true; } };
+      frame.contentDocument = { querySelectorAll: () => frame.children };
+      frame.contentWindow = { postMessage(request, _origin, ports) {
+        frame.messages.push(request);
+        if (fixture.autoReply) ports[0].postMessage({ id: request.id, ok: true });
+      } };
+      return frame;
+    } };
+  const environment = { window, document, MessageChannel, URL, setTimeout, clearTimeout, module: { exports: {} },
+    chrome: { runtime: { getURL: path => origin + "/" + path } },
+    ChatGPTSafariSidebarOptions: { companion: { async agentKernelURL() {
+      fixture.checks++; if (fixture.error) throw fixture.error; return fixture.url;
+    } } } };
+  vm.runInNewContext(source, environment);
+  return Object.assign(fixture, { bridge: environment.module.exports, window, origin });
+}
+test("current native kernel capability replaces the cached offscreen only after a real service change", async () => {
+  const f = kernelLifecycleFixture();
+  await f.bridge.ensureHostDocument();
+  await Promise.all([f.bridge.ensureHostDocument(), f.bridge.ensureHostDocument()]);
+  assert.equal(f.frames.length, 1, "same-service provider remounts retain the original kernel and scopes");
+  assert.ok(f.checks > 1, "a persistent background must observe the current native service");
+  f.url = f.url.replace(":1234/", ":5678/").replace("cap=" + "a".repeat(64), "cap=" + "b".repeat(64));
+  await Promise.all([f.bridge.ensureHostDocument(), f.bridge.ensureHostDocument()]);
+  assert.equal(f.frames.length, 2, "one changed native capability creates exactly one replacement");
+  assert.equal(f.frames[0].removed, true);
+  assert.equal(new URL(f.frames[1].src).searchParams.get("kernel"), f.url);
+  assert.equal((await f.bridge.sendRequest({ type: "js-kernel:execute", id: "fresh", scopeId: "original" })).ok, true);
+  assert.equal(f.frames[0].messages.length, 0); assert.equal(f.frames[1].messages.length, 1);
+});
+test("native kernel replacement closes old browser RPC and rejects a delivered execution without replay", async () => {
+  const f = kernelLifecycleFixture();
+  await f.bridge.ensureHostDocument();
+  let accepted;
+  f.bridge.onBrowserConnection((_scope, transport) => { accepted = transport; });
+  const source = {}, channel = new MessageChannel();
+  f.frames[0].children.push({ src: f.origin + "/js-kernel-host.html?scopeId=original", contentWindow: source });
+  f.window.listener({ isTrusted: true, source, origin: f.origin, ports: [channel.port2],
+    data: { type: "chatgpt-safari:kernel-browser", scopeId: "original" } });
+  const closed = new Promise(resolve => { channel.port1.onmessage = event => { if (event.data?.type === "close") resolve(); }; });
+  f.autoReply = false;
+  const active = f.bridge.sendRequest({ type: "js-kernel:execute", id: "delivered", scopeId: "original" });
+  const rejected = assert.rejects(active, /changed.*not retried/);
+  await new Promise(setImmediate);
+  assert.equal(f.frames[0].messages.length, 1);
+  await f.bridge.ensureHostDocument();
+  assert.doesNotThrow(() => accepted.sendMessage({ original: "same-service active RPC" }));
+  assert.equal(f.frames[0].removed, undefined, "unchanged app sessions must not interrupt delivered work");
+  f.url = f.url.replace("cap=" + "a".repeat(64), "cap=" + "b".repeat(64));
+  await f.bridge.ensureHostDocument(); await rejected; await closed;
+  assert.throws(() => accepted.sendMessage({}), /closed/);
+  f.autoReply = true;
+  await f.bridge.sendRequest({ type: "js-kernel:execute", id: "next", scopeId: "original" });
+  assert.deepEqual(f.frames[1].messages.map(item => item.id), ["next"]);
+  assert.equal(f.bridge.status().failures, 1);
+  channel.port1.close();
+});
+test("a missing or invalid current native kernel capability never dispatches through a cached host", async () => {
+  const f = kernelLifecycleFixture(); await f.bridge.ensureHostDocument();
+  f.error = new Error("The native sidebar owner has changed");
+  await assert.rejects(f.bridge.sendRequest({ id: "wrong-owner" }), /owner has changed/);
+  f.error = undefined; f.url = "http://127.0.0.1:1234/command";
+  await assert.rejects(f.bridge.sendRequest({ id: "invalid-capability" }), /Invalid isolated/);
+  assert.equal(f.frames.length, 1); assert.equal(f.frames[0].messages.length, 0);
 });
 test("same-document kernel browser RPC uses a real exact-host MessageChannel and propagates close", async () => {
   const source = fs.readFileSync("safari/ChatGPT for Safari/ChatGPT for Safari Extension/Resources/safari/agent-kernel-bridge.js", "utf8");

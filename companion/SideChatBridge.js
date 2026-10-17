@@ -130,29 +130,54 @@ globalThis.__CHATGPT_SAFARI_ADAPTER_READY__ = (async () => {
   }
   if (relayMode) {
     let trustedInputCounter = 0;
+    let observedComposer;
+    const visibleSurface = element => {
+      if (!element?.isConnected) return false;
+      for (let current = element; current; current = current.parentElement) {
+        const style = window.getComputedStyle(current);
+        if (style.display === "none" || ["hidden", "collapse"].includes(style.visibility) || Number(style.opacity) === 0) return false;
+      }
+      return Array.from(element.getClientRects()).some(rect => rect.width > 0 && rect.height > 0
+        && rect.right > 0 && rect.bottom > 0 && rect.left < window.innerWidth && rect.top < window.innerHeight);
+    };
+    const observeComposer = () => {
+      // Original Work uses a native contenteditable editing host, not the
+      // normal Chat composer's ID. Never choose among multiple visible editors.
+      const candidates = Array.from(document.querySelectorAll("textarea, [contenteditable]")).filter(element =>
+        (element.tagName === "TEXTAREA" ? !element.disabled && !element.readOnly
+          : element.isContentEditable === true && element.parentElement?.isContentEditable !== true)
+        && visibleSurface(element));
+      const composer = candidates.length === 1 ? candidates[0] : undefined;
+      if (observedComposer !== composer) { observedComposer = composer; trustedInputCounter = 0; }
+      return { composer, composerCandidateCount: candidates.length };
+    };
     const observeComposerInput = event => {
       if (!event.isTrusted) return;
-      const composer = document.querySelector("#prompt-textarea");
-      if (composer && composer.isConnected !== false
-        && (event.target === composer || composer.contains?.(event.target))) {
+      const { composer } = observeComposer();
+      if (composer && (event.target === composer || composer.contains(event.target))) {
         trustedInputCounter = Math.min(1_000_000_000, trustedInputCounter + 1);
       }
     };
-    document.addEventListener("input", observeComposerInput, true);
+    // The original pending textarea stops propagation at window capture. A
+    // passive observer on that same target still sees its real input events.
+    window.addEventListener("input", observeComposerInput, { capture: true, passive: true });
     const composerHealth = () => {
-      const composer = document.querySelector("#prompt-textarea");
-      if (!composer || composer.isConnected === false) return {};
+      const { composer, composerCandidateCount } = observeComposer();
+      if (!composer) return { composerCandidateCount };
       const text = typeof composer.value === "string" ? composer.value : composer.innerText ?? composer.textContent;
       const active = document.activeElement;
-      const send = document.querySelector('button[data-testid="send-button"], button#composer-submit-button:not([data-testid="stop-button"])');
+      const sends = Array.from(document.querySelectorAll('button[data-testid="send-button"]')).filter(visibleSurface);
       // Only presence/focus/editability and native input counts leave this
       // document. Never report draft text, selection, event data or key values.
       return {
+        composerCandidateCount,
         composerHasText: typeof text === "string" && text.trim().length > 0,
         composerFocused: active === composer || !!(active && composer.contains?.(active)),
         composerEditable: composer.isContentEditable === true
           || ["INPUT", "TEXTAREA"].includes(composer.tagName) && !composer.disabled && !composer.readOnly,
-        ...(send && send.isConnected !== false ? { sendDisabled: send.disabled === true || send.getAttribute?.("aria-disabled") === "true" } : {}),
+        composerPendingInput: composer.tagName === "TEXTAREA" && composer.dataset?.pendingInputInitialized === "true",
+        composerComposing: ["active", "ending"].includes(composer.dataset?.composition),
+        ...(sends.length === 1 ? { sendDisabled: sends[0].disabled === true || sends[0].getAttribute("aria-disabled") === "true" } : {}),
       };
     };
     const originalError = console.error;
@@ -160,17 +185,18 @@ globalThis.__CHATGPT_SAFARI_ADAPTER_READY__ = (async () => {
     window.addEventListener("error", event => captureError(event.error));
     window.addEventListener("unhandledrejection", event => captureError(event.reason));
     const report = setInterval(() => {
+      const health = composerHealth();
       void relay.report({ state: siteAdapter.state,
         usedOrigin: siteAdapter.usedFactories.aH || 0, usedConnection: siteAdapter.usedFactories.Kxt || 0,
         connections: siteAdapter.connections, contexts: diagnostics.outbound.context || 0,
         streamCalls: siteAdapter.streamCalls,
         failures: diagnostics.failures, scriptErrors: diagnostics.scriptErrors,
         unhandledRejections: diagnostics.unhandledRejections, channelConnected: relayPort != null,
-        trustedInputCounter, ...composerHealth(), ...handshake,
+        trustedInputCounter, ...health, ...handshake,
         errors: caughtErrors.map(error => ({ kind: error.kind, frames: error.frames.slice(0, 4), ...(error.reason ? { reason: error.reason } : {}) })) }).catch(() => {});
     }, 2000);
     window.addEventListener("pagehide", () => {
-      clearInterval(report); document.removeEventListener("input", observeComposerInput, true);
+      clearInterval(report); window.removeEventListener("input", observeComposerInput, true);
     }, { once: true });
   }
   function validRecord(value) { return value != null && typeof value === "object" && !Array.isArray(value); }

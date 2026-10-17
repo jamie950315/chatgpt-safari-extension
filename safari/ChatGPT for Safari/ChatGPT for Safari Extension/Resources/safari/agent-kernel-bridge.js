@@ -25,7 +25,7 @@
     "browser_user_open_tabs", "browser_user_claim_tab", "browser_user_get_tab_context", "browser_user_history",
     "get_tab", "list_tabs", "create_tab", "selected_tab", "mark_tab", "name_session",
   ]);
-  let hostDocument;
+  let hostDocument, hostPreparation;
   const status = { phase: "idle", requests: 0, replies: 0, failures: 0, connections: 0 };
   let browserConnection;
   const record = value => value !== null && typeof value === "object" && !Array.isArray(value);
@@ -38,6 +38,9 @@
       // these reads and leases to the same real sidebar owner as native input.
       await context.api.executeUnhandledCommand({ type: "browser_safari_context" });
       const result = await original();
+      if (command.type === "create_tab" && typeof result?.id === "string") {
+        await context.api.executeUnhandledCommand({ type: "browser_safari_command", command: { type: "safari_created_tab_bind", browser_id: command.browser_id, tab_id: result.id } });
+      }
       if (["browser_user_claim_tab", "create_tab"].includes(command.type) && typeof result?.id === "string") {
         await context.api.executeUnhandledCommand({ type: "browser_safari_command", command: { type: "safari_logs_start", browser_id: command.browser_id, tab_id: result.id } });
       }
@@ -89,29 +92,31 @@
   }
 
   function ensureHostDocument(api = root.chrome, document = root.document) {
-    if (hostDocument) return hostDocument.ready;
+    if (hostPreparation) return hostPreparation;
     if (!document?.body || root.window?.parent !== root.window) {
       return Promise.reject(new Error("Safari requires its persistent background document to start the agent kernel."));
     }
-    const frame = document.createElement("iframe");
-    frame.hidden = true;
-    frame.setAttribute("aria-hidden", "true");
-    const state = { frame };
-    state.ready = (async () => {
+    hostPreparation = (async () => {
+      // Safari's persistent background can outlive its containing app. Check
+      // the owner-bound native resource, not an iframe's old successful load.
+      const url = validateSandboxURL(await root.ChatGPTSafariSidebarOptions.companion.agentKernelURL());
+      if (hostDocument?.url === url) return hostDocument.ready;
+      if (hostDocument) retireHostDocument(hostDocument,
+        new Error("The native Safari kernel service changed. The delivered execution was not retried; read the current page before continuing."));
+      const frame = document.createElement("iframe");
+      frame.hidden = true;
+      frame.setAttribute("aria-hidden", "true");
+      const state = { frame, url, requests: new Set(), connections: new Set() };
+      hostDocument = state;
       status.phase = "preparing";
-      const url = await root.ChatGPTSafariSidebarOptions.companion.agentKernelURL();
-      validateSandboxURL(url);
-      return new Promise((resolve, reject) => {
+      state.ready = new Promise((resolve, reject) => {
         let timer;
         const finish = error => {
           root.clearTimeout(timer);
           frame.removeEventListener("load", loaded);
           frame.removeEventListener("error", failed);
-          if (error) {
-            frame.remove();
-            if (hostDocument === state) hostDocument = undefined;
-            reject(error);
-          } else resolve();
+          if (error) reject(error);
+          else resolve();
         };
         const loaded = () => { status.phase = "host_loaded"; finish(); };
         const failed = () => finish(new Error("The Safari agent host document could not load."));
@@ -120,10 +125,20 @@
         timer = root.setTimeout(() => finish(new Error("The Safari agent host document did not load within 10 seconds.")), 10000);
         frame.src = api.runtime.getURL("js-kernel-offscreen.html") + "?kernel=" + encodeURIComponent(url);
         document.body.append(frame);
-      });
-    })().catch(error => { status.phase = "failed"; status.failures++; frame.remove(); if (hostDocument === state) hostDocument = undefined; throw error; });
-    hostDocument = state;
-    return state.ready;
+      }).catch(error => { retireHostDocument(state, error); throw error; });
+      return state.ready;
+    })().catch(error => { status.phase = "failed"; status.failures++; throw error; })
+      .finally(() => { hostPreparation = undefined; });
+    return hostPreparation;
+  }
+
+  function retireHostDocument(state, error) {
+    if (hostDocument === state) hostDocument = undefined;
+    // Removing a frame alone silently strands its MessagePorts and callers.
+    // Settle the old delivered work, never forward it to the new service.
+    for (const reject of state.requests) reject(error);
+    for (const transport of state.connections) transport.close();
+    state.frame.remove();
   }
 
   function validateSandboxURL(value) {
@@ -188,23 +203,30 @@
         if (url.protocol !== expected.protocol || url.host.toLowerCase() !== expected.host.toLowerCase()
           || url.pathname !== expected.pathname || !event.data.scopeId || url.searchParams.get("scopeId") !== event.data.scopeId) throw new Error();
       } catch { port.postMessage({ type: "close" }); port.close(); return; }
+      const state = hostDocument, transport = portTransport(port);
+      state.connections.add(transport);
+      transport.addCloseListener(() => state.connections.delete(transport));
       status.connections++;
-      listener(event.data.scopeId, portTransport(port));
+      listener(event.data.scopeId, transport);
     });
   }
 
   async function sendRequest(request) {
     status.requests++;
     await ensureHostDocument();
-    const target = hostDocument.frame.contentWindow;
+    const state = hostDocument, target = state.frame.contentWindow;
     if (!target) throw new Error("The Safari agent host document is unavailable.");
     // Safari treats an iframe in its persistent background as the same message
     // context: runtime.sendMessage does not deliver to this replacement for
     // Chrome's offscreen document. Use the original protocol over a real port.
     const channel = new root.MessageChannel();
     return new Promise((resolve, reject) => {
-      const close = () => { channel.port1.close(); channel.port2.close(); };
+      let closed = false;
+      const close = () => { closed = true; state.requests.delete(failed); channel.port1.close(); channel.port2.close(); };
+      const failed = error => { if (closed) return; status.phase = "failed"; status.failures++; close(); reject(error); };
+      state.requests.add(failed);
       channel.port1.onmessage = event => {
+        if (closed) return;
         if (event.data?.type === "chatgpt-safari:kernel-progress" && event.data.phase === "received") {
           status.phase = "executing"; return;
         }
@@ -212,9 +234,9 @@
         if (event.data?.ok !== true) status.failures++;
         close(); resolve(event.data);
       };
-      channel.port1.onmessageerror = () => { status.phase = "failed"; status.failures++; close(); reject(new Error("The Safari agent host returned unreadable data.")); };
+      channel.port1.onmessageerror = () => failed(new Error("The Safari agent host returned unreadable data."));
       try { status.phase = "sent"; target.postMessage(request, "*", [channel.port2]); }
-      catch (error) { close(); reject(error); }
+      catch (error) { failed(error); }
     });
   }
 

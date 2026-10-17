@@ -122,6 +122,38 @@ test("native bookmark failures restore before reporting and never replay deliver
   assert.equal(f.calls.filter(call => call.command.command.action === "bookmarks").length, 1);
 });
 
+test("the actual bookmark caller keeps bounded native wait evidence in the original kernel message without private data", async () => {
+  const f = bookmarkFixture();
+  f.response({ ok: false, error: { code: "BOOKMARK_OPERATION_UNCONFIRMED", message: "Native field wait unconfirmed", data: {
+    stage: "url_focus", guardStage: "none", waitMS: 2048, queueWaitMS: 3, elapsedMS: 6721, expansionMS: 1800, inventoryMS: 1420,
+    focusedElementMatches: false, fieldFocused: true, valueMatches: false, mutationApplied: false, doNotReplay: false,
+    title: "Private title must not cross the message boundary", url: "https://private.test/secret", inventory: ["Private folder"],
+  } } });
+  await assert.rejects(f.data.bookmarks("update", ["bookmark-one", { url: "https://example.test/changed" }]), error => {
+    assert.match(error.message, /Native bookmark result: /);
+    const safe = JSON.parse(error.message.match(/Native bookmark result: (\{[^}]+\})\./)[1]);
+    assert.deepEqual(safe, { code: "BOOKMARK_OPERATION_UNCONFIRMED", stage: "url_focus", guardStage: "none",
+      waitMS: 2048, queueWaitMS: 3, elapsedMS: 6721, expansionMS: 1800, inventoryMS: 1420,
+      focusedElementMatches: false, fieldFocused: true, valueMatches: false, mutationApplied: false, doNotReplay: false });
+    assert.equal(/Private|private\.test/.test(error.message), false);
+    assert.equal(error.doNotReplay, true, "A delivered mutation request is never replayed even if the field value was not yet changed");
+    return true;
+  });
+  assert.equal(f.calls.filter(call => call.command.command.action === "bookmarks").length, 1);
+  assert.deepEqual(f.events.slice(-2), ["restore", "remove"]);
+
+  const invalid = bookmarkFixture();
+  invalid.response({ ok: false, error: { code: "PRIVATE_CODE", message: "Native wait unconfirmed", data: {
+    stage: "Private folder", guardStage: "Private URL", waitMS: "Private value", queueWaitMS: -1, elapsedMS: 1_000_000_001,
+    expansionMS: NaN, inventoryMS: 1.25, focusedElementMatches: "Private text", fieldFocused: 1,
+  } } });
+  await assert.rejects(invalid.data.bookmarks("update", ["bookmark-one", { title: "Changed" }]), error => {
+    assert.equal(error.message.includes("Native bookmark result:"), false);
+    assert.equal(error.message.includes("Private"), false);
+    return true;
+  });
+});
+
 test("manual focus change leaves the utility window and never forces owner restoration", async () => {
   const f = bookmarkFixture();
   f.duringSelect(() => f.manualFocus());

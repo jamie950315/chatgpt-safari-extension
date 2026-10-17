@@ -32,6 +32,19 @@ import ApplicationServices
         }
         precondition(!SafariFileChooser.modalFocusMatches(sourceIsFocused: false, focusedRole: kAXWindowRole, focusedIdentifier: "open-panel", attachedToSource: true))
         precondition(!SafariFileChooser.modalFocusMatches(sourceIsFocused: false, focusedRole: kAXSheetRole, focusedIdentifier: "unrelated-dialog", attachedToSource: true))
+        let leafRoles = ["AXWebArea", "AXOutline", "AXTable", "AXList", "AXRow", "AXCell", "AXCollection"]
+        var visits = 0, contentReads = 0
+        let chrome = try SafariFileChooser.modalChromeTraversal(0, role: { $0 == 0 ? "AXWindow" : leafRoles[$0 - 1] },
+            children: { node in
+                if node == 0 { return Array(1...leafRoles.count) }
+                contentReads += 1; return Array(1000...4000)
+            }, sheets: { $0 == 0 ? [2, 0] : [] }, same: ==, visit: { _ in visits += 1 })
+        precondition(chrome == Array(0...leafRoles.count) && contentReads == 0 && visits == leafRoles.count + 1,
+                     "A complete native chrome proof must not scan 3000 file rows or web content, and must deduplicate sheet/cycle edges")
+        do {
+            _ = try SafariFileChooser.modalChromeTraversal(0, role: { _ in "AXGroup" }, children: { $0 == 0 ? Array(1...513) : [] }, sheets: { _ in [] }, same: ==)
+            preconditionFailure("An incomplete bounded chrome inventory was accepted")
+        } catch let failure as SafariFileChooser.Failure { precondition(failure.code == "NATIVE_MODAL_CHROME_UNVERIFIABLE") }
         let root = FileManager.default.temporaryDirectory.appendingPathComponent("safari-filechooser-test-" + UUID().uuidString)
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: false)
         defer { try? FileManager.default.removeItem(at: root) }

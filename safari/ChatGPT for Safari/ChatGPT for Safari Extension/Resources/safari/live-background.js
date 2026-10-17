@@ -529,11 +529,17 @@
       // persist an alias, or permit blank DOM reads or arbitrary internal URLs.
       return "about:blank";
     }
-    async function target(handle, expectedUrl, allowBlank = false) {
+    async function target(handle, expectedUrl, allowBlank = false, createdSource) {
       const parts = String(handle).split(":");
       if (parts.length !== 3 || parts[0] !== "live" || parts[1] !== profileId || !/^\d+$/.test(parts[2])) throw fail("INVALID_HANDLE", "Use a handle from this profile's live_list_tabs result.");
       let tab = await api.tabs.get(Number(parts[2]));
       if (tab.incognito) throw fail("PRIVATE_TAB", "Private Safari tabs are not controlled by this backend.");
+      if (createdSource) {
+        if (environment.ChatGPTSafariSessionWindows?.validateCreatedTabReceipt?.(createdSource.receipt, createdSource.scope, tab) !== true) {
+          throw fail("STALE_CREATED_TAB", "This exact newly created tab no longer has its creating sidebar, account, profile, session and turn receipt. No navigation or close was delivered.");
+        }
+        return tab;
+      }
       if (tab.url == null || tab.url === "") {
         if (!allowBlank || expectedUrl !== "about:blank") throw fail("TAB_URL_UNAVAILABLE", "Safari has not exposed this tab's committed URL. Its website document was not read or acted on.");
         tab = { ...tab, url: await navigationSourceUrl(tab.id) };
@@ -718,7 +724,15 @@
         const created = await api.tabs.create({ url: url(args.url), active: true, ...(args.windowId === undefined ? {} : { windowId: args.windowId }) });
         return describe(await ready(created.id));
       }
-      const tab = await target(args.handle, ["navigate", "history", "select_tab", "close_tab"].includes(action) ? args.expectedUrl : undefined, ["navigate", "close_tab"].includes(action));
+      let createdSource;
+      if (args.createdTab !== undefined || args.creationScope !== undefined) {
+        if (!["navigate", "close_tab"].includes(action) || !request.agentOwner || args.creationScope?.ownerId !== request.agentOwner || args.creationScope?.profileId !== profileId
+          || typeof environment.ChatGPTSafariSessionWindows?.validateCreatedTabReceipt !== "function") {
+          throw fail("INVALID_CREATED_TAB", "Native creation provenance is only available to the creating original sidebar's same-turn navigation or close.");
+        }
+        createdSource = { receipt: args.createdTab, scope: args.creationScope };
+      }
+      const tab = await target(args.handle, ["navigate", "history", "select_tab", "close_tab"].includes(action) ? args.expectedUrl : undefined, ["navigate", "close_tab"].includes(action), createdSource);
       if (action === "viewport") return environment.ChatGPTSafariViewport.run({ ...request, sessionId }, selection);
       if (action === "read_page") return read(tab, args.maxLength);
       if (action === "dom_query") {
@@ -830,8 +844,14 @@
         return selection && ["createGroup", "moveToGroup", "moveToUngrouped"].includes(args.operation)
           ? selection.runNativeGroupMove(args.operation, organize) : organize();
       }
-      if (["navigate", "history", "select_tab", "close_tab"].includes(action) && typeof args.expectedUrl !== "string") throw fail("INVALID_ARGUMENT", "expectedUrl is required for this action.");
-      if (action === "navigate") { await api.tabs.update(tab.id, { url: url(args.url) }); return describe(await ready(tab.id)); }
+      if (["navigate", "history", "select_tab", "close_tab"].includes(action) && typeof args.expectedUrl !== "string" && !createdSource) throw fail("INVALID_ARGUMENT", "expectedUrl is required for this action.");
+      const consumeCreation = () => {
+        assertTime();
+        if (createdSource && !environment.ChatGPTSafariSessionWindows.validateCreatedTabReceipt(createdSource.receipt, createdSource.scope, tab, true)) {
+          throw fail("STALE_CREATED_TAB", "The native creation receipt ended before delivery. No navigation or close was repeated.");
+        }
+      };
+      if (action === "navigate") { const destination = url(args.url); consumeCreation(); await api.tabs.update(tab.id, { url: destination }); return describe(await ready(tab.id)); }
       if (action === "history") {
         const method = { back: "goBack", forward: "goForward", reload: "reload" }[args.direction];
         if (!method || typeof api.tabs[method] !== "function") throw fail("UNSUPPORTED_NAVIGATION", "This native Safari navigation method is unavailable.");
@@ -839,7 +859,7 @@
         return describe(await ready(tab.id));
       }
       if (action === "select_tab") { await focus(tab, selection); return describe(await target(args.handle, tab.url)); }
-      if (action === "close_tab") { await api.tabs.remove(tab.id); return { closed: true, handle: args.handle }; }
+      if (action === "close_tab") { consumeCreation(); await api.tabs.remove(tab.id); return { closed: true, handle: args.handle }; }
       if (action !== "interact") throw fail("UNKNOWN_ACTION", "Unknown live Safari action.");
       if (typeof args.documentId !== "string" || typeof args.snapshotId !== "string" ||
           !Array.isArray(args.interactions) || args.interactions.length < 1 || args.interactions.length > 20) throw fail("INVALID_ARGUMENT", "A fresh page snapshot and 1–20 interactions are required.");

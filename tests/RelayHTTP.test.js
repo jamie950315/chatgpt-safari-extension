@@ -119,7 +119,8 @@ test("provider relay uses real bounded HTTP, isolated capabilities, module gates
   const diagnostic = { state: "installed", usedOrigin: 2, usedConnection: 1, connections: 1, contexts: 1, failures: 0,
     scriptErrors: 1, unhandledRejections: 0, channelConnected: true, readyPosted: true,
     connectMessages: 1, parentSourceMatched: true, parentTokenMatched: true, parentOriginKind: "expected",
-    trustedInputCounter: 2, composerHasText: true, composerFocused: true, composerEditable: true, sendDisabled: true,
+    trustedInputCounter: 2, composerCandidateCount: 1, composerHasText: true, composerFocused: true, composerEditable: true, sendDisabled: true,
+    composerPendingInput: true, composerComposing: false,
     errors: [{ kind: "TypeError", frames: ["/cdn/assets/async/637745.14f70978dc.js:12:34"] }] };
   const diagnosticPost = value => {
     const body = Buffer.from(JSON.stringify(value));

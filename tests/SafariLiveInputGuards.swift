@@ -45,6 +45,39 @@ struct SafariLiveInputGuards {
         rejects("DIALOG_RESPONSE_UNVERIFIABLE") { _ = try responseButton(type: "prompt", count: 1) }
         rejects("DIALOG_RESPONSE_UNAVAILABLE") { _ = try responseButton(enabled: [0]) }
         rejects("DIALOG_RESPONSE_UNAVAILABLE") { _ = try responseButton(pressable: [0]) }
+        let nativePromptLabels = SafariLiveInput.nativeDialogLabels("prompt")
+        precondition(nativePromptLabels.contains(.init(primary: "好", cancel: "取消")), "Read the installed Safari framework's exact Traditional Chinese prompt pair")
+        let localPairs = [SafariLiveInput.DialogButtonLabels(primary: "好", cancel: "取消"), .init(primary: "OK", cancel: "Cancel")]
+        let nativePair = try SafariLiveInput.localizedDialogButtonIdentity(titles: ["取消", "好"], type: "prompt", labels: localPairs)
+        let reversedPair = try SafariLiveInput.localizedDialogButtonIdentity(titles: ["好", "取消"], type: "prompt", labels: localPairs)
+        precondition(nativePair.primary == 1 && nativePair.cancel == 0 && reversedPair.primary == 0 && reversedPair.cancel == 1)
+        let nativeButton = try SafariLiveInput.dialogResponseButtonIndex(operation: "accept", type: "prompt", buttonCount: 2,
+            defaultIndices: [], cancelIndices: [], enabled: [0, 1], pressable: [0, 1], localized: nativePair)
+        precondition(nativeButton == 1, "A complete OS-localized pair supplies positive response identity without AXDefaultButton")
+        for titles in [["Cancel", "好"], ["取消", "Unknown"], ["好", "好"], ["取消", "好", "Other"]] {
+            rejects("DIALOG_RESPONSE_UNVERIFIABLE") { _ = try SafariLiveInput.localizedDialogButtonIdentity(titles: titles, type: "prompt", labels: localPairs) }
+        }
+        rejects("DIALOG_RESPONSE_UNVERIFIABLE") {
+            _ = try SafariLiveInput.localizedDialogButtonIdentity(titles: ["取消", "好"], type: "prompt", labels: localPairs + [.init(primary: "取消", cancel: "好")])
+        }
+        rejects("DIALOG_RESPONSE_UNVERIFIABLE") {
+            _ = try SafariLiveInput.dialogResponseButtonIndex(operation: "accept", type: "prompt", buttonCount: 2,
+                defaultIndices: [0], cancelIndices: [1], enabled: [0, 1], pressable: [0, 1], localized: nativePair)
+        }
+        let alert = try SafariLiveInput.localizedDialogButtonIdentity(titles: ["關閉"], type: "alert", labels: SafariLiveInput.nativeDialogLabels("alert"))
+        precondition(alert.primary == 0 && alert.cancel == nil)
+        let alertWindow = CGRect(x: -1200, y: 25, width: 1200, height: 900), alertDialog = CGRect(x: -1100, y: 400, width: 300, height: 200)
+        let alertButton = CGRect(x: -1000, y: 500, width: 100, height: 30)
+        let alertPoint = try SafariLiveInput.nativeDialogButtonPoint(button: alertButton, dialog: alertDialog, window: alertWindow)
+        precondition(alertPoint == CGPoint(x: -950, y: 515), "Use the exact native button center, including negative-screen coordinates")
+        precondition(SafariLiveInput.nativePointerMatches(alertPoint, expected: alertPoint))
+        precondition(SafariLiveInput.nativePointerMatches(CGPoint(x: -949.5, y: 515.5), expected: alertPoint))
+        precondition(!SafariLiveInput.nativePointerMatches(CGPoint(x: -948, y: 515), expected: alertPoint))
+        precondition(!SafariLiveInput.nativePointerMatches(CGPoint(x: CGFloat.infinity, y: 515), expected: alertPoint))
+        for button in [CGRect(x: 0, y: 500, width: 100, height: 30), CGRect(x: -1150, y: 500, width: 100, height: 30),
+                       CGRect(x: -1000, y: 500, width: 0, height: 30), CGRect(x: CGFloat.infinity, y: 500, width: 100, height: 30)] {
+            rejects("DIALOG_BUTTON_BOUNDS_CHANGED") { _ = try SafariLiveInput.nativeDialogButtonPoint(button: button, dialog: alertDialog, window: alertWindow) }
+        }
         for update: [String: Any] in [["accept": NSNumber(value: 1)], ["type": "alert", "accept": false], ["timeout_ms": 10001],
                                      ["timeout_ms": 0], ["type": "confirm"], ["message": String(repeating: "x", count: 8001)], ["unknown": true]] {
             rejects("INVALID_NATIVE_MODAL") { _ = try SafariLiveInput.ModalPlan(["policy": modalPolicy.merging(update) { _, n in n }, "scope": modalScope], request: request()) }

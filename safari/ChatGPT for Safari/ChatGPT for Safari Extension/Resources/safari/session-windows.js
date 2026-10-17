@@ -5,6 +5,16 @@
     const action = api.browserAction || api.action;
     const key = "chatgptSafariSessionWindowsV1";
     const sessions = new Map();
+    // Native creation provenance is memory-only, unlike session labels. It
+    // authorizes only navigating/closing this exact new tab in its creating
+    // original turn; it never asserts that an unreported document URL is blank.
+    const createdTabs = new Map();
+    const scopeKeys = ["profileId", "ownerId", "accountScope", "sessionId", "turnId"];
+    const sameScope = (left, right) => left && right && Object.keys(right).length === scopeKeys.length
+      && scopeKeys.every(key => typeof right[key] === "string" && right[key] && left[key] === right[key]);
+    const sourceMatches = (entry, tab) => entry && Number.isSafeInteger(entry.windowId) && entry.windowId >= 0
+      && tab.id === entry.tabId && tab.windowId === entry.windowId && !tab.incognito
+      && [undefined, null, "", "about:blank"].includes(tab.url) && [undefined, null, "", "about:blank"].includes(tab.pendingUrl);
     let queue = Promise.resolve();
     const ready = api.storage.session.get(key).then(value => {
       for (const [id, state] of Object.entries(value[key] || {})) {
@@ -23,7 +33,7 @@
       await action.setTitle({ tabId, title: state.title ? `ChatGPT — ${state.title}` : "ChatGPT" });
     }
     const manager = {
-      createTab(sessionId, preferredWindowId) {
+      createTab(sessionId, preferredWindowId, turnId) {
         return serial(async () => {
           let state = sessions.get(sessionId);
           if (!state) { state = { windowId: null, tabs: new Set(), title: "" }; sessions.set(sessionId, state); }
@@ -44,6 +54,9 @@
             state.tabs.add(live.id);
             await label(state, live.id);
             await save();
+            if (typeof turnId === "string" && turnId && sourceMatches({ tabId: live.id, windowId: live.windowId }, live)) {
+              createdTabs.set(live.id, { id: root.crypto.randomUUID(), tabId: live.id, windowId: live.windowId, sessionId, turnId });
+            }
             return live;
           } catch (error) {
             state.tabs.delete(tab.id);
@@ -54,6 +67,30 @@
             throw error;
           }
         });
+      },
+      bindCreatedTab(tabId, scope) {
+        const entry = createdTabs.get(tabId);
+        if (!entry || entry.sessionId !== scope.sessionId || entry.turnId !== scope.turnId || entry.scope && !sameScope(entry.scope, scope)) return false;
+        if (!sameScope(scope, scope)) return false;
+        entry.scope = { ...scope }; return true;
+      },
+      async createdTabReceipt(tabId, scope) {
+        const entry = createdTabs.get(tabId);
+        if (!entry || !sameScope(entry.scope, scope)) return null;
+        const tab = await api.tabs.get(tabId);
+        if (!sourceMatches(entry, tab)) { createdTabs.delete(tabId); return null; }
+        return { id: entry.id, tabId: entry.tabId, windowId: entry.windowId };
+      },
+      validateCreatedTabReceipt(receipt, scope, tab, consume = false) {
+        const entry = createdTabs.get(tab.id);
+        if (!entry || !sameScope(entry.scope, scope) || !receipt || Object.keys(receipt).length !== 3
+          || receipt.id !== entry.id || receipt.tabId !== entry.tabId || receipt.windowId !== entry.windowId) return false;
+        if (!sourceMatches(entry, tab)) { createdTabs.delete(tab.id); return false; }
+        if (consume) createdTabs.delete(tab.id);
+        return true;
+      },
+      releaseCreatedTabs(sessionId, turnId) {
+        for (const [id, entry] of createdTabs) if (entry.sessionId === sessionId && (turnId == null || entry.turnId === turnId)) createdTabs.delete(id);
       },
       ensureAgentTabGroup(sessionId, tabId, previousTabIds) {
         return serial(async () => {
@@ -104,7 +141,16 @@
         });
       },
     };
-    api.tabs.onRemoved.addListener(() => {
+    api.tabs.onUpdated?.addListener((id, changes, tab) => {
+      const entry = createdTabs.get(id);
+      if (!entry) return;
+      if (tab && !sourceMatches(entry, tab)
+        || changes.url != null && changes.url !== "" && changes.url !== "about:blank"
+        || changes.pendingUrl != null && changes.pendingUrl !== "" && changes.pendingUrl !== "about:blank") createdTabs.delete(id);
+    });
+    api.tabs.onAttached?.addListener(id => createdTabs.delete(id));
+    api.tabs.onRemoved.addListener(id => {
+      createdTabs.delete(id);
       manager.refreshManagedGroupsFromChrome().catch(() => console.error("Unable to refresh Safari session windows"));
     });
     return manager;

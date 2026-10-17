@@ -3,12 +3,30 @@
   "use strict";
   const sameOwner = (left, right) => left.instanceId === right.instanceId
     && left.profileId === right.profileId && left.accountScope === right.accountScope;
-  function nativeFailure(response, fallback) {
+  function nativeFailure(response, fallback, bookmarkOperation = false) {
     const error = new Error(response?.error?.message || fallback);
     error.code = response?.error?.code;
     error.data = response?.error?.data;
     for (const key of ["mutationApplied", "doNotReplay"]) {
       if (typeof error.data?.[key] === "boolean") error[key] = error.data[key];
+    }
+    if (bookmarkOperation) {
+      // The original kernel retains Error.message, not arbitrary error data.
+      // Carry only fixed native stages, timings, and equality outcomes across
+      // that boundary. Never copy bookmark titles, URLs, handles or inventories.
+      const data = error.data || {}, safe = {};
+      if (["BOOKMARK_OPERATION_UNCONFIRMED", "FOCUS_CHANGED", "BOOKMARK_DEADLINE_EXPIRED", "STALE_OPERATION"].includes(error.code)) safe.code = error.code;
+      if (["expansion", "restoration", "inventory", "confirmation", "url_focus", "url_commit", "title_focus", "title_commit",
+        "folder_focus", "folder_commit", "delete_menu", "delete_completion"].includes(data.stage)) safe.stage = data.stage;
+      if (["none", "owner", "deadline", "owner_and_deadline", "frontmost_process", "focused_application", "focused_window",
+        "window_identity", "window_bounds", "input", "editor_surface", "editor_identity", "utility_identity"].includes(data.guardStage)) safe.guardStage = data.guardStage;
+      for (const key of ["waitMS", "queueWaitMS", "elapsedMS", "expansionMS", "inventoryMS"]) {
+        if (Number.isSafeInteger(data[key]) && data[key] >= 0 && data[key] <= 1_000_000_000) safe[key] = data[key];
+      }
+      for (const key of ["focusedElementMatches", "fieldFocused", "valueMatches", "mutationApplied", "doNotReplay"]) {
+        if (typeof data[key] === "boolean") safe[key] = data[key];
+      }
+      if (Object.keys(safe).length) error.message += ` Native bookmark result: ${JSON.stringify(safe)}.`;
     }
     return error;
   }
@@ -135,7 +153,7 @@
             selection.assertCurrent();
             nativeDelivered = true;
             const response = await send(owner, { action: "bookmarks", expectedUrl: url, windowBounds, method, arguments: args });
-            return response?.ok === true ? { value: response.result } : { error: nativeFailure(response, "Safari's native bookmark operation failed") };
+            return response?.ok === true ? { value: response.result } : { error: nativeFailure(response, "Safari's native bookmark operation failed", true) };
           } catch (error) { return { error }; }
         });
         await currentOwner(owner);

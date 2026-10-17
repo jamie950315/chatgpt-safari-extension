@@ -101,9 +101,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                     guard let expected = try? self.companionServer.utilityEntry(), request["expectedUrl"] as? String == expected else {
                         reply(["ok": false, "error": ["code": "INVALID_UTILITY_PAGE", "message": "Bookmarks must use the app's temporary operation page."]]); return
                     }
-                    let deadline = Date().addingTimeInterval(20)
-                    self.liveInput.manageBookmarks(request, profileIdentity: profile + ":" + epoch.uuidString,
-                        isAuthorized: { Date() < deadline && authorized() }) { result in DispatchQueue.main.async { reply(result) } }
+                    let deadline = SafariBookmarks.OperationDeadline()
+                    self.liveInput.manageBookmarks(request, profileIdentity: profile + ":" + epoch.uuidString, deadline: deadline,
+                        isAuthorized: authorized) { result in DispatchQueue.main.async { reply(result) } }
                 } else if request["action"] as? String == "notification" {
                     self.notifications.handle(request, isAuthorized: authorized) { result in DispatchQueue.main.async { reply(result) } }
                 } else {

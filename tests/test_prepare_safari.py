@@ -20,6 +20,7 @@ class SafariPreparationTests(unittest.TestCase):
         self.assertEqual(helper.prepare_kernel_host(prepared), prepared)
         subprocess.run(["node", "--input-type=module", "--check"], input=prepared, text=True, capture_output=True, check=True)
         self.assertIn("ChatGPTSafariAgent.release(t,r)", background)
+        self.assertIn("createTab(this.sessionId,r.length===0?t:void 0,e.turn_id)", background)
         for member in ["Tabs.new", "Browser.history", "Tab.dev", "Tab.capabilities", "Tab.playwright", "Tab.screenshot", "Tab.getJsDialog", "DomCUAAPI.double_click"]:
             self.assertTrue(helper.API_SUPPORT_OVERRIDES[member])
         self.assertFalse(helper.API_SUPPORT_OVERRIDES["PlaywrightAPI.evaluate"])

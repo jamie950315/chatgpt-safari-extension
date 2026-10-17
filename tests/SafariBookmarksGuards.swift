@@ -10,6 +10,49 @@ import Foundation
         }
     }
     static func main() throws {
+        let issued = Date(timeIntervalSince1970: 1000), deadline = SafariBookmarks.OperationDeadline(now: Date(timeIntervalSince1970: 1000))
+        precondition(deadline.issuedAt == issued && deadline.expiresAt == issued.addingTimeInterval(20))
+        precondition(deadline.authorization(ownerCurrent: true, now: issued.addingTimeInterval(19.999)) == .current)
+        precondition(deadline.authorization(ownerCurrent: false, now: issued.addingTimeInterval(19)) == .owner)
+        precondition(deadline.authorization(ownerCurrent: true, now: issued.addingTimeInterval(20)) == .deadline)
+        precondition(deadline.authorization(ownerCurrent: false, now: issued.addingTimeInterval(20)) == .ownerAndDeadline,
+                     "The native deadline must not masquerade as an owner/account authorization change")
+        let diagnostic = SafariBookmarks.Diagnostics(stage: .urlFocus, waitMS: 2048, expansionMS: -1,
+            inventoryMS: 1_000_000_001, observation: .init(focusedElementMatches: false, fieldFocused: true, valueMatches: false)).data
+        precondition(diagnostic["stage"] as? String == "url_focus" && diagnostic["waitMS"] as? Int == 2048)
+        precondition(diagnostic["expansionMS"] as? Int == 0 && diagnostic["inventoryMS"] as? Int == 1_000_000_000)
+        precondition(diagnostic["focusedElementMatches"] as? Bool == false && diagnostic["fieldFocused"] as? Bool == true
+            && diagnostic["valueMatches"] as? Bool == false)
+        precondition(Set(diagnostic.keys) == ["stage", "waitMS", "expansionMS", "inventoryMS", "focusedElementMatches", "fieldFocused", "valueMatches"],
+                     "Native bookmark diagnostics must remain fixed timings and booleans, without private identities or values")
+        var opened = Set<Int>(), rowScans = 0, classified = 0
+        try SafariBookmarks.expandInRounds(rows: {
+            rowScans += 1
+            return (0..<100).flatMap { opened.contains($0) ? [$0, $0 + 100] : [$0] }
+        }, collapsedTriangle: { row -> Int? in
+            classified += 1
+            return opened.contains(row) ? nil : row
+        }, expand: { row, triangle in
+            precondition(row == triangle && !opened.contains(row), "A delivered folder expansion must never be replayed")
+            opened.insert(row)
+        })
+        precondition(opened.count == 200 && rowScans == 3 && classified == 500,
+                     "Sibling folders are classified in one AXRows round; only newly disclosed depth requires another pass")
+        enum Interrupted: Error { case ownerChanged }
+        var delivered: [Int] = []
+        do {
+            try SafariBookmarks.expandInRounds(rows: { [1, 2, 3] }, collapsedTriangle: { Optional($0) }, expand: { row, _ in
+                if row == 3 { throw Interrupted.ownerChanged }
+                delivered.append(row)
+            })
+            preconditionFailure("An interrupted native expansion was accepted")
+        } catch Interrupted.ownerChanged { precondition(delivered == [1, 2]) }
+        do {
+            try SafariBookmarks.expandInRounds(rows: { Array(0...20000) }, collapsedTriangle: { Optional($0) }, expand: { _, _ in
+                preconditionFailure("An oversized row collection delivered an expansion")
+            })
+            preconditionFailure("An oversized native row collection was accepted")
+        } catch let failure as SafariBookmarks.Failure { precondition(failure.code == "BOOKMARK_TREE_TOO_LARGE") }
         let outline = SurfaceNode("AXOutline", "Bookmarks", (0..<3000).map { _ in SurfaceNode("AXRow") })
         let address = SurfaceNode("AXTextField", "WEB_BROWSER_ADDRESS_AND_SEARCH_FIELD")
         let search = SurfaceNode("AXTextField", "BookmarksSearchField")

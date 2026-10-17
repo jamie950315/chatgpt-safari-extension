@@ -99,7 +99,7 @@ REPLACEMENTS = {
     'async function k_(e,t){await Pl(t,':
         ('async function k_(e,t){if(!chrome.debugger)throw new Error("Safari browser control is unavailable: the desktop runtime requires a CDP debugger, which Safari does not expose.");await Pl(t,', 1),
     "const n=await P_(r.length===0?t:void 0);":
-        ("const n=Yt(await this.tabGroups.createTab(this.sessionId,r.length===0?t:void 0));", 1),
+        ("const n=Yt(await this.tabGroups.createTab(this.sessionId,r.length===0?t:void 0,e.turn_id));", 1),
     'tabGroups=zg.getInstance();':
         ('tabGroups=globalThis.ChatGPTSafariSessionWindows;', 1),
     'chrome.runtime.connectNative(this.application)':
