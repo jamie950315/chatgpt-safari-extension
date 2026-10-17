@@ -137,3 +137,13 @@ test("original Blob security approves its real website origin before writer comp
   assert.equal((await dispatch(context, command, () => assert.fail())).state, "complete");
   assert.deepEqual(calls, ["safari_download_capture", "approve", "recheck", "safari_download_complete", "safari_download_cancel"]);
 });
+
+
+test("an expired native command cannot arm capture and does not prevent exact cleanup", async () => {
+  const f = fixture();
+  await assert.rejects(f.run("arm", { commandDeadline: Date.now() - 1 }), /expired before capture delivery/);
+  assert.equal(f.eval("HTMLAnchorElement.prototype.click===originalClick"), true);
+  await f.run("arm");
+  await f.run("cancel", { commandDeadline: Date.now() - 1 });
+  assert.equal(f.eval("HTMLAnchorElement.prototype.click===originalClick"), true);
+});

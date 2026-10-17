@@ -69,6 +69,16 @@ This is a development-signed conversion of Chrome extension 1.26.1005.11759.
   uses a separate profile/session-bound extension poll channel, independent of
   side-chat ownership. Handles bind profile and tab; snapshots bind document,
   URL, and node identity. Never replay a delivered command after a disconnect.
+  `live_status.downloadObservation` keeps at most 32 fixed transfer/writer stage
+  events with elapsed time and bounded byte/sequence counts. It carries no URLs,
+  paths, file contents, operation IDs or credentials. Input receipts describe
+  their own command, not subsequent transfer progress; use writer stages to
+  distinguish a transfer timeout from a source-click failure.
+  Downloads honor the existing command deadline even if a callback is lost.
+  Pass that deadline into fixed page deliveries so a queued expired script
+  cannot start a request. Cleanup is independently dispatched, native abort
+  first, with a two-second acknowledgment bound; retain the primary error and
+  report unconfirmed cleanup as uncertain. Cancel remains allowed after expiry.
 - The original side-chat Work agent uses its account-bound upstream cloud
   tunnel and JavaScript kernel, not a separate MCP or replacement model loop.
   Its native-only session read is owner-bound and returns only the minimum
@@ -218,9 +228,10 @@ This is a development-signed conversion of Chrome extension 1.26.1005.11759.
   original full-URL policy before each next request. Reject missing/ambiguous
   evidence, cycles, cross-origin hops and a sixth request. Preserve the 32 MiB /
   30-second active-transfer bound and consume the final response only once.
-  Existing direct-link/exports keep their original behavior. Detached anchors,
-  location/form/later-task downloads and a generic native download waiter remain
-  unsupported; never advertise those from the narrower connected-anchor proof.
+  Existing direct-link/exports keep their original behavior. The default route
+  does not capture detached or later-task downloads; those require the explicit
+  causal option below. Location/form downloads and a generic native download
+  waiter remain unsupported.
 - The additive `redirects: "cross-origin-policy"` route keeps the same full-URL
   approval before each manual GET, native nonce/request/document proof, five-GET
   bound, and single final response. Ordinary-page `credentials: "include"` lets
@@ -257,7 +268,7 @@ This is a development-signed conversion of Chrome extension 1.26.1005.11759.
   cancellation must work after same-document URL changes; old-URL targeting is
   not a prerequisite for cleanup. The default and credentialed-CORS routes keep
   their original contracts.
-- Owned native detached/Promise-timer/Blob prototypes produced real Safari files,
+- Unintercepted native detached/Promise-timer/Blob prototypes produced Safari files,
   but no download event or operation-bound source receipt. The same native
   webRequest observers saw page fetches, not those native downloads; Safari's
   downloads API was absent. Do not adopt completed files or metadata by URL,
@@ -388,6 +399,34 @@ original approval UI: zero destination requests (including preflight), no path,
 normal final response, and no retry. A concurrent other-tab native download was
 not adopted; that separate attempt failed exact header proof rather than proving
 an explicit denial. Keep these outcomes distinct.
+
+Installed original Work `tab-origin-policy` completed a no-CORS different-host
+redirect using existing claimed ordinary Safari source/destination documents.
+The destination had zero requests before its original one-time approval, then
+one authenticated GET with only its own HTTP-only login and no Authorization.
+One source GET and one final response produced the exact 46-byte file, mode
+0600 with quarantine, and a normal final reply with the native writer path.
+This requires an existing authorized destination-origin HTML document; it is
+not an arbitrary-origin non-CORS transport.
+
+Installed original Work causal capture separately completed detached HTTP
+(41 bytes), explicit Promise/timer output (40 bytes), and immediate-revoke Blob
+(36 bytes), each with a real writer path, exact bytes, 0600 and quarantine.
+The latest reviewed build also completed the immutable-manager/anchor-listener
+guard (39 bytes) and server-preparation case (40 bytes): one preparation request,
+one final GET, no extra anchor listener, and normal Work final replies.
+The latest build separately completed a 33-byte immediate-revoke Blob and
+rejected multiple causal anchors with no path or file GET. The shared selection
+contract restores the owner on success, not on error; an error can leave the
+source selected until the user returns to the owner sidebar. Do not refocus on
+an error to conceal a manual interruption.
+A later same-page concurrent ordinary download was not adopted, but Work's own
+capture failed; do not call that a successful concurrent managed transfer.
+Slow-stream owner-close acceptance remains pending a transfer/native callback
+failure. A captured correct URL and nonce-bound manual request were observed;
+nonce absence in the default route or `Completed steps: 0` on a later transfer
+error does not establish a native anchor bypass or an undelivered source click.
+Native await and other untracked continuations retain the limitations above.
 
 Installed original Work bookmark tree/search/read, title/URL update, folder
 creation, URL creation, and native movement passed with exact synthetic-record

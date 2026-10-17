@@ -743,7 +743,7 @@
           return environment.ChatGPTSafariDownloads.createExports({ api, target, send, profileId, sessionId, assertTime, unwrap }).inspect(tab, args.command);
         }
         if (["safari_assets_list", "safari_assets_inspect"].includes(args.command?.type)) {
-          const downloads = environment.ChatGPTSafariDownloads.createDownloads({ api, target, send, profileId, sessionId, assertTime, unwrap });
+          const downloads = environment.ChatGPTSafariDownloads.createDownloads({ api, target, send, profileId, sessionId, assertTime, unwrap, deadline: request.deadline });
           return args.command.type === "safari_assets_list" ? downloads.listAssets(tab, { ...args.command, handle: args.handle })
             : downloads.inspectAssets(tab, { ...args.command, handle: args.handle });
         }
@@ -785,7 +785,7 @@
         return { ...result, ...(frameId ? { frameId, framePath } : {}) };
       }
       if (action === "asset_bundle") {
-        const downloads = environment.ChatGPTSafariDownloads.createDownloads({ api, target, send, profileId, sessionId, assertTime, unwrap });
+        const downloads = environment.ChatGPTSafariDownloads.createDownloads({ api, target, send, profileId, sessionId, assertTime, unwrap, deadline: request.deadline });
         return downloads.bundle(request, tab, args);
       }
       if (action === "content_export") {
@@ -831,12 +831,12 @@
           throw fail("INVALID_DOWNLOAD_INTENT", "Captured downloads require their exact original owner/account/profile/session/turn/tab scope.");
         }
         await target(args.handle, args.expectedUrl);
-        const downloads = environment.ChatGPTSafariDownloads.createDownloads({ api, target, send, profileId, sessionId, assertTime, unwrap,
+        const downloads = environment.ChatGPTSafariDownloads.createDownloads({ api, target, send, profileId, sessionId, assertTime, unwrap, deadline: request.deadline,
           ...args.capture === "causal" || args.redirectPolicy === "tab-origin-policy" ? { authorizeIntent: () => environment.ChatGPTSafariAgent.assertDownloadIntent(args) } : {} });
         return action === "download_intent_redirect" ? downloads.redirectStep(tab, args) : downloads.executeIntent(request, tab, args);
       }
       if (action === "download_link_inspect" || action === "download_link") {
-        const downloads = environment.ChatGPTSafariDownloads.createDownloads({ api, target, send, profileId, sessionId, assertTime, unwrap });
+        const downloads = environment.ChatGPTSafariDownloads.createDownloads({ api, target, send, profileId, sessionId, assertTime, unwrap, deadline: request.deadline });
         return action === "download_link_inspect" ? downloads.inspect(tab, args) : downloads.execute(request, tab, args);
       }
       if (action === "organize") {
@@ -990,7 +990,7 @@
             }
             if (args.downloadIntent) {
               if (kind !== "click" || intentDownloads) throw fail("INVALID_DOWNLOAD_INTENT", "A captured download may post only one native source click.");
-              intentDownloads = environment.ChatGPTSafariDownloads.createDownloads({ api, target, send, profileId, sessionId, assertTime, unwrap });
+              intentDownloads = environment.ChatGPTSafariDownloads.createDownloads({ api, target, send, profileId, sessionId, assertTime, unwrap, deadline: request.deadline });
               intentBinding = { handle: args.handle, expectedUrl: tab.url, documentId: args.documentId, snapshotId: args.snapshotId,
                 node: interaction.node, intentId: args.downloadIntent.intentId, scope: args.downloadIntent.scope, timeout_ms: args.downloadIntent.timeout_ms,
                 ...(args.downloadIntent.capture === "causal" ? { capture: "causal", wait_ms: args.downloadIntent.wait_ms } : {}) };

@@ -10,6 +10,7 @@
     const success = result => ({ ok: true, result });
     const maximumBytes = 32 * 1024 * 1024, chunkBytes = 48 * 1024, maximumNonces = 1024;
     if (!args || typeof args !== "object") return fail("INVALID_DOWNLOAD_REALM", "An exact destination-document lease is required.");
+    if (operation !== "cancel" && Number.isFinite(args.commandDeadline) && Date.now() > args.commandDeadline) return fail("LIVE_TIMEOUT", "The original command expired before destination delivery. No request was sent or repeated.");
     const live = globalThis.__chatGPTSafariLiveDocument;
     const stateKey = "__chatGPTSafariDownloadRealms";
     let state = globalThis[stateKey];

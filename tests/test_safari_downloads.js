@@ -40,6 +40,9 @@ function fixture(options = {}) {
   const api = { scripting: { async executeScript(request) {
     assert.equal(request.target.tabId, 12);
     const [name, value] = request.args;
+    if (name === "start" && options.delayPageStart) await new Promise(resolve => setTimeout(resolve, options.delayPageStart));
+    if (name === "read" && options.hangPageRead) return new Promise(() => {});
+    if (name === "cancel" && options.hangPageCancel) return new Promise(() => {});
     try { return [{ result: { ok: true, result: await operation(request.func === assetInventoryPageOperation ? "inventory-" + name : name, value) } }]; }
     catch (error) { return [{ result: { ok: false, error: { code: error.code, message: error.message } } }]; }
   } } };
@@ -58,13 +61,15 @@ function fixture(options = {}) {
     if (input.action === "append") {
       assert.equal(input.sequence, sequence++);
       written += Buffer.from(input.data, "base64").length;
+      if (options.hangNativeAppend) return new Promise(() => {});
       if (options.cancelAfterAppend) return { ok: false, error: { code: "AGENT_OWNER_CHANGED", message: "The owner changed" } };
       if (options.mutateAfterAppend) anchor.href = "https://example.com/other.txt";
       return { ok: true, result: { sequence, bytesWritten: written } };
     }
     if (input.action === "finish") { assert.equal(input.expectedBytes, written); return { ok: true, result: { state: "complete", path: "/Downloads/report.txt", bytesWritten: written } }; }
+    options.onAbort?.();
     return { ok: true, result: { aborted: true } };
-  }, profileId: "profile-a", sessionId: "session-a", assertTime() {}, unwrap });
+  }, profileId: "profile-a", sessionId: "session-a", deadline: options.commandDeadline, assertTime() { if (options.commandDeadline && Date.now() > options.commandDeadline) throw new Error("The original command deadline expired"); }, unwrap });
   return { args, calls, writes, content, anchor, live, location, operation, page, downloads,
     execute: () => downloads.execute({ id: "operation-a" }, { id: 12 }, args) };
 }
@@ -142,4 +147,55 @@ test("observed inline assets produce exact bundle bytes and a manifest referenci
   assert.equal(final.input.manifest.assets[0].path, result.assets[0].path);
   assert.equal(f.calls.length, 0, "Inline SVG bytes must not trigger an unapproved network fetch");
   await assert.rejects(f.downloads.bundle({ id: "operation-a" }, { id: 12 }, { ...args, scope: "other-owner" }), /current claimed document/);
+});
+
+
+test("a lost page cleanup callback cannot delay native abort or hide the primary failure", { timeout: 4000 }, async () => {
+  let observedAbort;
+  const aborted = new Promise(resolve => { observedAbort = resolve; });
+  const f = fixture({ cancelAfterAppend: true, hangPageCancel: true, onAbort: observedAbort });
+  const execution = f.execute();
+  const rejection = assert.rejects(execution, /owner changed.*cleanup was not acknowledged/);
+  await aborted;
+  assert.equal(f.writes.at(-1).input.action, "abort", "Native abort must be dispatched before waiting for an unresponsive page");
+  assert.equal(f.writes.some(item => item.input.action === "finish"), false);
+  await rejection;
+  // Retire the harness's simulated inaccessible document timer after checking
+  // that production cleanup returned without its callback.
+  for (const id of f.page.__chatGPTSafariDownloadState.keys()) await f.operation("cancel", { ...f.args, transferId: id });
+});
+
+test("MAIN and isolated cancellation dispatch independently and release a lost callback within a bounded wait", { timeout: 4000 }, async () => {
+  const worlds = [];
+  const downloads = createDownloads({ api: { scripting: { executeScript(request) {
+    worlds.push(request.world); return new Promise(() => {});
+  } } }, target() {}, send() {}, profileId: "profile-a", sessionId: "session-a", assertTime() {}, unwrap() {} });
+  await assert.rejects(downloads.cancelIntent({ id: 12 }, { capture: "causal", intentId: "owned-intent", documentId: "owned-document" }),
+    /cleanup was not acknowledged/);
+  assert.deepEqual(worlds, ["MAIN", "ISOLATED"]);
+});
+
+
+test("a lost scripting read honors the existing command deadline and aborts its writer without replay", { timeout: 2000 }, async () => {
+  const f = fixture({ hangPageRead: true, commandDeadline: Date.now() + 150 });
+  await assert.rejects(f.execute(), /original command deadline expired/);
+  assert.deepEqual(f.writes.map(item => item.input.action), ["begin", "abort"]);
+  assert.equal(f.calls.length, 1);
+});
+
+
+test("a lost native append callback honors the command deadline and aborts the exact writer", { timeout: 2000 }, async () => {
+  const f = fixture({ hangNativeAppend: true, commandDeadline: Date.now() + 150 });
+  await assert.rejects(f.execute(), /original command deadline expired/);
+  assert.deepEqual(f.writes.map(item => item.input.action), ["begin", "append", "abort"]);
+  assert.equal(f.calls.length, 1);
+});
+
+
+test("a delayed script cannot start its approved request after the original command expired", { timeout: 2000 }, async () => {
+  const f = fixture({ delayPageStart: 300, commandDeadline: Date.now() + 100 });
+  await assert.rejects(f.execute(), /original command deadline expired/);
+  await new Promise(resolve => setTimeout(resolve, 350));
+  assert.equal(f.calls.length, 0, "A late script callback must not issue an expired request");
+  assert.equal(f.writes.length, 0);
 });

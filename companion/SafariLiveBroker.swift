@@ -47,6 +47,70 @@ final class SafariLiveBroker {
     private var inputSequence = 0
     private var inputObservedAt = Date()
     private var inputOperation: String?
+    private struct DownloadObservation {
+        let operation: String // Private correlation only; never returned in status.
+        let sequence: Int
+        let action: String
+        let started: Date
+        var updated: Date
+        var firstWriterMS: Int?
+        var eventCount = 0
+        var events: [[String: Any]] = []
+    }
+    private var downloadSequence = 0
+    private var downloadObservation: DownloadObservation?
+
+    private static func observedMS(_ date: Date, since start: Date) -> Int {
+        Int(max(0, min(1_000_000_000, date.timeIntervalSince(start) * 1000)))
+    }
+
+    private static func downloadError(_ response: [String: Any]) -> String {
+        guard response["ok"] as? Bool != true else { return "" }
+        let code = (response["error"] as? [String: Any])?["code"] as? String ?? ""
+        let known: Set<String> = ["LIVE_TIMEOUT", "BACKGROUND_CHANGED", "AGENT_OWNER_CHANGED", "APP_CLOSED",
+            "STALE_OPERATION", "STALE_DOWNLOAD", "INVALID_DOWNLOAD", "DOWNLOAD_ACCESS_DENIED", "DOWNLOAD_WRITE_FAILED",
+            "DOWNLOAD_SEQUENCE", "DOWNLOAD_SIZE", "DOWNLOAD_UNAVAILABLE", "DOWNLOAD_TARGET_CHANGED", "DOWNLOAD_INTENT_USED",
+            "DOWNLOAD_HEADERS_EXPIRED", "DOWNLOAD_REDIRECT_APPROVAL_REQUIRED", "DOWNLOAD_FETCH_FAILED", "DOWNLOAD_READ_FAILED",
+            "INVALID_BUNDLE", "STALE_DOWNLOAD_REALM", "DOWNLOAD_REALM_FETCH_FAILED", "DOWNLOAD_REALM_READ_FAILED"]
+        return known.contains(code) ? code : "UNCLASSIFIED"
+    }
+
+    private func observeDownload(_ id: String, stage: String, writerAction: String? = nil,
+                                 input: [String: Any] = [:], response: [String: Any]? = nil) {
+        guard operation?.id == id, var value = downloadObservation, value.operation == id else { return }
+        let now = Date(), elapsed = Self.observedMS(now, since: value.started)
+        var event: [String: Any] = ["stage": stage, "elapsedMs": elapsed]
+        if let writerAction { event["action"] = writerAction }
+        func number(_ raw: Any?) -> Int? {
+            guard let number = raw as? NSNumber, CFGetTypeID(number) != CFBooleanGetTypeID(),
+                  number.doubleValue.isFinite, number.doubleValue.rounded() == number.doubleValue,
+                  (0...1_000_000_000).contains(number.doubleValue) else { return nil }
+            return number.intValue
+        }
+        if let sequence = number(input["sequence"]) { event["sequence"] = sequence }
+        if let bytes = number(input["expectedBytes"]) { event["expectedBytes"] = bytes }
+        if let bytes = number(input["encodedBytes"]) { event["encodedBytes"] = bytes }
+        if let response {
+            event["ok"] = response["ok"] as? Bool == true
+            event["errorCode"] = Self.downloadError(response)
+            let result = response["result"] as? [String: Any] ?? [:]
+            if let bytes = number(result["bytesWritten"]) { event["bytesWritten"] = bytes }
+            if let sequence = number(result["sequence"]) { event["replySequence"] = sequence }
+        }
+        if stage == "writer_ingress", value.firstWriterMS == nil { value.firstWriterMS = elapsed }
+        value.updated = now; value.eventCount += 1; value.events.append(event)
+        if value.events.count > 32 { value.events.removeFirst(value.events.count - 32) }
+        downloadObservation = value
+    }
+
+    private func downloadStatus() -> [String: Any]? {
+        guard let value = downloadObservation else { return nil }
+        var result: [String: Any] = ["sequence": value.sequence, "outerAction": value.action,
+            "elapsedMs": Self.observedMS(value.updated, since: value.started),
+            "ageMs": Self.observedMS(Date(), since: value.updated), "eventCount": value.eventCount, "events": value.events]
+        if let first = value.firstWriterMS { result["firstWriterElapsedMs"] = first }
+        return result
+    }
 
     init(download: @escaping ([String: Any], String, @escaping () -> Bool, @escaping Reply) -> Void = { _, _, _, reply in
             reply(SafariLiveBroker.failure("DOWNLOAD_UNAVAILABLE", "The native download writer is unavailable."))
@@ -297,7 +361,18 @@ final class SafariLiveBroker {
                   let native = command["input"] as? [String: Any] else {
                 reply(Self.failure("STALE_OPERATION", "This native operation no longer belongs to an active Safari command.")); return
             }
-            if isDownload { download(native, current.id, { [weak self] in self?.operation?.id == current.id }, reply) }
+            if isDownload {
+                let writerAction = native["action"] as? String ?? ""
+                let fixedAction = ["begin", "append", "finish", "abort", "bundleBegin", "bundleFinish", "bundleCancel"].contains(writerAction) ? writerAction : "unknown"
+                var metadata: [String: Any] = [:]
+                for name in ["sequence", "expectedBytes"] { metadata[name] = native[name] }
+                if let data = native["data"] as? String { metadata["encodedBytes"] = min(data.utf8.count, 1_000_000_000) }
+                observeDownload(current.id, stage: "writer_ingress", writerAction: fixedAction, input: metadata)
+                download(native, current.id, { [weak self] in self?.operation?.id == current.id }) { [weak self] response in
+                    self?.observeDownload(current.id, stage: "writer_reply", writerAction: fixedAction, input: metadata, response: response)
+                    reply(response)
+                }
+            }
             else {
                 let expected = current.command["arguments"] as? [String: Any] ?? [:]
                 guard native["action"] as? String == expected["operation"] as? String,
@@ -323,6 +398,7 @@ final class SafariLiveBroker {
                         observed["ageMs"] = max(0, Int(Date().timeIntervalSince(self.inputObservedAt) * 1000))
                         result["lastInputObservation"] = observed
                     }
+                    if let observed = self.downloadStatus() { result["downloadObservation"] = observed }
                     self.viewportStatus { status in
                         result["viewport"] = status
                         reply(["ok": true, "result": result])
@@ -399,6 +475,7 @@ final class SafariLiveBroker {
         }
         if let previous = profiles[profile], previous.session != session,
            let old = operation, old.profile == profile {
+            observeDownload(old.id, stage: "outer_cancel", response: Self.failure("BACKGROUND_CHANGED", ""))
             operation = nil
             cancelDownload(old.id)
             old.reply(Self.failure("BACKGROUND_CHANGED", "The Safari background restarted; the command was not replayed."))
@@ -410,6 +487,7 @@ final class SafariLiveBroker {
         if var current = operation, current.profile == profile, current.session == session, !current.delivered {
             current.delivered = true
             operation = current
+            observeDownload(current.id, stage: "outer_delivered")
             requests = [["id": current.id, "command": current.command,
                          "deadline": Date().addingTimeInterval(35).timeIntervalSince1970 * 1000]]
             if let owner = current.agentOwner { requests[0]["agentOwner"] = owner }
@@ -425,6 +503,7 @@ final class SafariLiveBroker {
               let result = command["response"] as? [String: Any], result["ok"] is Bool else {
             reply(Self.failure("STALE_OPERATION", "This live Safari response belongs to an expired command.")); return
         }
+        observeDownload(current.id, stage: "outer_end", response: result)
         operation = nil
         if inputOperation == current.id { lastInputObservation?["stage"] = "resolve_received"; inputObservedAt = Date() }
         cancelDownload(current.id)
@@ -440,8 +519,16 @@ final class SafariLiveBroker {
         let id = UUID().uuidString
         operation = Operation(id: id, profile: profile, session: connection.session,
                               command: ["action": action, "arguments": args], agentOwner: agentOwner, reply: reply)
+        if ["download_link", "asset_bundle", "content_export", "download_intent_transfer", "download_intent_redirect"].contains(action)
+            || action == "interact" && args["downloadIntent"] != nil {
+            downloadSequence += 1
+            let now = Date()
+            downloadObservation = DownloadObservation(operation: id, sequence: downloadSequence, action: action, started: now, updated: now)
+            observeDownload(id, stage: "outer_start")
+        }
         DispatchQueue.main.asyncAfter(deadline: .now() + 40) { [weak self] in
             guard let self, let pending = self.operation, pending.id == id else { return }
+            self.observeDownload(id, stage: "outer_timeout", response: Self.failure("LIVE_TIMEOUT", ""))
             self.operation = nil
             self.cancelDownload(pending.id)
             pending.reply(Self.failure("LIVE_TIMEOUT", "Safari did not finish the live command. Its outcome is uncertain; it was not retried."))
@@ -559,6 +646,7 @@ final class SafariLiveBroker {
         activeAgentOwner = nil
         agentGeneration += 1
         guard let pending = operation, pending.agentOwner == owner else { return }
+        observeDownload(pending.id, stage: "outer_cancel", response: Self.failure("AGENT_OWNER_CHANGED", ""))
         operation = nil
         cancelDownload(pending.id)
         pending.reply(Self.failure("AGENT_OWNER_CHANGED", pending.delivered
@@ -569,7 +657,10 @@ final class SafariLiveBroker {
     func close() {
         closed = true
         cancelViewport(nil)
-        if let pending = operation { operation = nil; cancelDownload(pending.id); pending.reply(Self.failure("APP_CLOSED", "The live Safari companion was closed.")) }
+        if let pending = operation {
+            observeDownload(pending.id, stage: "outer_cancel", response: Self.failure("APP_CLOSED", ""))
+            operation = nil; cancelDownload(pending.id); pending.reply(Self.failure("APP_CLOSED", "The live Safari companion was closed."))
+        }
         profiles.removeAll()
     }
 

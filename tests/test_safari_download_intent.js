@@ -53,6 +53,7 @@ function pageFixture(configuration = {}) {
   let sequence = 0, written = 0;
   const adapter = downloadsModule.createDownloads({ api: { webRequest, scripting: { async executeScript(request) {
     assert.equal(request.target.tabId, 12); assert.deepEqual(request.target.frameIds, [0]);
+    if (configuration.hangCancel && request.args[0] === "cancel") return new Promise(() => {});
     try { return [{ result: { ok: true, result: await invoke(request.func, ...request.args) } }]; }
     catch (error) { return [{ result: { ok: false, error: { code: error.code, message: error.message } } }]; }
   } } }, async target(handle, expectedUrl) { assert.equal(handle, args.handle); if (expectedUrl && context.location.href !== expectedUrl) throw new Error("Navigated"); return { id: 12 }; },
@@ -434,4 +435,16 @@ test("destination transports require original claims and recheck them through th
   await assert.rejects(agent.assertDownloadIntent(binding), /claim released/);
   await agent.release("session", "turn");
   await assert.rejects(agent.assertDownloadIntent(binding), /lost its original/);
+});
+
+
+test("a failed approved redirect request cannot hold its original error behind a lost cancellation callback", { timeout: 4000 }, async () => {
+  const href = "https://example.test/synchronous.txt";
+  const f = pageFixture({ hangCancel: true, routes: { [href]: { corsDenied: true } } });
+  await f.arm(); f.gesture(() => f.emit(f.anchor(href))); await f.read();
+  await assert.rejects(f.adapter.redirectStep({ id: 12 }, { ...f.args, href, redirectPolicy: "cross-origin-policy" }),
+    /exact approved request failed.*cleanup was not acknowledged/);
+  assert.equal(f.requests.length, 1);
+  assert.equal(f.writes.length, 0);
+  for (const event of Object.values(f.webRequest)) assert.equal(event.size(), 0);
 });

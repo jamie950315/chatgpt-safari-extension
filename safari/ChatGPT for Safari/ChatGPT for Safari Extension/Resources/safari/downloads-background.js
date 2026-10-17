@@ -78,6 +78,7 @@
   // pairs this exact isolated source event with a fixed MAIN-world interceptor.
   async function downloadIntentPageOperation(operation, args) {
     const fail = message => ({ ok: false, error: { code: "DOWNLOAD_INTENT_REJECTED", message } });
+    if (operation !== "cancel" && Number.isFinite(args.commandDeadline) && Date.now() > args.commandDeadline) return fail("The original command expired before page delivery. No request was sent or repeated.");
     const live = globalThis.__chatGPTSafariLiveDocument;
     if (!live) return fail("Read and resolve the current claimed page before capturing a download intent.");
     live.downloadIntents ||= new Map();
@@ -252,6 +253,7 @@
   // Self-contained because WebExtension scripting serializes this function.
   async function downloadPageOperation(operation, args) {
     const failure = (code, message) => ({ ok: false, error: { code, message } });
+    if (operation !== "cancel" && Number.isFinite(args.commandDeadline) && Date.now() > args.commandDeadline) return failure("LIVE_TIMEOUT", "The original command expired before page delivery. No request was sent or repeated.");
     const live = globalThis.__chatGPTSafariLiveDocument;
     const stateKey = "__chatGPTSafariDownloadState";
     let state = globalThis[stateKey];
@@ -641,7 +643,42 @@
     return { promise, cleanup, assertCurrent() { if (failure) throw failure; } };
   }
 
-  function createDownloads({ api, target, send, profileId, sessionId, assertTime, unwrap, authorizeIntent }) {
+  function createDownloads({ api, target: resolveTarget, send, profileId, sessionId, assertTime, unwrap, authorizeIntent: authorizeSource, deadline }) {
+    // Honor the existing command deadline even if Safari loses a scripting or
+    // native callback. The operation is never reissued after this race ends.
+    async function observe(callback) {
+      let timer;
+      try {
+        assertTime();
+        const result = await Promise.race([Promise.resolve().then(callback), new Promise((_, reject) => {
+          timer = setInterval(() => { try { assertTime(); } catch (error) { reject(error); } }, 100);
+        })]);
+        assertTime();
+        return result;
+      } finally { clearInterval(timer); }
+    }
+    const delivery = args => ({ ...args, ...(Number.isFinite(deadline) ? { commandDeadline: deadline } : {}) });
+    const target = (...args) => observe(() => resolveTarget(...args));
+    const authorizeIntent = authorizeSource && (() => observe(authorizeSource));
+    // Dispatch every cleanup independently. An unresponsive page callback must
+    // never prevent the operation-bound native writer from receiving abort.
+    async function cleanup(steps, failure) {
+      let timer;
+      try {
+        const results = await Promise.race([
+          Promise.all(steps.map(step => Promise.resolve().then(step).then(value => ({ ok: true, value }), error => ({ ok: false, error })))),
+          new Promise((_, reject) => { timer = setTimeout(() => reject(Object.assign(
+            new Error("Download cleanup was not acknowledged within two seconds. Its outcome is uncertain; do not repeat the source input."),
+            { code: "DOWNLOAD_CLEANUP_UNCONFIRMED" })), 2000); })
+        ]);
+        const unconfirmed = results.find(value => !value.ok && value.error?.code === "DOWNLOAD_CLEANUP_UNCONFIRMED");
+        if (unconfirmed) throw unconfirmed.error;
+        return results;
+      } catch (error) {
+        if (!failure) throw error;
+        failure.message += " " + error.message;
+      } finally { clearTimeout(timer); }
+    }
     const main = async (tab, operation, args) => {
       const identity = JSON.stringify([tab.id, args.documentId]);
       let channelKey = causalChannels.get(identity), freshChannel = false;
@@ -651,38 +688,44 @@
         // Retain only the current document's facade for each tab.
         for (const key of causalChannels.keys()) if (key !== identity && JSON.parse(key)[0] === tab.id) causalChannels.delete(key);
       }
-      const [value] = await api.scripting.executeScript({ target: { tabId: tab.id, frameIds: [0] }, world: "MAIN", func: causalCapture.operation,
-        args: [operation, { channelKey, freshChannel, intentId: args.intentId, expectedUrl: args.expectedUrl, wait_ms: args.wait_ms, href: args.href }] });
+      const invoke = () => api.scripting.executeScript({ target: { tabId: tab.id, frameIds: [0] }, world: "MAIN", func: causalCapture.operation,
+        args: [operation, delivery({ channelKey, freshChannel, intentId: args.intentId, expectedUrl: args.expectedUrl, wait_ms: args.wait_ms, href: args.href })] });
+      const [value] = await (operation === "cancel" ? invoke() : observe(invoke));
       return unwrap(value?.result);
     };
-    const causalCheck = async (tab, args) => {
+    const causalCheck = async (tab, args) => observe(async () => {
       await authorizeIntent?.();
       if (args.capture !== "causal") return;
       await target(args.handle, args.expectedUrl);
       await intent(tab, "causal_check", args);
       const state = await main(tab, "check", args);
       if (!state.ready || (args.capturedHref || args.href) && state.href !== (args.capturedHref || args.href)) throw new Error("The causal download changed or is no longer ready; no request was repeated.");
-    };
+    });
     async function page(tab, operation, args) {
       if (operation !== "cancel") await causalCheck(tab, args);
-      const [value] = await api.scripting.executeScript({ target: { tabId: tab.id, frameIds: [0] }, func: downloadPageOperation, args: [operation, args] });
+      const invoke = () => api.scripting.executeScript({ target: { tabId: tab.id, frameIds: [0] }, func: downloadPageOperation, args: [operation, delivery(args)] });
+      const [value] = await (operation === "cancel" ? invoke() : observe(invoke));
       return unwrap(value?.result);
     }
     async function intent(tab, operation, args) {
-      const [value] = await api.scripting.executeScript({ target: { tabId: tab.id, frameIds: [0] }, world: "ISOLATED", func: downloadIntentPageOperation, args: [operation, args] });
+      const invoke = () => api.scripting.executeScript({ target: { tabId: tab.id, frameIds: [0] }, world: "ISOLATED", func: downloadIntentPageOperation, args: [operation, delivery(args)] });
+      const [value] = await (operation === "cancel" ? invoke() : observe(invoke));
       return unwrap(value?.result);
     }
     async function realm(entry, operation, extra = {}) {
-      if (operation !== "cancel") await target(entry.binding.handle, entry.binding.expectedUrl);
-      const [value] = await api.scripting.executeScript({ target: { tabId: entry.tab.id, frameIds: [0] }, world: "ISOLATED",
-        func: destinationRealm.realmPageOperation, args: [operation, { ...entry.binding, ...extra }] });
-      return unwrap(value?.result);
+      const invoke = async () => {
+        if (operation !== "cancel") await target(entry.binding.handle, entry.binding.expectedUrl);
+        const [value] = await api.scripting.executeScript({ target: { tabId: entry.tab.id, frameIds: [0] }, world: "ISOLATED",
+          func: destinationRealm.realmPageOperation, args: [operation, delivery({ ...entry.binding, ...extra })] });
+        return unwrap(value?.result);
+      };
+      return operation === "cancel" ? invoke() : observe(invoke);
     }
     async function cancelRealm(args) {
       const entry = realmTransfers.get(args.intentId);
       if (!entry || entry.binding.scope !== args.scope) return;
       realmTransfers.delete(args.intentId);
-      await realm(entry, "cancel").catch(() => {});
+      await cleanup([() => realm(entry, "cancel")]);
     }
     async function sourceCheck(tab, args) {
       await authorizeIntent?.();
@@ -708,11 +751,14 @@
         const result = await intent(tab, "redirect_bind", { ...args, nonce, kind: receipt.kind, nextHref: receipt.href, status: receipt.status });
         if (result.kind === "redirect") await cancelRealm(args);
         return result;
-      } catch (error) { await cancelRealm(args); await intent(tab, "cancel", args).catch(() => {}); throw error; }
+      } catch (error) {
+        await cleanup([() => cancelRealm(args), () => intent(tab, "cancel", args)], error);
+        throw error;
+      }
       finally { observer.cleanup(); }
     }
     async function inventory(tab, operation, args) {
-      const [value] = await api.scripting.executeScript({ target: { tabId: tab.id, frameIds: [0] }, func: assetInventoryPageOperation, args: [operation, args] });
+      const [value] = await observe(() => api.scripting.executeScript({ target: { tabId: tab.id, frameIds: [0] }, func: assetInventoryPageOperation, args: [operation, args] }));
       return unwrap(value?.result);
     }
     async function listAssets(tab, args) {
@@ -729,11 +775,11 @@
       const started = Date.now(), selected = await inventory(tab, "inspect", args);
       if (!selected.items.length) throw new Error("The asset bundle matched no supported discovered assets");
       const binding = { ...args, documentId: selected.documentId, expectedUrl: selected.pageUrl };
-      let bundleId, finished = false;
+      let bundleId, finished = false, pendingError;
       const assets = [], failures = [];
       const write = async input => {
         assertTime(); await target(args.handle, binding.expectedUrl); await inventory(tab, "inspect", args);
-        return unwrap(await send({ action: "liveDownload", id: request.id, profileId, sessionId, input }));
+        return unwrap(await observe(() => send({ action: "liveDownload", id: request.id, profileId, sessionId, input })));
       };
       const acceptedType = (asset, contentType) => {
         const type = contentType?.split(";", 1)[0].trim().toLowerCase();
@@ -748,7 +794,7 @@
         for (const asset of selected.items) {
           assertTime();
           const transferArgs = { ...binding, assetId: asset.id, href: asset.url, transferId: root.crypto.randomUUID() };
-          let nativeID, sequence = 0, bytes = 0, controller, reader, timer, contentType;
+          let nativeID, sequence = 0, bytes = 0, controller, reader, timer, contentType, fatalFailure;
           try {
             const source = new URL(asset.url, binding.expectedUrl);
             const crossOrigin = !asset.inline && ["http:", "https:"].includes(source.protocol) && source.origin !== new URL(binding.expectedUrl).origin;
@@ -757,7 +803,7 @@
               // The original security gate approved this observed asset origin.
               // Fetch inside Safari's extension process, never in the native app.
               controller = new AbortController(); timer = setTimeout(() => controller.abort(), 30000);
-              const response = await fetch(source.href, { credentials: "include", redirect: "error", signal: controller.signal });
+              const response = await observe(() => fetch(source.href, { credentials: "include", redirect: "error", signal: controller.signal }));
               if (!response.ok || response.redirected || response.type === "opaque" || !response.body) throw new Error("The observed asset could not be fetched without a redirect");
               contentType = response.headers.get("content-type"); reader = response.body.getReader();
               metadata = { filename: asset.id + "-" + asset.name, mime: contentType };
@@ -774,7 +820,7 @@
             for (;;) {
               assertTime(); await target(args.handle, binding.expectedUrl);
               if (reader) {
-                const next = await reader.read();
+                const next = await observe(() => reader.read());
                 if (next.done) break;
                 for (let offset = 0; offset < next.value.length; offset += chunkBytes) {
                   const chunk = next.value.subarray(offset, offset + chunkBytes);
@@ -790,19 +836,24 @@
             const saved = await write({ action: "finish", transferId: nativeID, sequence, expectedBytes: bytes }); nativeID = undefined;
             assets.push({ contentType, id: asset.id, kind: asset.kind, name: asset.name, path: saved.path, url: asset.url });
           } catch (error) {
-            if (["STALE_DOWNLOAD", "STALE_ASSET_INVENTORY", "AGENT_OWNER_CHANGED", "LIVE_TIMEOUT", "PROFILE_DISCONNECTED"].includes(error.code)) throw error;
+            if (["STALE_DOWNLOAD", "STALE_ASSET_INVENTORY", "AGENT_OWNER_CHANGED", "LIVE_TIMEOUT", "PROFILE_DISCONNECTED"].includes(error.code)) { fatalFailure = error; throw error; }
             failures.push({ contentType: contentType || null, id: asset.id, name: asset.name, reason: error.message, url: asset.url });
           } finally {
-            clearTimeout(timer); controller?.abort(); await reader?.cancel().catch(() => {});
-            await page(tab, "cancel", transferArgs).catch(() => {});
-            if (nativeID) await send({ action: "liveDownload", id: request.id, profileId, sessionId, input: { action: "abort", transferId: nativeID } }).catch(() => {});
+            clearTimeout(timer); controller?.abort();
+            await cleanup([
+              ...(nativeID ? [() => send({ action: "liveDownload", id: request.id, profileId, sessionId,
+                input: { action: "abort", transferId: nativeID } })] : []),
+              () => reader?.cancel(), () => page(tab, "cancel", transferArgs)
+            ], fatalFailure);
           }
         }
         const result = await write({ action: "bundleFinish", bundleId, manifest: { assets, failures } }); finished = true;
         return { assets, failures, directoryPath: result.directoryPath, manifestPath: result.manifestPath,
           summary: { downloadedCount: assets.length, elapsedMs: Date.now() - started, failedCount: failures.length, requestedCount: selected.items.length } };
-      } finally {
-        if (bundleId && !finished) await send({ action: "liveDownload", id: request.id, profileId, sessionId, input: { action: "bundleCancel", bundleId } }).catch(() => {});
+      } catch (error) { pendingError = error; throw error; }
+      finally {
+        if (bundleId && !finished) await cleanup([() => send({ action: "liveDownload", id: request.id, profileId, sessionId,
+          input: { action: "bundleCancel", bundleId } })], pendingError);
       }
     }
     async function inspect(tab, args) {
@@ -815,12 +866,12 @@
       if (typeof args.href !== "string" || typeof args.documentId !== "string" || typeof args.snapshotId !== "string"
         || typeof args.node !== "string" || typeof args.expectedUrl !== "string") throw new Error("A policy-approved link and its current document snapshot are required for download.");
       const transferArgs = { ...args, transferId: root.crypto.randomUUID() };
-      let nativeID, sequence = 0, bytes = 0;
+      let nativeID, sequence = 0, bytes = 0, failure;
       const write = async input => {
         assertTime();
         await target(args.handle, args.expectedUrl);
         await page(tab, "inspect", args).then(result => { if (result.href !== args.href) throw new Error("The approved download link changed."); });
-        return unwrap(await send({ action: "liveDownload", id: request.id, profileId, sessionId, input }));
+        return unwrap(await observe(() => send({ action: "liveDownload", id: request.id, profileId, sessionId, input })));
       };
       try {
         assertTime();
@@ -842,10 +893,13 @@
           bytes += chunk.bytes; sequence++;
           if (written.bytesWritten !== bytes || written.sequence !== sequence) throw new Error("The native download writer did not confirm the expected bytes.");
         }
-      } finally {
-        await page(tab, "cancel", transferArgs).catch(() => {});
-        if (nativeID) await send({ action: "liveDownload", id: request.id, profileId, sessionId,
-          input: { action: "abort", transferId: nativeID } }).catch(() => {});
+      } catch (error) { failure = error; throw error; }
+      finally {
+        await cleanup([
+          ...(nativeID ? [() => send({ action: "liveDownload", id: request.id, profileId, sessionId,
+            input: { action: "abort", transferId: nativeID } })] : []),
+          () => page(tab, "cancel", transferArgs)
+        ], failure);
       }
     }
     async function redirectStep(tab, args) {
@@ -862,13 +916,16 @@
         observer.assertCurrent(); assertTime(); await target(args.handle, args.expectedUrl);
         if (response.kind !== receipt.kind || response.kind === "response" && (response.status !== receipt.status || response.url !== destination.href)) throw new Error("The observed headers did not match this exact manual page fetch. It was not repeated.");
         return await intent(tab, "redirect_bind", { ...args, nonce, kind: receipt.kind, nextHref: receipt.href, status: receipt.status });
-      } catch (error) { await intent(tab, "cancel", args).catch(() => {}); throw error; }
+      } catch (error) { await cleanup([() => intent(tab, "cancel", args)], error); throw error; }
       finally { observer.cleanup(); }
     }
     async function cancelIntent(tab, args) {
-      await cancelRealm(args);
-      if (args.capture === "causal") await main(tab, "cancel", args).catch(() => {});
-      return intent(tab, "cancel", args);
+      const results = await cleanup([() => cancelRealm(args),
+        ...(args.capture === "causal" ? [() => main(tab, "cancel", args)] : []),
+        () => intent(tab, "cancel", args)]);
+      const isolated = results.at(-1);
+      if (!isolated.ok) throw isolated.error;
+      return isolated.value;
     }
     async function armIntent(tab, args) {
       const result = await intent(tab, "arm", args);
@@ -888,10 +945,10 @@
       }
     }
     async function executeBlob(request, tab, args) {
-      let nativeID, sequence = 0, bytes = 0;
+      let nativeID, sequence = 0, bytes = 0, failure;
       const write = async input => {
         assertTime(); await causalCheck(tab, args);
-        return unwrap(await send({ action: "liveDownload", id: request.id, profileId, sessionId, input }));
+        return unwrap(await observe(() => send({ action: "liveDownload", id: request.id, profileId, sessionId, input })));
       };
       try {
         await causalCheck(tab, args);
@@ -909,16 +966,18 @@
           const result = await write({ action: "append", transferId: nativeID, sequence, data: chunk.data }); bytes += chunk.bytes; sequence++;
           if (result.bytesWritten !== bytes || result.sequence !== sequence) throw new Error("The writer did not confirm the exact causal Blob bytes.");
         }
-      } finally {
-        if (nativeID) await send({ action: "liveDownload", id: request.id, profileId, sessionId, input: { action: "abort", transferId: nativeID } }).catch(() => {});
+      } catch (error) { failure = error; throw error; }
+      finally {
+        if (nativeID) await cleanup([() => send({ action: "liveDownload", id: request.id, profileId, sessionId,
+          input: { action: "abort", transferId: nativeID } })], failure);
       }
     }
     async function executeRealm(request, tab, args) {
       const entry = realmTransfers.get(args.intentId);
       if (!entry || entry.binding.scope !== args.scope || entry.binding.href !== args.href) throw new Error("No exact approved destination-document response remains. It was not requested again.");
-      let nativeID, sequence = 0, bytes = 0;
+      let nativeID, sequence = 0, bytes = 0, failure;
       const check = async () => { await sourceCheck(tab, args); await realm(entry, "check"); };
-      const write = async input => { await check(); return unwrap(await send({ action: "liveDownload", id: request.id, profileId, sessionId, input })); };
+      const write = async input => { await check(); return unwrap(await observe(() => send({ action: "liveDownload", id: request.id, profileId, sessionId, input }))); };
       try {
         await check(); const metadata = await realm(entry, "metadata");
         const opened = await write({ action: "begin", filename: metadata.filename }); nativeID = opened.transferId;
@@ -933,19 +992,25 @@
           const result = await write({ action: "append", transferId: nativeID, sequence, data: chunk.data }); bytes += chunk.bytes; sequence++;
           if (result.bytesWritten !== bytes || result.sequence !== sequence) throw new Error("The writer did not confirm the destination response's exact bytes.");
         }
-      } finally {
-        await cancelRealm(args);
-        if (nativeID) await send({ action: "liveDownload", id: request.id, profileId, sessionId, input: { action: "abort", transferId: nativeID } }).catch(() => {});
+      } catch (error) { failure = error; throw error; }
+      finally {
+        await cleanup([
+          ...(nativeID ? [() => send({ action: "liveDownload", id: request.id, profileId, sessionId,
+            input: { action: "abort", transferId: nativeID } })] : []),
+          () => cancelRealm(args)
+        ], failure);
       }
     }
     return { inspect, execute, listAssets, inspectAssets, bundle, redirectStep, armIntent, readIntent, cancelIntent, cancelTransport: cancelRealm,
       async executeIntent(request, tab, args) {
+        let failure;
         try {
           if (args.capture === "causal" && new URL(args.href).protocol === "blob:") return await executeBlob(request, tab, args);
           if (args.redirectPolicy === "tab-origin-policy" && new URL(args.href).origin !== new URL(args.expectedUrl).origin) return await executeRealm(request, tab, args);
           return await execute(request, tab, args);
         }
-        finally { await cancelIntent(tab, args).catch(() => {}); }
+        catch (error) { failure = error; throw error; }
+        finally { await cleanup([() => cancelIntent(tab, args)], failure); }
       } };
   }
   const bridge = Object.freeze({ createDownloads, createExports, downloadPageOperation, downloadIntentPageOperation, observeRedirectHeaders, contentExportPageOperation, youtubeTranscriptPageOperation, formatYouTubeTranscript, assetInventoryPageOperation, maximumBytes, chunkBytes });

@@ -207,3 +207,12 @@ test("browser export is frozen and page serialization needs no module closure", 
   assert.equal(Object.isFrozen(sandbox.globalThis.ChatGPTSafariDownloadRealm), true);
   assert.equal(typeof sandbox.globalThis.ChatGPTSafariDownloadRealm.realmPageOperation, "function");
 });
+
+
+test("an expired delivered destination command cannot issue a request but can still cancel its exact lease", async () => {
+  const f = fixture(); await f.run("arm");
+  await assert.rejects(f.run("fetch", { commandDeadline: 99 }), /expired before destination delivery/);
+  assert.equal(f.calls.length, 0);
+  await f.run("cancel", { commandDeadline: 99 });
+  await assert.rejects(f.run("check"), /document, snapshot, scope/);
+});

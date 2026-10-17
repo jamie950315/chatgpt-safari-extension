@@ -4,6 +4,7 @@
   // Self-contained: Safari serializes this function into the page's own realm.
   function operation(action, args) {
     const fail = message => ({ ok: false, error: { code: "CAUSAL_DOWNLOAD_REJECTED", message } });
+    if (action !== "cancel" && Number.isFinite(args.commandDeadline) && Date.now() > args.commandDeadline) return fail("The original command expired before capture delivery; no input was repeated.");
     const key = args.channelKey;
     if (typeof key !== "string" || !/^__chatGPTSafariCausal_[a-f0-9]{32}$/.test(key)) return fail("A background-owned causal channel is required.");
     let channel = globalThis[key];

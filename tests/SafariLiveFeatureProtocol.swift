@@ -182,6 +182,94 @@ import Foundation
         chooserNative("liveFileChooser", upload, ok: true)
         precondition(chooserCalls == 2, "Only the exact native-opened chooser inspection and authorized upload may reach the helper")
         chooserBroker.close()
+        // Fixed, bounded telemetry must identify the writer boundary without
+        // retaining request identities, filenames, bytes or arbitrary errors.
+        var writerReplies: [SafariLiveBroker.Reply] = []
+        let observedBroker = SafariLiveBroker(download: { _, _, _, reply in writerReplies.append(reply) },
+            input: { _, reply in reply(["ok": true, "result": [:]]) })
+        var observedRequest: [String: Any] = [:]
+        var observedSession = UUID().uuidString
+        func observedPoll() {
+            observedBroker.handle(["action": "livePoll", "profileId": profile, "sessionId": observedSession]) {
+                if let request = ($0["requests"] as? [[String: Any]])?.first { observedRequest = request }
+            }
+        }
+        func observedRun(_ action: String = "download_intent_transfer", args: [String: Any] = [:]) {
+            observedBroker.handle(["action": "live", "agentOwner": "private-owner", "command": ["action": action,
+                "arguments": args.merging(["handle": "live:\(profile):12"]) { value, _ in value }]]) { _ in }
+            observedPoll()
+        }
+        func observation() -> [String: Any] {
+            var result: [String: Any] = [:]
+            observedBroker.handle(["action": "live", "command": ["action": "status"]]) {
+                result = (($0["result"] as! [String: Any])["downloadObservation"] as? [String: Any]) ?? [:]
+            }
+            return result
+        }
+        func writer(_ input: [String: Any]) {
+            observedBroker.handle(["action": "liveDownload", "id": observedRequest["id"]!,
+                "profileId": profile, "sessionId": observedSession, "input": input]) { _ in }
+        }
+        func resolveObserved() {
+            observedBroker.handle(["action": "liveResolve", "id": observedRequest["id"]!, "profileId": profile,
+                "sessionId": observedSession, "response": ["ok": true, "result": ["path": "/private/saved"]]]) { _ in }
+        }
+        observedPoll(); observedRun()
+        precondition((observation()["events"] as! [[String: Any]]).map { $0["stage"] as! String } == ["outer_start", "outer_delivered"])
+        precondition(observation()["firstWriterElapsedMs"] == nil)
+        writer(["action": "begin", "filename": "/private/filename", "id": "private-transfer"])
+        precondition(observation()["firstWriterElapsedMs"] is Int)
+        writerReplies.removeFirst()(["ok": true, "result": ["transferId": "private-transfer"]])
+        writer(["action": "append", "sequence": 0, "data": "PRIVATE_BYTES"])
+        var events = observation()["events"] as! [[String: Any]]
+        precondition(events.last?["stage"] as? String == "writer_ingress" && events.last?["encodedBytes"] as? Int == 13)
+        writerReplies.removeFirst()(["ok": true, "result": ["bytesWritten": 9, "sequence": 1, "path": "/private/path"]])
+        events = observation()["events"] as! [[String: Any]]
+        precondition(events.last?["bytesWritten"] as? Int == 9 && events.last?["replySequence"] as? Int == 1)
+        for index in 0..<20 {
+            writer(["action": "append", "sequence": index, "data": "PRIVATE_BYTES"])
+            writerReplies.removeFirst()(["ok": false, "error": ["code": "PRIVATE_SECRET", "message": "private-message"]])
+        }
+        precondition((observation()["events"] as! [[String: Any]]).count == 32)
+        precondition((observation()["eventCount"] as! Int) > 32)
+        precondition((observation()["events"] as! [[String: Any]]).last?["errorCode"] as? String == "UNCLASSIFIED")
+        writer(["action": "finish", "sequence": 1, "expectedBytes": 9])
+        writerReplies.removeFirst()(["ok": true, "result": ["bytesWritten": 9, "path": "/private/final"]])
+        resolveObserved()
+        precondition((observation()["events"] as! [[String: Any]]).last?["stage"] as? String == "outer_end")
+        let encodedObservation = String(decoding: try! JSONSerialization.data(withJSONObject: observation()), as: UTF8.self)
+        for secret in ["private", "PRIVATE", profile, observedSession, observedRequest["id"] as! String] {
+            precondition(!encodedObservation.contains(secret), "Telemetry must contain only fixed stages and bounded counts")
+        }
+        observedRun(); writer(["action": "begin", "filename": "private-old"])
+        let lateReply = writerReplies.removeFirst()
+        observedBroker.cancelAgent(owner: "private-owner")
+        events = observation()["events"] as! [[String: Any]]
+        precondition(events.last?["stage"] as? String == "outer_cancel" && events.last?["errorCode"] as? String == "AGENT_OWNER_CHANGED")
+        observedRun("interact", args: ["downloadIntent": ["intentId": "private-intent"]])
+        let freshSequence = observation()["sequence"] as! Int
+        lateReply(["ok": true, "result": ["bytesWritten": 999]])
+        precondition(observation()["sequence"] as? Int == freshSequence && observation()["eventCount"] as? Int == 2,
+                     "A late writer callback must not overwrite a newer operation")
+        observedSession = UUID().uuidString; observedPoll()
+        precondition((observation()["events"] as! [[String: Any]]).last?["errorCode"] as? String == "BACKGROUND_CHANGED")
+        observedRun(); writer(["action": "abort", "transferId": "private-transfer"])
+        writerReplies.removeFirst()(["ok": true, "result": ["aborted": true]])
+        precondition((observation()["events"] as! [[String: Any]]).last?["action"] as? String == "abort")
+        resolveObserved()
+        if CommandLine.arguments.contains("--timeout-observation") {
+            observedRun()
+            let deadline = Date().addingTimeInterval(43)
+            while Date() < deadline && (observation()["events"] as! [[String: Any]]).last?["stage"] as? String != "outer_timeout" {
+                _ = RunLoop.current.run(mode: .default, before: Date().addingTimeInterval(0.1))
+            }
+            let timedOut = (observation()["events"] as! [[String: Any]]).last!
+            precondition(timedOut["stage"] as? String == "outer_timeout" && timedOut["errorCode"] as? String == "LIVE_TIMEOUT")
+            precondition(observation()["firstWriterElapsedMs"] == nil)
+            observedPoll()
+        }
+        observedRun(); observedBroker.close()
+        precondition((observation()["events"] as! [[String: Any]]).last?["errorCode"] as? String == "APP_CLOSED")
         print("Live native download and organization scope/cancellation checks passed")
     }
 }
