@@ -59,7 +59,13 @@
         // The actual anchor default is already cancelled. Original source and
         // destination policy runs before the first request or private file write.
         let href = captured.href;
-        if (["same-origin-policy", "cross-origin-policy"].includes(command.safari_download_intent.redirects)) {
+        if (captured.kind === "blob") {
+          // Match the original Blob download policy: it approves the current
+          // website origin, not a fabricated HTTP URL for the opaque Blob UUID.
+          const origin = new URL(href).origin;
+          await context.security.ensureDownloadAllowed(Number(command.tab_id), origin);
+          await context.security.ensureApprovedDownloadStillAllowed(Number(command.tab_id), origin);
+        } else if (["same-origin-policy", "cross-origin-policy", "tab-origin-policy"].includes(command.safari_download_intent.redirects)) {
           let ready = false;
           for (let request = 0; request < 5; request++) {
             await context.security.ensureDownloadAllowed(Number(command.tab_id), href);

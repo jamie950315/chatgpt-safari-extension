@@ -4,6 +4,10 @@
   "use strict";
   const maximumBytes = 32 * 1024 * 1024;
   const chunkBytes = 48 * 1024;
+  const realmTransfers = new Map();
+  const causalChannels = new Map();
+  const destinationRealm = typeof module === "object" && module.exports ? require("./download-realm-background.js") : root.ChatGPTSafariDownloadRealm;
+  const causalCapture = typeof module === "object" && module.exports ? require("./download-capture-main.js") : root.ChatGPTSafariDownloadCapture;
 
   function assetInventoryPageOperation(operation, args) {
     const fail = message => ({ ok: false, error: { code: "STALE_ASSET_INVENTORY", message } });
@@ -70,8 +74,8 @@
       summary: { byKind, inlineSvgCount: inlineSvgs.length, totalCount: assets.length } } };
   }
 
-  // Only an observed cancelable anchor default is diverted. This never
-  // wraps page APIs, resumes a native request, or manufactures a page gesture.
+  // The default route observes connected anchors. The explicit causal route
+  // pairs this exact isolated source event with a fixed MAIN-world interceptor.
   async function downloadIntentPageOperation(operation, args) {
     const fail = message => ({ ok: false, error: { code: "DOWNLOAD_INTENT_REJECTED", message } });
     const live = globalThis.__chatGPTSafariLiveDocument;
@@ -83,6 +87,7 @@
       && value.source.isConnected && Date.now() <= value.expires;
     const discard = value => {
       value.stop(); value.close?.(); value.abort?.(); clearTimeout(value.expiry);
+      value.source.removeAttribute?.("data-chatgpt-download-" + value.id);
       live.downloadIntents.delete(value.id);
     };
     if (operation === "cancel") {
@@ -102,7 +107,8 @@
       const source = live.nodes.get(args.node);
       if (!source?.isConnected || source.ownerDocument !== document) return fail("Download intents require a connected top-level source control.");
       const value = { id: args.intentId, scope: args.scope, source, documentId: live.documentId,
-        snapshotId: live.snapshotId, pageUrl: location.href, phase: "armed", expires: Date.now() + 90000 };
+        snapshotId: live.snapshotId, pageUrl: location.href, phase: "armed", expires: Date.now() + 90000, capture: args.capture };
+      if (args.capture === "causal") source.setAttribute("data-chatgpt-download-" + value.id, "");
       let timer, ended = false;
       const stop = () => { clearTimeout(timer); document.removeEventListener("click", clicked, true); };
       const closed = () => discard(value);
@@ -115,11 +121,12 @@
           // Prevent the source's own default form/navigation while preserving
           // its real handler, including a synchronous handler's anchor.click().
           if (event.cancelable) event.preventDefault();
-          timer = setTimeout(() => {
+          if (value.capture !== "causal") timer = setTimeout(() => {
             ended = true; stop();
             if (value.phase === "armed") value.error = "The delivered click produced no synchronous cancelable HTTP(S) download anchor. Location/form, detached-anchor and later-task downloads are unsupported; do not replay the click.";
           }, 0);
         }
+        if (value.capture === "causal") return;
         const anchor = path.find(node => node?.tagName === "A" && node.hasAttribute("download"));
         if (!anchor || !value.gesture || value.gesture.eventPhase === 0 || !navigator.userActivation?.isActive) return;
         if (event.cancelable) event.preventDefault();
@@ -142,10 +149,48 @@
       return { ok: true, result: { armed: true, intentId: value.id } };
     }
     if (!current(item)) { if (item?.scope === args.scope) discard(item); return fail("The download intent no longer belongs to its exact source document, snapshot, control and original sidebar scope."); }
+    if (operation === "marker_clear") {
+      item.source.removeAttribute("data-chatgpt-download-" + item.id);
+      return { ok: true, result: { cleared: true } };
+    }
+    if (operation === "lease_check") {
+      if (item.error || item.href !== args.href || !["captured", "redirect-pending", "realm-requesting", "headers-ready"].includes(item.phase)) return fail("The exact source download lease changed before destination transport.");
+      return { ok: true, result: { current: true } };
+    }
+    if (operation === "causal_check" || operation === "causal_adopt") {
+      if (item.capture !== "causal" || !item.gesture || item.gesture.eventPhase !== 0 || item.error) return fail("No exact completed trusted source event belongs to this causal operation.");
+      if (operation === "causal_check") return { ok: true, result: { current: true } };
+      if (item.phase !== "armed" || !["http", "blob"].includes(args.kind) || typeof args.href !== "string") return fail("Only one fresh causal download can be adopted.");
+      const href = new URL(args.href), source = new URL(item.pageUrl);
+      if (href.username || href.password || (args.kind === "blob" ? href.protocol !== "blob:" || href.origin !== source.origin : !["http:", "https:"].includes(href.protocol))) return fail("The causal download URL has an invalid source identity.");
+      item.href = href.href; item.filename = args.filename; item.kind = args.kind; item.phase = "captured"; item.stop();
+      return { ok: true, result: { intentId: item.id, href: item.href, kind: item.kind, filename: item.filename } };
+    }
+    if (operation === "realm_reserve") {
+      const href = new URL(args.href);
+      if (args.redirectPolicy !== "tab-origin-policy" || !["captured", "redirect-pending"].includes(item.phase)
+        || href.href !== item.href || !["http:", "https:"].includes(href.protocol) || href.username || href.password
+        || !/^[a-f0-9-]{36}$/i.test(args.nonce || "")) return fail("Only the exact approved URL may reserve one destination-document request.");
+      item.visited ||= new Set(); item.requestCount ||= 0; item.activeMs ||= 0;
+      if (item.visited.has(href.href) || item.requestCount >= 5 || item.activeMs >= 30000) return fail("The destination-document route exhausted its request, cycle or active-transfer bound.");
+      item.visited.add(href.href); item.requestCount++; item.redirectPolicy = args.redirectPolicy; item.phase = "realm-requesting"; item.nonce = args.nonce;
+      return { ok: true, result: { remainingMs: 30000 - item.activeMs } };
+    }
+    if (operation === "realm_response") {
+      if (item.phase !== "realm-requesting" || item.nonce !== args.nonce || item.href !== args.href
+        || !Number.isFinite(args.elapsedMs) || args.elapsedMs < 0) return fail("The destination response no longer belongs to its original source operation.");
+      item.activeMs += args.elapsedMs;
+      if (item.activeMs >= 30000) return fail("The destination response exhausted its active-transfer budget.");
+      item.phase = args.kind === "redirect" ? "redirect-proof" : "response-proof";
+      // The actual Response belongs to the independently bound destination
+      // document, never to this source document or a fabricated source alias.
+      item.realmResponse = args.kind === "response" ? { url: args.href, status: args.status } : null;
+      return { ok: true, result: { current: true } };
+    }
     if (operation === "redirect_fetch") {
       const source = new URL(item.pageUrl), href = new URL(args.href);
       const crossOriginPolicy = args.redirectPolicy === "cross-origin-policy";
-      if (!["same-origin-policy", "cross-origin-policy"].includes(args.redirectPolicy)
+      if (!["same-origin-policy", "cross-origin-policy", "tab-origin-policy"].includes(args.redirectPolicy)
         || item.redirectPolicy && item.redirectPolicy !== args.redirectPolicy
         || !["captured", "redirect-pending"].includes(item.phase) || item.href !== href.href || !crossOriginPolicy && href.origin !== source.origin
         || !["http:", "https:"].includes(href.protocol) || href.username || href.password
@@ -180,13 +225,13 @@
       if (item.nonce !== args.nonce || item.href !== args.href || item.redirectPolicy !== args.redirectPolicy) return fail("This header receipt belongs to a different exact hop.");
       if (args.kind === "redirect" && item.phase === "redirect-proof") {
         const next = new URL(args.nextHref), source = new URL(item.pageUrl); next.hash = "";
-        if (args.redirectPolicy !== "cross-origin-policy" && next.origin !== source.origin || next.username || next.password || !["http:", "https:"].includes(next.protocol)) return fail("A cross-origin redirect was rejected before contacting its destination.");
+        if (args.redirectPolicy === "same-origin-policy" && next.origin !== source.origin || next.username || next.password || !["http:", "https:"].includes(next.protocol)) return fail("A cross-origin redirect was rejected before contacting its destination.");
         if (item.visited.has(next.href) || item.requestCount >= 5) return fail("The redirect repeated a URL or exceeded the five-request bound. No next request was sent.");
         item.href = next.href; item.phase = "redirect-pending"; item.nonce = null;
         return { ok: true, result: { kind: "redirect", href: next.href } };
       }
-      if (args.kind !== "response" || item.phase !== "response-proof" || item.response?.status !== args.status
-        || item.response.url !== item.href) return fail("The observed native headers did not match this exact page response.");
+      if (args.kind !== "response" || item.phase !== "response-proof" || (item.response || item.realmResponse)?.status !== args.status
+        || (item.response || item.realmResponse).url !== item.href) return fail("The observed native headers did not match this exact page response.");
       item.phase = "headers-ready"; item.nonce = null;
       return { ok: true, result: { kind: "ready", href: item.href } };
     }
@@ -258,7 +303,7 @@
     if (operation === "inspect") return { ok: true, result: { href: source, url: location.href } };
     if (operation === "start") {
       if (typeof args.transferId !== "string" || state.has(args.transferId)) return failure("INVALID_DOWNLOAD", "A fresh download transfer is required.");
-      const prepared = ["same-origin-policy", "cross-origin-policy"].includes(args.redirectPolicy);
+      const prepared = ["same-origin-policy", "cross-origin-policy", "tab-origin-policy"].includes(args.redirectPolicy);
       if (args.intentId && (!intentCurrent() || intent.phase !== (prepared ? "headers-ready" : "captured"))) return failure("DOWNLOAD_INTENT_USED", "This exact captured intent was already consumed or cancelled; no request was repeated.");
       if (prepared && (!intent?.response || intent.response.url !== source || intent.transferDeadline <= Date.now())) return failure("DOWNLOAD_HEADERS_EXPIRED", "The approved exact response expired before body transfer; it was not requested again.");
       if (intent) intent.phase = "transferring";
@@ -577,7 +622,7 @@
         if (locations.length !== 1 || typeof locations[0].value !== "string" || !locations[0].value.trim()) { fail(); return; }
         let next; try { next = new URL(locations[0].value, href); } catch { fail(); return; }
         next.hash = "";
-        if (redirectPolicy !== "cross-origin-policy" && next.origin !== destination.origin || next.username || next.password || !["http:", "https:"].includes(next.protocol)) {
+        if (redirectPolicy === "same-origin-policy" && next.origin !== destination.origin || next.username || next.password || !["http:", "https:"].includes(next.protocol)) {
           failure = new Error("The observed redirect leaves its approved same origin. Its next destination was not contacted.");
           if (!settled) { settled = true; reject(failure); } return;
         }
@@ -596,14 +641,75 @@
     return { promise, cleanup, assertCurrent() { if (failure) throw failure; } };
   }
 
-  function createDownloads({ api, target, send, profileId, sessionId, assertTime, unwrap }) {
+  function createDownloads({ api, target, send, profileId, sessionId, assertTime, unwrap, authorizeIntent }) {
+    const main = async (tab, operation, args) => {
+      const identity = JSON.stringify([tab.id, args.documentId]);
+      let channelKey = causalChannels.get(identity), freshChannel = false;
+      if (!channelKey && operation === "arm") {
+        channelKey = "__chatGPTSafariCausal_" + root.crypto.randomUUID().replace(/-/g, "");
+        causalChannels.set(identity, channelKey); freshChannel = true;
+        // Retain only the current document's facade for each tab.
+        for (const key of causalChannels.keys()) if (key !== identity && JSON.parse(key)[0] === tab.id) causalChannels.delete(key);
+      }
+      const [value] = await api.scripting.executeScript({ target: { tabId: tab.id, frameIds: [0] }, world: "MAIN", func: causalCapture.operation,
+        args: [operation, { channelKey, freshChannel, intentId: args.intentId, expectedUrl: args.expectedUrl, wait_ms: args.wait_ms, href: args.href }] });
+      return unwrap(value?.result);
+    };
+    const causalCheck = async (tab, args) => {
+      await authorizeIntent?.();
+      if (args.capture !== "causal") return;
+      await target(args.handle, args.expectedUrl);
+      await intent(tab, "causal_check", args);
+      const state = await main(tab, "check", args);
+      if (!state.ready || (args.capturedHref || args.href) && state.href !== (args.capturedHref || args.href)) throw new Error("The causal download changed or is no longer ready; no request was repeated.");
+    };
     async function page(tab, operation, args) {
+      if (operation !== "cancel") await causalCheck(tab, args);
       const [value] = await api.scripting.executeScript({ target: { tabId: tab.id, frameIds: [0] }, func: downloadPageOperation, args: [operation, args] });
       return unwrap(value?.result);
     }
     async function intent(tab, operation, args) {
       const [value] = await api.scripting.executeScript({ target: { tabId: tab.id, frameIds: [0] }, world: "ISOLATED", func: downloadIntentPageOperation, args: [operation, args] });
       return unwrap(value?.result);
+    }
+    async function realm(entry, operation, extra = {}) {
+      if (operation !== "cancel") await target(entry.binding.handle, entry.binding.expectedUrl);
+      const [value] = await api.scripting.executeScript({ target: { tabId: entry.tab.id, frameIds: [0] }, world: "ISOLATED",
+        func: destinationRealm.realmPageOperation, args: [operation, { ...entry.binding, ...extra }] });
+      return unwrap(value?.result);
+    }
+    async function cancelRealm(args) {
+      const entry = realmTransfers.get(args.intentId);
+      if (!entry || entry.binding.scope !== args.scope) return;
+      realmTransfers.delete(args.intentId);
+      await realm(entry, "cancel").catch(() => {});
+    }
+    async function sourceCheck(tab, args) {
+      await authorizeIntent?.();
+      assertTime(); await target(args.handle, args.expectedUrl); await causalCheck(tab, args);
+      await intent(tab, "lease_check", args);
+    }
+    async function realmRedirectStep(tab, args) {
+      await sourceCheck(tab, args);
+      const matches = args.transportDocuments?.filter(document => new URL(document.expectedUrl).origin === new URL(args.href).origin) || [];
+      if (matches.length !== 1) throw new Error("This destination requires one explicitly supplied, already-claimed ordinary Safari document of its own origin. No carrier tab or fallback request was created.");
+      const binding = { ...matches[0], intentId: args.intentId, scope: args.scope, href: args.href };
+      const entry = { tab: { id: binding.tabId }, binding }, nonce = root.crypto.randomUUID();
+      await cancelRealm(args);
+      const observer = observeRedirectHeaders(api, entry.tab, args.href, nonce, args.redirectPolicy);
+      try {
+        await realm(entry, "arm"); realmTransfers.set(args.intentId, entry);
+        const budget = await intent(tab, "realm_reserve", { ...args, nonce });
+        await sourceCheck(tab, args);
+        const [response, receipt] = await Promise.all([realm(entry, "fetch", { nonce, remainingMs: Math.floor(budget.remainingMs) }), observer.promise]);
+        observer.assertCurrent(); await target(args.handle, args.expectedUrl); await causalCheck(tab, args); await realm(entry, "check");
+        if (response.kind !== receipt.kind || response.kind === "response" && (response.status !== receipt.status || response.url !== args.href)) throw new Error("The destination document response did not match its exact native nonce/request/document receipt.");
+        await intent(tab, "realm_response", { ...args, nonce, kind: response.kind, elapsedMs: response.elapsedMs, status: response.status });
+        const result = await intent(tab, "redirect_bind", { ...args, nonce, kind: receipt.kind, nextHref: receipt.href, status: receipt.status });
+        if (result.kind === "redirect") await cancelRealm(args);
+        return result;
+      } catch (error) { await cancelRealm(args); await intent(tab, "cancel", args).catch(() => {}); throw error; }
+      finally { observer.cleanup(); }
     }
     async function inventory(tab, operation, args) {
       const [value] = await api.scripting.executeScript({ target: { tabId: tab.id, frameIds: [0] }, func: assetInventoryPageOperation, args: [operation, args] });
@@ -744,10 +850,12 @@
     }
     async function redirectStep(tab, args) {
       assertTime(); await target(args.handle, args.expectedUrl);
+      await causalCheck(tab, args);
       const source = new URL(args.expectedUrl), destination = new URL(args.href);
-      if (!["same-origin-policy", "cross-origin-policy"].includes(args.redirectPolicy)
+      if (!["same-origin-policy", "cross-origin-policy", "tab-origin-policy"].includes(args.redirectPolicy)
         || !["http:", "https:"].includes(destination.protocol) || destination.username || destination.password
         || args.redirectPolicy === "same-origin-policy" && source.origin !== destination.origin) throw new Error("This explicit redirect route requires an exact HTTP(S) URL allowed by its selected policy.");
+      if (args.redirectPolicy === "tab-origin-policy" && source.origin !== destination.origin) return realmRedirectStep(tab, args);
       const nonce = root.crypto.randomUUID(), observer = observeRedirectHeaders(api, tab, destination.href, nonce, args.redirectPolicy);
       try {
         const [response, receipt] = await Promise.all([intent(tab, "redirect_fetch", { ...args, nonce }), observer.promise]);
@@ -757,13 +865,87 @@
       } catch (error) { await intent(tab, "cancel", args).catch(() => {}); throw error; }
       finally { observer.cleanup(); }
     }
-    return { inspect, execute, listAssets, inspectAssets, bundle, redirectStep,
-      armIntent: (tab, args) => intent(tab, "arm", args),
-      readIntent: (tab, args) => intent(tab, "read", args),
-      cancelIntent: (tab, args) => intent(tab, "cancel", args),
+    async function cancelIntent(tab, args) {
+      await cancelRealm(args);
+      if (args.capture === "causal") await main(tab, "cancel", args).catch(() => {});
+      return intent(tab, "cancel", args);
+    }
+    async function armIntent(tab, args) {
+      const result = await intent(tab, "arm", args);
+      if (args.capture !== "causal") return result;
+      try { await main(tab, "arm", args); await intent(tab, "marker_clear", args); return result; }
+      catch (error) { await cancelIntent(tab, args).catch(() => {}); throw error; }
+    }
+    async function readIntent(tab, args) {
+      if (args.capture !== "causal") return intent(tab, "read", args);
+      const deadline = Date.now() + args.wait_ms;
+      for (;;) {
+        assertTime(); await target(args.handle, args.expectedUrl); await intent(tab, "causal_check", args);
+        const state = await main(tab, "poll", args);
+        if (state.ready) return intent(tab, "causal_adopt", { ...args, href: state.href, kind: state.kind, filename: state.filename });
+        if (Date.now() >= deadline) throw new Error("File preparation exceeded its bounded wait. The delivered click was not repeated.");
+        await new Promise(resolve => setTimeout(resolve, 80));
+      }
+    }
+    async function executeBlob(request, tab, args) {
+      let nativeID, sequence = 0, bytes = 0;
+      const write = async input => {
+        assertTime(); await causalCheck(tab, args);
+        return unwrap(await send({ action: "liveDownload", id: request.id, profileId, sessionId, input }));
+      };
+      try {
+        await causalCheck(tab, args);
+        const metadata = await main(tab, "start", args);
+        const opened = await write({ action: "begin", filename: metadata.filename }); nativeID = opened.transferId;
+        for (;;) {
+          assertTime(); await causalCheck(tab, args);
+          const chunk = await main(tab, "read", args);
+          if (chunk.done) {
+            if (chunk.bytes !== bytes || bytes !== metadata.bytes) throw new Error("The causal Blob byte count changed before completion.");
+            const saved = await write({ action: "finish", transferId: nativeID, sequence, expectedBytes: bytes }); nativeID = undefined;
+            return { ...saved, mime: metadata.mime };
+          }
+          if (!Number.isInteger(chunk.bytes) || chunk.bytes < 1 || chunk.bytes > chunkBytes || bytes + chunk.bytes > maximumBytes) throw new Error("The causal Blob exceeded its bounded transfer size.");
+          const result = await write({ action: "append", transferId: nativeID, sequence, data: chunk.data }); bytes += chunk.bytes; sequence++;
+          if (result.bytesWritten !== bytes || result.sequence !== sequence) throw new Error("The writer did not confirm the exact causal Blob bytes.");
+        }
+      } finally {
+        if (nativeID) await send({ action: "liveDownload", id: request.id, profileId, sessionId, input: { action: "abort", transferId: nativeID } }).catch(() => {});
+      }
+    }
+    async function executeRealm(request, tab, args) {
+      const entry = realmTransfers.get(args.intentId);
+      if (!entry || entry.binding.scope !== args.scope || entry.binding.href !== args.href) throw new Error("No exact approved destination-document response remains. It was not requested again.");
+      let nativeID, sequence = 0, bytes = 0;
+      const check = async () => { await sourceCheck(tab, args); await realm(entry, "check"); };
+      const write = async input => { await check(); return unwrap(await send({ action: "liveDownload", id: request.id, profileId, sessionId, input })); };
+      try {
+        await check(); const metadata = await realm(entry, "metadata");
+        const opened = await write({ action: "begin", filename: metadata.filename }); nativeID = opened.transferId;
+        for (;;) {
+          await check(); const chunk = await realm(entry, "read");
+          if (chunk.done) {
+            if (chunk.bytes !== bytes) throw new Error("The destination response byte count changed before completion.");
+            const saved = await write({ action: "finish", transferId: nativeID, sequence, expectedBytes: bytes }); nativeID = undefined;
+            return { ...saved, mime: metadata.mime };
+          }
+          if (!Number.isInteger(chunk.bytes) || chunk.bytes < 1 || chunk.bytes > chunkBytes || bytes + chunk.bytes > maximumBytes) throw new Error("The destination response exceeded its bounded transfer size.");
+          const result = await write({ action: "append", transferId: nativeID, sequence, data: chunk.data }); bytes += chunk.bytes; sequence++;
+          if (result.bytesWritten !== bytes || result.sequence !== sequence) throw new Error("The writer did not confirm the destination response's exact bytes.");
+        }
+      } finally {
+        await cancelRealm(args);
+        if (nativeID) await send({ action: "liveDownload", id: request.id, profileId, sessionId, input: { action: "abort", transferId: nativeID } }).catch(() => {});
+      }
+    }
+    return { inspect, execute, listAssets, inspectAssets, bundle, redirectStep, armIntent, readIntent, cancelIntent, cancelTransport: cancelRealm,
       async executeIntent(request, tab, args) {
-        try { return await execute(request, tab, args); }
-        finally { await intent(tab, "cancel", args).catch(() => {}); }
+        try {
+          if (args.capture === "causal" && new URL(args.href).protocol === "blob:") return await executeBlob(request, tab, args);
+          if (args.redirectPolicy === "tab-origin-policy" && new URL(args.href).origin !== new URL(args.expectedUrl).origin) return await executeRealm(request, tab, args);
+          return await execute(request, tab, args);
+        }
+        finally { await cancelIntent(tab, args).catch(() => {}); }
       } };
   }
   const bridge = Object.freeze({ createDownloads, createExports, downloadPageOperation, downloadIntentPageOperation, observeRedirectHeaders, contentExportPageOperation, youtubeTranscriptPageOperation, formatYouTubeTranscript, assetInventoryPageOperation, maximumBytes, chunkBytes });

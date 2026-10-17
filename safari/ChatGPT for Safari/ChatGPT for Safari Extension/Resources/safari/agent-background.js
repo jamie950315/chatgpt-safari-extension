@@ -118,9 +118,15 @@
         const fullScope = { ...agentScope, accountScope: owner.accountScope };
         if (command.type === "safari_download_capture") {
           const options = command.safari_download_intent;
-          if (!options || typeof options !== "object" || Array.isArray(options) || Object.keys(options).some(name => !["timeout_ms", "redirects"].includes(name))
+          if (!options || typeof options !== "object" || Array.isArray(options) || Object.keys(options).some(name => !["timeout_ms", "redirects", "capture", "wait_ms", "transportTabs"].includes(name))
             || !Number.isInteger(options.timeout_ms) || options.timeout_ms < 1 || options.timeout_ms > 3000
-            || options.redirects !== undefined && !["same-origin-policy", "cross-origin-policy"].includes(options.redirects)
+            || options.capture !== undefined && options.capture !== "causal"
+            || options.capture === "causal" && (!Number.isInteger(options.wait_ms) || options.wait_ms < 1 || options.wait_ms > 15000)
+            || options.capture !== "causal" && options.wait_ms !== undefined
+            || options.redirects !== undefined && !["same-origin-policy", "cross-origin-policy", "tab-origin-policy"].includes(options.redirects)
+            || options.redirects === "tab-origin-policy" && (!Array.isArray(options.transportTabs) || options.transportTabs.length < 1 || options.transportTabs.length > 4
+              || new Set(options.transportTabs).size !== options.transportTabs.length || options.transportTabs.some(id => typeof id !== "string" || !/^[1-9]\d*$/.test(id) || !Number.isSafeInteger(Number(id)) || id === command.tab_id))
+            || options.redirects !== "tab-origin-policy" && options.transportTabs !== undefined
             || typeof command.selector !== "string" || !command.selector || command.safari_native_modal !== undefined
             || command.force === true || command.button && command.button !== "left" || command.modifiers?.length) {
             throw new Error("A captured download requires one plain top-level locator click and a 1–3000ms intent observation deadline");
@@ -129,21 +135,41 @@
           if ([...downloadIntents.values()].some(item => item.key === key)) throw new Error("A captured download is already active for this tab and original turn");
           const target = await query("safari_locator_prepare");
           if (target.frameId || target.framePath?.length) throw new Error("Captured download controls must be in the top-level document, not an iframe");
+          const transportDocuments = [];
+          for (const id of options.transportTabs || []) {
+            await session.requireOwnedTab(Number(id));
+            const destinationHandle = `live:${owner.profileId}:${id}`;
+            const page = await companion.runAgentCommand({ action: "read_page", arguments: { handle: destinationHandle, maxLength: 1000 } }, owner);
+            if (!page.documentId || !page.snapshotId || !/^https?:\/\//i.test(page.url || "") || page.profileId !== owner.profileId) throw new Error("Each destination transport needs an existing claimed ordinary document in the same Safari profile.");
+            if (transportDocuments.some(value => new URL(value.expectedUrl).origin === new URL(page.url).origin)) throw new Error("More than one supplied transport document has the same origin; no source click was delivered.");
+            transportDocuments.push({ tabId: Number(id), handle: destinationHandle, documentId: page.documentId, snapshotId: page.snapshotId, expectedUrl: page.url });
+          }
           const intentId = root.crypto.randomUUID(), binding = { documentId: target.documentId, snapshotId: target.snapshotId,
             node: target.node, expectedUrl: target.url, intentId, scope, agentScope: fullScope,
+            ...(options.capture === "causal" ? { capture: "causal", wait_ms: options.wait_ms } : {}),
+            ...(transportDocuments.length ? { transportDocuments } : {}),
             ...(options.redirects ? { redirectPolicy: options.redirects } : {}) };
           const record = { key, owner: owner.instanceId, tabId, binding, phase: "armed" };
+          record.assertCurrent = async () => {
+            await authorize(session, metadata); await session.requireOwnedTab(tabId);
+            for (const document of transportDocuments) await session.requireOwnedTab(document.tabId);
+            if (downloadIntents.get(intentId) !== record) throw new Error("The original download operation was cancelled or released.");
+          };
           downloadIntents.set(intentId, record);
           try {
             const result = await run("interact", { documentId: target.documentId, snapshotId: target.snapshotId,
               interactions: [{ type: "click", node: target.node, button: "left", clickCount: 1, modifiers: [] }],
-              agentScope: fullScope, downloadIntent: { intentId, scope, timeout_ms: options.timeout_ms } });
+              agentScope: fullScope, downloadIntent: { intentId, scope, timeout_ms: options.timeout_ms,
+                ...(options.capture === "causal" ? { capture: "causal", wait_ms: options.wait_ms } : {}) } });
             await authorize(session, metadata); await session.requireOwnedTab(tabId);
             const captured = result.downloadIntent;
             if (downloadIntents.get(intentId) !== record || record.phase !== "armed" || captured?.intentId !== intentId
-              || typeof captured.href !== "string" || !/^https?:\/\//i.test(captured.href)) throw new Error("The delivered click has no current exact-source captured download intent. Do not replay it");
+              || typeof captured.href !== "string" || !(options.capture === "causal" && captured.kind === "blob"
+                ? new URL(captured.href).protocol === "blob:" && new URL(captured.href).origin === new URL(target.url).origin
+                : /^https?:\/\//i.test(captured.href))) throw new Error("The delivered click has no current exact-source captured download intent. Do not replay it");
             record.href = captured.href; record.phase = "captured";
-            return { intentId, href: captured.href };
+            if (options.capture === "causal") { record.binding.capturedHref = captured.href; record.kind = captured.kind; }
+            return { intentId, href: captured.href, ...(record.kind ? { kind: record.kind } : {}) };
           } catch (error) {
             downloadIntents.delete(intentId);
             await root.ChatGPTSafariLive?.releaseDownloadIntent?.(tabId, binding).catch(() => {});
@@ -156,8 +182,9 @@
           downloadIntents.delete(command.intentId);
           await root.ChatGPTSafariLive?.releaseDownloadIntent?.(tabId, record.binding).catch(() => {}); return {};
         }
+        for (const document of record.binding.transportDocuments || []) await session.requireOwnedTab(document.tabId);
         if (command.type === "safari_download_redirect_step") {
-          if (!["same-origin-policy", "cross-origin-policy"].includes(record.binding.redirectPolicy) || !["captured", "redirect"].includes(record.phase) || command.href !== record.href) throw new Error("Approve the exact pending redirect URL before issuing its one policy-gated request");
+          if (!["same-origin-policy", "cross-origin-policy", "tab-origin-policy"].includes(record.binding.redirectPolicy) || !["captured", "redirect"].includes(record.phase) || command.href !== record.href) throw new Error("Approve the exact pending redirect URL before issuing its one policy-gated request");
           record.phase = "requesting";
           try {
             const result = await run("download_intent_redirect", { ...record.binding, href: record.href });
@@ -172,7 +199,7 @@
             await root.ChatGPTSafariLive?.releaseDownloadIntent?.(tabId, record.binding).catch(() => {}); throw error;
           }
         }
-        if (record.phase !== (record.binding.redirectPolicy ? "ready" : "captured") || command.href !== record.href) throw new Error("Approve the exact captured download destination once before transferring; it cannot be replayed");
+        if (record.phase !== (record.binding.redirectPolicy && record.kind !== "blob" ? "ready" : "captured") || command.href !== record.href) throw new Error("Approve the exact captured download destination once before transferring; it cannot be replayed");
         record.phase = "transferring";
         try {
           const result = await run("download_intent_transfer", { ...record.binding, href: record.href });
@@ -573,7 +600,13 @@
       await Promise.all([...sessions].map(session => release(session)));
       clipboards.clear(); snapshots.clear();
     }
-    return { execute, authorize, release, invalidateAll, supported };
+    async function assertDownloadIntent(args) {
+      const record = downloadIntents.get(args.intentId);
+      if (!record || record.binding.scope !== args.scope || record.binding.documentId !== args.documentId
+        || record.binding.snapshotId !== args.snapshotId || record.binding.expectedUrl !== args.expectedUrl) throw new Error("The download lost its original session, claim or source binding.");
+      await record.assertCurrent();
+    }
+    return { execute, authorize, release, invalidateAll, supported, assertDownloadIntent };
   }
   if (typeof module === "object" && module.exports) module.exports = { createAgent, supported };
   const api = root.browser || root.chrome;

@@ -236,7 +236,7 @@ resume extension JavaScript while Safari's native modal blocks its event loop.
 
 NATIVE_DOWNLOAD_DOCUMENTATION = """# Safari Tab Capability: nativeDownloads
 Use `await (await tab.capabilities.get('nativeDownloads')).run({selector,
-timeout_ms?, redirects?})` for a known top-level control whose real click synchronously
+timeout_ms?, redirects?, capture?, wait_ms?, transportTabs?})` for a known top-level control whose real click synchronously
 clicks a connected `a[download]` HTTP(S) anchor. A direct download anchor also
 qualifies. This is a bounded anchor-intent transfer, not a native request waiter.
 
@@ -251,8 +251,8 @@ control, not an arbitrary action whose other effects should be suppressed.
 
 The result contains `state: 'complete'`, `path`, `bytesWritten` and response MIME
 only after actual operation-bound writing finishes in Downloads. Existing page
-cookies remain in ordinary Safari. Cross-origin destinations require their real
-credentialed CORS support. Transfer limits remain 32 MiB and 30 seconds.
+cookies remain in ordinary Safari. The default and cross-origin-policy routes
+require real credentialed CORS for cross-origin destinations. Transfer limits remain 32 MiB and 30 seconds.
 `timeout_ms` bounds post-click intent observation (default 1000, maximum 3000),
 not consent time. Captured receipts expire after 90 seconds and are single-use.
 
@@ -278,8 +278,51 @@ The same-origin server must accept this header; no alternate request or retry
 is attempted. The 30-second active network/body budget excludes approvals while
 no request is active. Missing or mismatched header observations fail closed.
 
-Location assignment, forms, detached anchors, later-task downloads, cross-origin
-frames, blob/data URLs and unobservable/noncancelable responses are unsupported
+For a destination that does not allow CORS, a conditional route is available:
+`redirects: 'tab-origin-policy', transportTabs: ['claimed-destination-tab-id']`.
+First claim the already-existing ordinary Safari destination tab through the
+original browser-user flow. Supply one tab per destination origin (maximum 4),
+not the source tab. The bridge binds each current destination document separately.
+After each exact URL approval, Safari fetches within that URL's own origin using
+its own HTTP-only login. No Cookie or Authorization is copied. Native request
+proof identifies the actual transport tab/document, not the original source.
+Both source and destination leases must remain current through native writing.
+A missing or ambiguous origin document, navigation, claim release or cancellation
+stops the operation. It never opens a carrier page, navigates a destination tab,
+retries a CORS failure or follows a redirect without the next full-URL approval.
+This route requires an existing authorized HTML document at each destination;
+it does not provide arbitrary-origin non-CORS downloads.
+
+For detached anchors and callback-based delayed exports, explicitly set
+`capture: 'causal'` and optionally `wait_ms` (default 10000, maximum 15000).
+The fixed page-realm interceptor follows only the exact native source dispatch
+and its instrumented explicit Promise.then/catch/finally, setTimeout and
+queueMicrotask callbacks. It takes over detached or connected a[download].click() calls before any
+anchor listener or default action can issue a request. The source control
+handler still runs, but extra click listeners on the programmatic anchor do
+not run in this explicit mode. Use it only when the export URL is prepared
+before calling anchor.click(). It waits for the tracked callback tree to
+finish; multiple anchors fail instead of selecting the first or newest file.
+Preparation time is separate from the 30-second active transfer budget. The
+interceptor is removed on completion, cancellation, expiry or navigation.
+Cancellation also retires the pending instrumented export callbacks and timers;
+unrelated page callbacks are not stopped.
+
+This option also supports a Blob created through URL.createObjectURL within
+that exact causal chain. It retains the actual Blob even if the page immediately
+revokes its URL; no Blob bytes are read before the original website-origin
+approval. Only the native writer can report a completed file and path.
+
+Native async/await continuations, pre-cached uninstrumented functions, workers,
+event-listener or interval continuations, and blobs created before the operation
+have no supported causal attribution. They may trigger an ordinary Safari
+native download, but it is never adopted or reported as a Work completion.
+Do not use causal capture when such a path is known. It does not rewrite site
+code, patch the selector helper, manufacture user activation, or replay input.
+
+Without capture: 'causal', detached anchors, later-task downloads and Blob URLs
+remain unsupported as before. Location assignment, forms, cross-origin
+frames, data URLs and unobservable/noncancelable responses are unsupported
 and do not produce a completion path. After any uncertain delivered
 click, inspect the page and never repeat that click automatically. The generic
 `waitForEvent('download')` is not advertised as supported in Safari.
@@ -290,11 +333,11 @@ def native_download_sdk(base: str, click: str, define: str) -> str:
     return f'''class SafariNativeDownloadsCapability extends {base}{{
 constructor({{browserId,documentation,info,tabId,transport}}){{super(transport,browserId,tabId,documentation,info)}}
 async run(options){{
-if(!options||typeof options!=="object"||Array.isArray(options)||Object.keys(options).some(key=>!["selector","timeout_ms","redirects"].includes(key))||typeof options.selector!=="string"||!options.selector||!Number.isInteger(options.timeout_ms??1000)||(options.timeout_ms??1000)<1||(options.timeout_ms??1000)>3000||options.redirects!==undefined&&!["same-origin-policy","cross-origin-policy"].includes(options.redirects))throw new Error("Specify one known download-control selector, a 1–3000ms intent deadline, and optional same-origin-policy or cross-origin-policy redirects");
-return this.transport.send({{command:{click}({{browser_id:this.browserId,tab_id:this.tabId,selector:options.selector,safari_download_intent:{{timeout_ms:options.timeout_ms??1000,...options.redirects===undefined?{{}}:{{redirects:options.redirects}}}}}}),timeoutMs:120000}})
+if(!options||typeof options!=="object"||Array.isArray(options)||Object.keys(options).some(key=>!["selector","timeout_ms","redirects","capture","wait_ms","transportTabs"].includes(key))||typeof options.selector!=="string"||!options.selector||!Number.isInteger(options.timeout_ms??1000)||(options.timeout_ms??1000)<1||(options.timeout_ms??1000)>3000||options.redirects!==undefined&&!["same-origin-policy","cross-origin-policy","tab-origin-policy"].includes(options.redirects)||options.capture!==undefined&&options.capture!=="causal"||options.capture==="causal"&&(!Number.isInteger(options.wait_ms??10000)||(options.wait_ms??10000)<1||(options.wait_ms??10000)>15000)||options.capture!=="causal"&&options.wait_ms!==undefined||options.redirects==="tab-origin-policy"&&(!Array.isArray(options.transportTabs)||options.transportTabs.length<1||options.transportTabs.length>4||new Set(options.transportTabs).size!==options.transportTabs.length||options.transportTabs.some(id=>typeof id!=="string"||!/^[1-9][0-9]*$/.test(id)||id===this.tabId))||options.redirects!=="tab-origin-policy"&&options.transportTabs!==undefined)throw new Error("Specify one known download-control selector and its documented capture, deadline and redirect options");
+return this.transport.send({{command:{click}({{browser_id:this.browserId,tab_id:this.tabId,selector:options.selector,safari_download_intent:{{timeout_ms:options.timeout_ms??1000,...options.redirects===undefined?{{}}:{{redirects:options.redirects}},...options.capture==="causal"?{{capture:"causal",wait_ms:options.wait_ms??10000}}:{{}},...options.transportTabs===undefined?{{}}:{{transportTabs:options.transportTabs}}}}}}),timeoutMs:120000}})
 }}
 }}
-var SafariNativeDownloadsDefinition={define}({{capability:SafariNativeDownloadsCapability,info:{{id:"nativeDownloads",description:"Capture one synchronous connected HTTP(S) anchor intent from a known native-clicked download control; approve its actual destination before ordinary-profile transfer. Read documentation first."}}}});
+var SafariNativeDownloadsDefinition={define}({{capability:SafariNativeDownloadsCapability,info:{{id:"nativeDownloads",description:"Capture a known download control once; optional causal mode supports detached HTTP and callback-based delayed or Blob exports. Approve before transfer. Read documentation first."}}}});
 '''
 
 
@@ -479,7 +522,7 @@ def prepare_background(source: str) -> str:
     source = replace_once(source, 'browser:[Go.info,...await this.browserManagementEnabled?[Mo.info]:[]]',
                           'browser:[{...Go.info,description:"Set exact measured CSS dimensions by resizing the real ordinary Safari window. Native focus, screen and minimum-size limits apply. Read Safari-specific documentation and reset before finishing."},...await this.browserManagementEnabled?[{...Mo.info,description:"Organize ordinary Safari tabs and native named tab groups. Read Safari-specific documentation first."}]:[]]')
     source = replace_once(source, 'tab:[y_,...await this.webMcpConfig?.enabled()?[Ao]:[]]',
-                          'tab:[y_,{id:"nativeDialogs",description:"Respond to one exact expected native JavaScript dialog within its opening click. Read documentation first."},{id:"nativeUploads",description:"Approve explicit files before clicking a visible file input, then complete its actual native Safari chooser. Read documentation first."},{id:"nativeDownloads",description:"Capture one synchronous connected HTTP(S) anchor intent from a known download control; approve before ordinary-profile transfer. Read documentation first."}]')
+                          'tab:[y_,{id:"nativeDialogs",description:"Respond to one exact expected native JavaScript dialog within its opening click. Read documentation first."},{id:"nativeUploads",description:"Approve explicit files before clicking a visible file input, then complete its actual native Safari chooser. Read documentation first."},{id:"nativeDownloads",description:"Capture a known download control once; read documentation for opt-in causal detached, delayed and Blob capture. Approve before transfer. Read documentation first."}]')
     source = replace_once(source, ',await n.endTurn(r)}async getInfo(e)',
                           ';try{await n.endTurn(r)}finally{await globalThis.ChatGPTSafariAgent.release(t,r)}}async getInfo(e)')
     return bridge_source() + "\n" + source

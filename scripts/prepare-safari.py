@@ -180,7 +180,7 @@ if __name__ == "__main__":
     resources = TARGET.parent
     manifest = prepare_manifest(json.loads((ROOT / "vendor/manifest.safari-input.json").read_text()))
     (resources / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
-    adapters = ["native-transport.js", "diagnostics-background.js", "sidechat-preload-background.js", "companion-background.js", "notifications-background.js", "personal-data-background.js", "downloads-background.js", "viewport-background.js", "live-background.js", "management-background.js", "agent-background.js", "sidebar-adapter.js", "session-windows.js"]
+    adapters = ["native-transport.js", "diagnostics-background.js", "sidechat-preload-background.js", "companion-background.js", "notifications-background.js", "personal-data-background.js", "download-capture-main.js", "download-realm-background.js", "downloads-background.js", "viewport-background.js", "live-background.js", "management-background.js", "agent-background.js", "sidebar-adapter.js", "session-windows.js"]
     TARGET.write_text(sidebar_functions() + "\n".join((resources / "safari" / name).read_text() for name in adapters)
                       + "\n" + prepare_safari_agent.prepare_background(prepare(SOURCE.read_text())))
     prepare_safari_agent.prepare_resources(resources)

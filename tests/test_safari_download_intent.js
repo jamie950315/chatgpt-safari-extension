@@ -339,3 +339,99 @@ test("cross-origin policy retains cycle and five-request limits across hosts", a
     assert.equal(Object.values(f.webRequest).every(event => event.size() === 0), true);
   }
 });
+
+function destinationAdapter(f, configuration = {}) {
+  const href = "https://destination.test/private", pageURL = "https://destination.test/login", body = Buffer.from("Destination realm, ordinary login, no CORS.\n");
+  const destination = vm.createContext({ URL, Headers, Response, Uint8Array, AbortController, setTimeout, clearTimeout, btoa, addEventListener() {},
+    location: { href: pageURL, origin: "https://destination.test" },
+    __chatGPTSafariLiveDocument: { documentId: "destination-document", snapshotId: "destination-snapshot", url: pageURL },
+    async fetch(url, options) {
+      f.requests.push({ url, options }); assert.equal(options.credentials, "same-origin"); assert.equal(options.mode, "same-origin"); assert.equal(options.redirect, "manual");
+      const details = { tabId: 13, frameId: 0, requestId: "destination-request", documentId: "native-destination-document", url };
+      f.webRequest.onBeforeRequest.emit(details);
+      f.webRequest.onBeforeSendHeaders.emit({ ...details, requestHeaders: Object.entries(options.headers).map(([name, value]) => ({ name, value })) });
+      f.webRequest.onHeadersReceived.emit({ ...details, statusCode: 200, responseHeaders: [] });
+      const response = new Response(body, { headers: { "Content-Type": "application/octet-stream", "Content-Disposition": "attachment; filename=destination.bin" } });
+      Object.defineProperty(response, "url", { value: url }); return response;
+    } });
+  let sequence = 0, bytes = 0;
+  const unwrap = value => { if (!value?.ok) throw Object.assign(new Error(value?.error?.message), value?.error); return value.result; };
+  const adapter = downloadsModule.createDownloads({ profileId: "profile", sessionId: "background", assertTime() {}, unwrap,
+    api: { webRequest: f.webRequest, scripting: { async executeScript(request) {
+      const context = request.target.tabId === 12 ? f.context : destination;
+      assert.ok([12, 13].includes(request.target.tabId));
+      const result = await vm.runInContext(`(${request.func.toString()})(...parameters)`, Object.assign(context, { parameters: request.args }));
+      return [{ result }];
+    } } }, async target(handle, expectedUrl) {
+      const context = handle.endsWith(":13") ? destination : f.context;
+      if (expectedUrl !== context.location.href) throw new Error("Document navigation changed its exact URL");
+      return { id: handle.endsWith(":13") ? 13 : 12 };
+    }, async send(command) {
+      f.writes.push(command); const input = command.input;
+      if (input.action === "begin") return { ok: true, result: { transferId: "realm-writer" } };
+      if (input.action === "append") { assert.equal(input.sequence, sequence++); bytes += Buffer.from(input.data, "base64").length; configuration.afterAppend?.(f, destination); return { ok: true, result: { sequence, bytesWritten: bytes } }; }
+      return { ok: true, result: { state: "complete", path: "/Downloads/destination.bin", bytesWritten: bytes } };
+    } });
+  return { adapter, href, destination, body, document: { tabId: 13, handle: "live:profile:13", documentId: "destination-document", snapshotId: "destination-snapshot", expectedUrl: pageURL } };
+}
+
+test("explicit destination-tab policy binds both documents, actual destination headers and a single non-CORS body", async () => {
+  const f = pageFixture({ routes: { "https://example.test/synchronous.txt": { status: 302, location: "https://destination.test/private" } } });
+  const realm = destinationAdapter(f); await f.arm(); f.gesture(() => f.emit(f.anchor())); const captured = await f.read();
+  const args = { ...f.args, href: captured.href, redirectPolicy: "tab-origin-policy", transportDocuments: [realm.document] };
+  const next = await realm.adapter.redirectStep({ id: 12 }, args);
+  assert.equal(next.href, realm.href); assert.equal(f.requests.length, 1); assert.equal(f.writes.length, 0);
+  const approved = { ...args, href: next.href };
+  const ready = await realm.adapter.redirectStep({ id: 12 }, approved); assert.equal(ready.kind, "ready"); assert.equal(f.requests.length, 2);
+  const result = await realm.adapter.executeIntent({ id: "owned-operation" }, { id: 12 }, approved);
+  assert.equal(result.state, "complete"); assert.equal(result.bytesWritten, realm.body.length); assert.equal(f.requests.length, 2);
+  assert.deepEqual(Buffer.concat(f.writes.filter(value => value.input.action === "append").map(value => Buffer.from(value.input.data, "base64"))), realm.body);
+  assert.equal(f.writes.filter(value => value.input.action === "finish").length, 1);
+  assert.equal(f.live.downloadIntents.size, 0);
+});
+
+test("missing carrier, source cancellation, and destination navigation cannot contact a next hop or finish a partial", async () => {
+  for (const mode of ["missing", "source", "destination", "destination-url"]) {
+    const f = pageFixture({ routes: { "https://example.test/synchronous.txt": { status: 302, location: "https://destination.test/private" } } });
+    const realm = destinationAdapter(f, { afterAppend(source, destination) {
+      if (mode === "source") source.live.documentId = "new-source";
+      if (mode === "destination") destination.__chatGPTSafariLiveDocument.documentId = "new-destination";
+      if (mode === "destination-url") destination.location.href += "#manual-change";
+    } });
+    await f.arm(); f.gesture(() => f.emit(f.anchor())); const captured = await f.read();
+    const args = { ...f.args, href: captured.href, redirectPolicy: "tab-origin-policy", transportDocuments: mode === "missing" ? [] : [realm.document] };
+    const next = await realm.adapter.redirectStep({ id: 12 }, args), approved = { ...args, href: next.href };
+    if (mode === "missing") { await assert.rejects(realm.adapter.redirectStep({ id: 12 }, approved), /already-claimed/); assert.equal(f.requests.length, 1); await f.cancel(); }
+    else {
+      await realm.adapter.redirectStep({ id: 12 }, approved);
+      await assert.rejects(realm.adapter.executeIntent({ id: "owned-operation" }, { id: 12 }, approved), /source|destination|document/i);
+      assert.equal(f.writes.some(value => value.input.action === "finish"), false);
+      assert.equal(f.writes.some(value => value.input.action === "abort"), true);
+      assert.equal(realm.destination.__chatGPTSafariDownloadRealms.leases.size, 0);
+    }
+  }
+});
+
+test("destination transports require original claims and recheck them through the source operation", async () => {
+  const owner = { instanceId: "owner", profileId: "profile", accountScope: "account" }, metadata = { session_id: "session", turn_id: "turn" };
+  const claimed = new Set([12, 13]), calls = [];
+  const session = { currentTurnId: "turn", async requireOwnedTab(id) { if (!claimed.has(id)) throw new Error("Destination claim released"); } };
+  const companion = { async agentOwner() { return owner; }, async runAgentCommand(command) {
+    calls.push(command);
+    if (command.action === "dom_query") return { node: "source", documentId: "source-doc", snapshotId: "source-snapshot", url: "https://example.test/owned" };
+    if (command.action === "read_page") { assert.equal(command.arguments.maxLength, 1000, "retain the established live read-page minimum"); return { documentId: "dest-doc", snapshotId: "dest-snapshot", url: "https://destination.test/login", profileId: "profile" }; }
+    if (command.action === "interact") return { downloadIntent: { intentId: command.arguments.downloadIntent.intentId, href: "https://example.test/file" } };
+    throw new Error("Unexpected transfer before policy");
+  } };
+  const agent = createAgent({ webRequest: webRequestFixture() }, companion), command = { browser_id: "0", tab_id: "12", selector: "#owned",
+    safari_download_intent: { timeout_ms: 1000, capture: "causal", wait_ms: 1000, redirects: "tab-origin-policy", transportTabs: ["13"] } };
+  const captured = await agent.execute({ ...command, type: "safari_download_capture" }, session, metadata);
+  const binding = { intentId: captured.intentId, documentId: "source-doc", snapshotId: "source-snapshot", expectedUrl: "https://example.test/owned",
+    scope: JSON.stringify(["session", "turn", "owner", "profile", "account", "12"]) };
+  await agent.assertDownloadIntent(binding);
+  assert.deepEqual(calls.map(value => value.action), ["dom_query", "read_page", "interact"]);
+  claimed.delete(13);
+  await assert.rejects(agent.assertDownloadIntent(binding), /claim released/);
+  await agent.release("session", "turn");
+  await assert.rejects(agent.assertDownloadIntent(binding), /lost its original/);
+});

@@ -102,12 +102,19 @@ const worker=vm.runInNewContext(bundle.slice(start,end));new vm.Script(worker);
 class Base{constructor(transport,browserId,tabId){Object.assign(this,{transport,browserId,tabId})}}
 const scope={Base,click:payload=>({type:"playwright_locator_click",...payload}),define:value=>value};vm.createContext(scope);vm.runInContext(SDK,scope);
 const calls=[],actual={state:"complete",path:"/Downloads/actual",bytesWritten:45};
-const capability=new scope.SafariNativeDownloadsDefinition.capability({browserId:"0",tabId:"12",transport:{async send(value){calls.push(value);return actual}}});
+// Execute the SDK emitted inside the real worker template. A regexp escape
+// can parse correctly in the outer bundle but change when that template runs.
+const emittedStart=worker.indexOf("class SafariNativeDownloadsCapability"),emittedEnd=worker.indexOf("\tconst jo = de({",emittedStart);
+assert.ok(emittedStart>=0&&emittedEnd>emittedStart);
+scope.ce=Base;scope.Xs=scope.click;scope.de=scope.define;
+const emittedScope=vm.createContext({Base,ce:Base,Xs:scope.click,de:scope.define});vm.runInContext(worker.slice(emittedStart,emittedEnd),emittedScope);
+const capability=new emittedScope.SafariNativeDownloadsDefinition.capability({browserId:"0",tabId:"12",transport:{async send(value){calls.push(value);return actual}}});
 (async()=>{assert.equal(await capability.run({selector:"#known-download"}),actual);assert.equal(calls[0].command.type,"playwright_locator_click");assert.equal(calls[0].command.safari_download_intent.timeout_ms,1000);assert.equal(calls[0].timeoutMs,120000);
 await capability.run({selector:"#known-download",redirects:"same-origin-policy"});assert.equal(calls[1].command.safari_download_intent.redirects,"same-origin-policy");
 await capability.run({selector:"#known-download",redirects:"cross-origin-policy"});assert.equal(calls[2].command.safari_download_intent.redirects,"cross-origin-policy");
-for(const options of [{selector:"x",href:"https://override.invalid"},{selector:"x",timeout_ms:3001},{selector:"x",force:true},{selector:"x",redirects:"follow"}])await assert.rejects(capability.run(options),/known download-control/);
-assert.equal(calls.length,3)})().catch(error=>{console.error(error);process.exitCode=1});
+await capability.run({selector:"#known-download",capture:"causal",wait_ms:5000,redirects:"tab-origin-policy",transportTabs:["13"]});assert.equal(calls[3].command.safari_download_intent.wait_ms,5000);assert.equal(calls[3].command.safari_download_intent.transportTabs[0],"13");
+for(const options of [{selector:"x",href:"https://override.invalid"},{selector:"x",timeout_ms:3001},{selector:"x",force:true},{selector:"x",redirects:"follow"},{selector:"x",capture:"causal",wait_ms:15001},{selector:"x",wait_ms:1000},{selector:"x",redirects:"tab-origin-policy",transportTabs:["12"]},{selector:"x",redirects:"tab-origin-policy",transportTabs:["x"]}])await assert.rejects(capability.run(options),/known download-control/);
+assert.equal(calls.length,4)})().catch(error=>{console.error(error);process.exitCode=1});
 '''.replace("WORKER", json.dumps(worker)).replace("SDK", json.dumps(helper.native_download_sdk("Base", "click", "define"))))
 
     def test_original_tab_context_reads_open_authenticated_tabs_with_bounded_content(self):

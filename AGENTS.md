@@ -230,6 +230,33 @@ This is a development-signed conversion of Chrome extension 1.26.1005.11759.
   never retries through another transport, and may follow one approved request.
   Installed prototype background fetch omitted the ordinary profile's HTTP-only
   cookie and returned 401; it is not an authenticated non-CORS alternative.
+- The explicit `capture: "causal"` nativeDownloads option intercepts
+  programmatic `a[download].click()` in MAIN before its native default or anchor
+  listeners run. Its root is the same exact trusted native source event also
+  observed in ISOLATED. Explicit Promise callbacks, setTimeout and queueMicrotask
+  propagate only that operation; wait for their tracked tree to drain. Reject
+  multiple candidates. Keep the background-owned immutable MAIN channel and
+  closure-owned candidate/Blob state; whitelist returned data, never authority
+  fields. Retained causal Blobs survive immediate revoke without reading bytes
+  before original website-origin consent. Only the source control's handlers
+  run; do not promise additional programmatic-anchor listeners run in this mode.
+  Preparation defaults to 10 seconds, at most 15, separately from the 30-second
+  transfer budget. Cancel retires only tagged pending callbacks/timers and
+  restores hooks without overwriting later page changes. Native await, cached
+  uninstrumented functions, event/interval/worker continuations and pre-existing
+  Blobs have no supported causal attribution. Never adopt their native files.
+- The conditional `redirects: "tab-origin-policy"` option accepts 1–4 explicit
+  `transportTabs` IDs, already claimed through the original flow in the same
+  profile. Bind their current documents separately from the original source.
+  Each exact approved URL uses its own origin's existing document, same-origin
+  Safari credentials and native nonce/request/document headers. Keep both leases,
+  original claims, cumulative request/time limits and the single retained final
+  Response through native writer finish. Do not silently create/navigate carrier
+  tabs, copy credentials, retry CORS failures or transfer claimed-tab authority.
+  A missing/ambiguous destination document fails before its request. Scoped
+  cancellation must work after same-document URL changes; old-URL targeting is
+  not a prerequisite for cleanup. The default and credentialed-CORS routes keep
+  their original contracts.
 - Owned native detached/Promise-timer/Blob prototypes produced real Safari files,
   but no download event or operation-bound source receipt. The same native
   webRequest observers saw page fetches, not those native downloads; Safari's

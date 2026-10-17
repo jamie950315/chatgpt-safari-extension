@@ -831,7 +831,8 @@
           throw fail("INVALID_DOWNLOAD_INTENT", "Captured downloads require their exact original owner/account/profile/session/turn/tab scope.");
         }
         await target(args.handle, args.expectedUrl);
-        const downloads = environment.ChatGPTSafariDownloads.createDownloads({ api, target, send, profileId, sessionId, assertTime, unwrap });
+        const downloads = environment.ChatGPTSafariDownloads.createDownloads({ api, target, send, profileId, sessionId, assertTime, unwrap,
+          ...args.capture === "causal" || args.redirectPolicy === "tab-origin-policy" ? { authorizeIntent: () => environment.ChatGPTSafariAgent.assertDownloadIntent(args) } : {} });
         return action === "download_intent_redirect" ? downloads.redirectStep(tab, args) : downloads.executeIntent(request, tab, args);
       }
       if (action === "download_link_inspect" || action === "download_link") {
@@ -991,7 +992,8 @@
               if (kind !== "click" || intentDownloads) throw fail("INVALID_DOWNLOAD_INTENT", "A captured download may post only one native source click.");
               intentDownloads = environment.ChatGPTSafariDownloads.createDownloads({ api, target, send, profileId, sessionId, assertTime, unwrap });
               intentBinding = { handle: args.handle, expectedUrl: tab.url, documentId: args.documentId, snapshotId: args.snapshotId,
-                node: interaction.node, intentId: args.downloadIntent.intentId, scope: args.downloadIntent.scope, timeout_ms: args.downloadIntent.timeout_ms };
+                node: interaction.node, intentId: args.downloadIntent.intentId, scope: args.downloadIntent.scope, timeout_ms: args.downloadIntent.timeout_ms,
+                ...(args.downloadIntent.capture === "causal" ? { capture: "causal", wait_ms: args.downloadIntent.wait_ms } : {}) };
               const armed = await intentDownloads.armIntent(tab, intentBinding);
               if (armed.armed !== true || armed.intentId !== intentBinding.intentId) throw fail("DOWNLOAD_INTENT_UNAVAILABLE", "The exact source download observer did not acknowledge arming. No click was posted.");
             }
@@ -1157,10 +1159,11 @@
     }
     async function releaseDownloadIntent(tabId, binding) {
       const tab = await api.tabs.get(tabId).catch(() => null);
-      if (!tab || tab.incognito || tab.url !== binding.expectedUrl) return;
-      const [value] = await api.scripting.executeScript({ target: { tabId, frameIds: [0] }, world: "ISOLATED",
-        func: environment.ChatGPTSafariDownloads.downloadIntentPageOperation, args: ["cancel", binding] });
-      unwrap(value?.result);
+      const downloads = environment.ChatGPTSafariDownloads.createDownloads({ api, target, send, profileId, sessionId, assertTime() {}, unwrap });
+      await downloads.cancelTransport(binding);
+      if (!tab || tab.incognito) return;
+      await downloads.cancelIntent(tab, { ...binding, handle: `live:${profileId}:${tabId}` });
+
     }
     return { start, poll, execute, releaseLogs, releaseFileChoosers, navigationSourceUrl, releaseDownloadIntent,
       stop() { stopped = true; environment.clearInterval(timer); fileChoosers.clear(); fileInputObservations.clear(); } };
