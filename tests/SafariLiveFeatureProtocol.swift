@@ -52,6 +52,20 @@ import Foundation
         precondition(authorization?() == false, "An in-flight native helper must observe owner cancellation")
         native("liveOrganize", input: ["action": "inspect", "expectedUrl": "https://example.com/"], expectOK: false)
         broker.close()
+        let diagnostic = SafariLiveBroker.selectionDiagnostics([
+            "phase": "rejected", "action": "createGroup", "token": "must-not-escape",
+            "failure": ["stage": "owner_mount", "code": "UNCLASSIFIED", "message": "must-not-escape"],
+            "before": [["tabId": 12, "windowId": 34, "active": true, "url": "must-not-escape"]],
+            "events": [["type": "windowFocusChanged", "windowId": -1, "title": "must-not-escape"],
+                       ["type": "unknown", "tabId": 12]]])!
+        let encoded = String(data: try! JSONSerialization.data(withJSONObject: diagnostic), encoding: .utf8)!
+        precondition(!encoded.contains("must-not-escape") && !encoded.contains("unknown"))
+        precondition((diagnostic["events"] as! [[String: Any]]).count == 1)
+        precondition((diagnostic["failure"] as? [String: String]) == ["stage": "owner_mount", "code": "UNCLASSIFIED"])
+        precondition(SafariLiveBroker.selectionDiagnostics(["phase": "rejected", "failure": ["stage": "secret-path", "code": "UNCLASSIFIED"]])?["failure"] == nil)
+        precondition(SafariLiveBroker.selectionDiagnostics(["phase": "rejected", "failure": ["stage": "owner_mount", "code": "secret-token"]])?["failure"] == nil)
+        precondition(SafariLiveBroker.selectionDiagnostics(["phase": "rejected", "failure": ["stage": "owner_rebind", "code": "REBIND_CONTEXT"]])?["failure"] != nil)
+        precondition(SafariLiveBroker.selectionDiagnostics(["phase": "untrusted"]) == nil)
         print("Live native download and organization scope/cancellation checks passed")
     }
 }

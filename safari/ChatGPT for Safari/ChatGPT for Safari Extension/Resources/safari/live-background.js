@@ -156,8 +156,12 @@
         const tab = await target(request.command.arguments?.handle, request.command.arguments?.expectedUrl);
         const nativeGroupMove = action === "organize" && ["createGroup", "moveToGroup", "moveToUngrouped"].includes(request.command.arguments?.operation)
           ? request.command.arguments.operation : undefined;
+        const groupArgs = request.command.arguments || {};
         return environment.ChatGPTSafariSidebar.withAgentSelection(request.agentOwner, tab,
-          selection => executeCommand(request, selection), { nativeGroupMove });
+          selection => executeCommand(request, selection), { nativeGroupMove,
+            destinationTitle: nativeGroupMove === "moveToUngrouped" ? null
+              : nativeGroupMove === "createGroup" ? groupArgs.newTitle : groupArgs.groupTitle,
+            nativeWindowIdentifier: groupArgs.windowIdentifier });
       }
       return executeCommand(request);
     }
@@ -268,13 +272,29 @@
       if (stopped || polling || !profileId) return;
       polling = true;
       try {
-        const response = await send({ action: "livePoll", profileId, sessionId });
+        const selection = environment.ChatGPTSafariSidebar?.selectionDiagnostics();
+        const response = await send({ action: "livePoll", profileId, sessionId, ...(selection ? { selection } : {}) });
         if (response?.ok !== true) return; // A poll never launches a user-quit app.
         for (const request of response.requests || []) {
           let response;
           try { response = { ok: true, result: await execute(request) }; }
-          catch (error) { response = { ok: false, error: { code: error.code || "SAFARI_API_ERROR", message: error.message,
-            ...(error.data ? { data: error.data } : {}) } }; }
+          catch (error) {
+            const native = {};
+            for (const key of ["actionsPerformed", "eventsPosted"]) {
+              if (Number.isSafeInteger(error[key]) && error[key] >= 0) native[key] = error[key];
+            }
+            for (const key of ["mutationApplied", "doNotReplay", "mayHavePostedInput"]) {
+              if (typeof error[key] === "boolean") native[key] = error[key];
+            }
+            for (const key of ["tabBarRestoration", "nativeSidebarRestoration"]) {
+              if (["restored", "unconfirmed"].includes(error[key])) native[key] = error[key];
+            }
+            const hasNative = Object.keys(native).length > 0;
+            const details = hasNative ? { ...(error.data && typeof error.data === "object" && !Array.isArray(error.data)
+              ? error.data : error.data === undefined ? {} : { details: error.data }), ...native } : error.data;
+            response = { ok: false, error: { code: error.code || "SAFARI_API_ERROR", message: error.message,
+              ...(details === undefined ? {} : { data: details }) } };
+          }
           await send({ action: "liveResolve", id: request.id, profileId, sessionId, response });
         }
       } catch { /* Service discovery resumes on the next poll; mutations are not retried. */ }

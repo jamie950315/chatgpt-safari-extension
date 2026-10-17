@@ -12,6 +12,11 @@ final class SafariTabOrganization {
     struct Failure: Error {
         let code: String
         let message: String
+        let details: [String: Any]?
+
+        init(code: String, message: String, details: [String: Any]? = nil) {
+            self.code = code; self.message = message; self.details = details
+        }
     }
 
     struct SelectedTab: Equatable {
@@ -71,12 +76,39 @@ final class SafariTabOrganization {
         }
     }
 
-    private struct Context {
+    private struct ExpectedSelection {
+        let groupTitle: String?
+        let tab: SelectedTab
+    }
+
+    private struct NativeMenuState {
+        let contextVisible: Bool
+        let pickerVisible: Bool
+        let viewVisible: Bool
+        let otherVisible: Bool
+        let menuFocused: Bool
+
+        var visible: Bool { contextVisible || pickerVisible || viewVisible || otherVisible }
+        var data: [String: Any] {
+            ["visibleContextMenu": contextVisible, "visibleGroupPickerMenu": pickerVisible,
+             "visibleViewMenu": viewVisible, "visibleOtherNativeMenu": otherVisible,
+             "nativeMenuFocused": menuFocused,
+             "menuInteractionState": visible ? "visible_native_menu" : (menuFocused ? "native_menu_focus" : "none")]
+        }
+    }
+
+    private final class Context {
         let request: Request
         let pid: pid_t
         let app: AXUIElement
         let window: AXUIElement
         let windowIdentifier: String
+        var expectedSelection: ExpectedSelection?
+
+        init(request: Request, pid: pid_t, app: AXUIElement, window: AXUIElement, windowIdentifier: String) {
+            self.request = request; self.pid = pid; self.app = app
+            self.window = window; self.windowIdentifier = windowIdentifier
+        }
     }
 
     private let queue = DispatchQueue(label: "dev.jamie.chatgpt-safari.tab-organization")
@@ -100,7 +132,10 @@ final class SafariTabOrganization {
                 reply(["ok": true, "result": result])
             } catch {
                 let code: String, message: String
-                if let failure = error as? Failure { code = failure.code; message = failure.message }
+                var failureData: [String: Any]?
+                if let failure = error as? Failure {
+                    code = failure.code; message = failure.message; failureData = failure.details
+                }
                 else if let failure = error as? SafariLiveInput.Failure { code = failure.code; message = failure.message }
                 else { code = "NATIVE_ORGANIZATION_FAILED"; message = "Native Safari tab organization failed." }
                 var details: [String: Any] = ["code": code, "message": message,
@@ -108,6 +143,7 @@ final class SafariTabOrganization {
                     "mutationApplied": mutationApplied, "doNotReplay": actions > 0]
                 if let tabBarRestoration { details["tabBarRestoration"] = tabBarRestoration }
                 if let sidebarRestoration { details["nativeSidebarRestoration"] = sidebarRestoration }
+                if let failureData { details["data"] = failureData }
                 reply(["ok": false, "error": details])
             }
         }
@@ -159,6 +195,48 @@ final class SafariTabOrganization {
         return titles
     }
 
+    static func validateExpectedSelection(groupTitle: String?, selectedTab: SelectedTab?, pageURLs: [String],
+                                           expectedGroupTitle: String?, expectedTab: SelectedTab) throws {
+        guard groupTitle == expectedGroupTitle, pageURLs == [expectedTab.url],
+              selectedTab == nil || selectedTab == expectedTab else {
+            throw Failure(code: "SELECTION_CHANGED", message: "The native Safari collection or selected tab changed outside the expected group transition. Source restoration was not forced.")
+        }
+    }
+
+    static func validateRenamedInventory(_ titles: [String], previousTitle: String, newTitle: String) throws {
+        guard titles.filter({ $0 == newTitle }).count == 1,
+              previousTitle == newTitle || !titles.contains(previousTitle) else {
+            throw Failure(code: "GROUP_RENAME_UNCONFIRMED", message: "Safari's native group inventory did not confirm the unique renamed group. Do not replay the name change.")
+        }
+    }
+
+    static func inventoryAfterConfirmedRename(_ titles: [String], previousTitle: String, newTitle: String) throws -> [String] {
+        guard titles.filter({ $0 == previousTitle }).count == 1,
+              previousTitle == newTitle || !titles.contains(newTitle),
+              Set(titles).count == titles.count else {
+            throw Failure(code: "GROUP_RENAME_UNCONFIRMED", message: "The preflight native group inventory cannot identify one unique renamed group. Do not replay the name change.")
+        }
+        let renamed = titles.map { $0 == previousTitle ? newTitle : $0 }
+        try validateRenamedInventory(renamed, previousTitle: previousTitle, newTitle: newTitle)
+        return renamed
+    }
+
+    static func tabBarPreference(mark: String?, status: AXError) throws -> Bool {
+        if status == .noValue { return false }
+        guard status == .success, let mark else {
+            throw Failure(code: "TAB_BAR_PREFERENCE_UNAVAILABLE", message: "Safari did not expose its native Always Show Tab Bar preference state.")
+        }
+        return !mark.isEmpty
+    }
+
+    static func menuCompletionConfirmed(visibleNativeMenu: Bool, nativeMenuFocused: Bool) -> Bool {
+        !visibleNativeMenu && !nativeMenuFocused
+    }
+
+    static func sidebarLayoutConfirmed(requestedVisible: Bool, sidebarHit: Bool, pickerHit: Bool) -> Bool {
+        sidebarHit == requestedVisible && (requestedVisible || pickerHit)
+    }
+
     private func perform(_ context: Context, isAuthorized: () -> Bool,
                          actions: inout Int, mutationApplied: inout Bool,
                          tabBarRestoration: inout String?, sidebarRestoration: inout String?) throws -> [String: Any] {
@@ -184,8 +262,12 @@ final class SafariTabOrganization {
             }
         }
         let initialGroup = try currentGroupTitle(context)
+        if !nativeTabs(context).isEmpty {
+            context.expectedSelection = ExpectedSelection(groupTitle: initialGroup, tab: try rawSelectedTab(context))
+        }
         let groups = try groupTitles(context, isAuthorized: isAuthorized, actions: &actions)
         var destination: String? = initialGroup
+        let restoresSource = ["createGroup", "moveToGroup", "moveToUngrouped"].contains(request.action)
         switch request.action {
         case "inspect": break
         case "selectGroup":
@@ -195,13 +277,14 @@ final class SafariTabOrganization {
             try selectGroup(title, context: context, isAuthorized: isAuthorized, actions: &actions)
             destination = title
         case "renameGroup":
-            guard initialGroup == request.groupTitle else {
-                throw Failure(code: "GROUP_CHANGED", message: "The selected native Safari Tab Group changed before rename.")
-            }
             try requireUnique(request.groupTitle!, among: groups)
             try requireUnused(request.newTitle!, except: request.groupTitle, among: groups)
-            try renameCurrentGroup(context, currentTitle: request.groupTitle!, newTitle: request.newTitle!,
-                                   isAuthorized: isAuthorized, actions: &actions, mutationApplied: &mutationApplied)
+            if nativeTabs(context).isEmpty {
+                try showHiddenTabBar(context, isAuthorized: isAuthorized, actions: &actions, revealed: &revealedTabBar)
+            }
+            context.expectedSelection = ExpectedSelection(groupTitle: initialGroup, tab: try rawSelectedTab(context))
+            try renameGroup(context, currentTitle: request.groupTitle!, newTitle: request.newTitle!,
+                            isAuthorized: isAuthorized, actions: &actions, mutationApplied: &mutationApplied)
             destination = request.newTitle
         default:
             if let initialGroup {
@@ -220,6 +303,8 @@ final class SafariTabOrganization {
                 try showHiddenTabBar(context, isAuthorized: isAuthorized, actions: &actions, revealed: &revealedTabBar)
             }
             let tab = try selectedTab(context)
+            let sourceSelected = try rawSelectedTab(context)
+            context.expectedSelection = ExpectedSelection(groupTitle: initialGroup, tab: sourceSelected)
             try rightClick(tab, context: context, isAuthorized: isAuthorized, actions: &actions)
             defer { cancelMenu(context) }
             let menu = try waitForIdentifier("SafariContextMenu", context: context, isAuthorized: isAuthorized)
@@ -233,18 +318,64 @@ final class SafariTabOrganization {
             }
             // This is the mutation boundary. A failed AX action may still have
             // delivered; callers must inspect fresh state, never replay it.
+            try stable(context, isAuthorized: isAuthorized)
             mutationApplied = true
+            // Only the delivered group command may change the collection. Its
+            // action-specific postcondition re-arms the exact selection guard.
+            context.expectedSelection = nil
             try press(item, context: context, isAuthorized: isAuthorized, actions: &actions)
             if request.action == "createGroup" {
                 let field = try waitForNameEditor(context, isAuthorized: isAuthorized)
-                try setName(field, title: request.newTitle!, context: context, isAuthorized: isAuthorized, actions: &actions)
+                guard let temporaryTitle = try currentGroupTitle(context), temporaryTitle != initialGroup,
+                      string(field, kAXValueAttribute) == temporaryTitle else {
+                    throw Failure(code: "GROUP_TRANSITION_UNCONFIRMED", message: "Safari did not expose the new group's own focused name editor. No name was entered; do not replay creation.")
+                }
+                try setName(field, currentTitle: temporaryTitle, title: request.newTitle!, context: context,
+                            isAuthorized: isAuthorized, actions: &actions)
                 try waitForGroup(request.newTitle!, context: context, isAuthorized: isAuthorized)
+                if nativeTabs(context).isEmpty {
+                    try showHiddenTabBar(context, isAuthorized: isAuthorized, actions: &actions, revealed: &revealedTabBar)
+                }
+                let createdSelected = try rawSelectedTab(context)
+                guard createdSelected.url == sourceSelected.url, createdSelected.title == sourceSelected.title else {
+                    throw Failure(code: "GROUP_TRANSITION_UNCONFIRMED", message: "Safari's newly created group no longer displays the moved target tab. Source restoration was not forced.")
+                }
+                context.expectedSelection = ExpectedSelection(groupTitle: request.newTitle, tab: createdSelected)
+                // Restore the preference in this same one-tab destination,
+                // before returning to a source whose multi-tab bar is forced
+                // visible and whose View preference action can be disabled.
+                if revealedTabBar {
+                    revealedTabBar = false
+                    do {
+                        try restoreHiddenTabBar(context, isAuthorized: isAuthorized, actions: &actions)
+                        tabBarRestoration = "restored"
+                    } catch { tabBarRestoration = "unconfirmed" }
+                }
+                try selectCollection(initialGroup, context: context, isAuthorized: isAuthorized,
+                                     actions: &actions, revealedTabBar: &revealedTabBar)
             } else {
-                try waitForMenuDismissal(context, isAuthorized: isAuthorized)
+                try waitForMenuDismissal(context, isAuthorized: isAuthorized, stage: "group_move_completion")
+                guard try currentGroupTitle(context) == initialGroup else {
+                    throw Failure(code: "GROUP_TRANSITION_UNCONFIRMED", message: "Safari changed away from the original source collection after moving the tab. Source restoration was not forced.")
+                }
+                if nativeTabs(context).isEmpty {
+                    try showHiddenTabBar(context, isAuthorized: isAuthorized, actions: &actions,
+                                         revealed: &revealedTabBar, requirePage: false)
+                }
+                context.expectedSelection = ExpectedSelection(groupTitle: initialGroup, tab: try rawSelectedTab(context))
             }
         }
         try stable(context, isAuthorized: isAuthorized, requirePage: false)
-        let titles = request.action == "inspect" ? groups : try groupTitles(context, isAuthorized: isAuthorized, actions: &actions, requirePage: false)
+        let titles: [String]
+        if request.action == "renameGroup" {
+            // The exact native row has committed its new title, the old row is
+            // absent, and the original source selection remains guarded. Apply
+            // that observed rename to the complete preflight inventory instead
+            // of immediately hiding the sidebar to reopen the picker.
+            titles = try Self.inventoryAfterConfirmedRename(groups, previousTitle: request.groupTitle!, newTitle: request.newTitle!)
+        } else {
+            titles = request.action == "inspect" ? groups : try groupTitles(context, isAuthorized: isAuthorized, actions: &actions, requirePage: false)
+        }
         if nativeSidebarVisible(context) != originalSidebarVisible {
             sidebarRestoreAttempted = true
             do {
@@ -292,7 +423,26 @@ final class SafariTabOrganization {
             "pageChanged": selected.url != request.target.expectedURL, "selectedTab": selected.data
         ]
         if request.action != "inspect" { result["destinationGroupTitle"] = destination as Any? ?? NSNull() }
+        if request.action == "renameGroup" {
+            result["renamedGroup"] = identity(request.newTitle!, context: context)
+            result["groupInventorySource"] = "confirmed_rename_of_preflight_inventory"
+        }
+        if restoresSource {
+            guard current == initialGroup else {
+                throw Failure(code: "SOURCE_COLLECTION_NOT_RESTORED", message: "Safari did not restore the original source collection after the group mutation. Do not replay it.")
+            }
+            result["sourceCollection"] = collectionProof(initialGroup, context: context).merging([
+                "selectedUrlBefore": request.target.expectedURL, "restored": true
+            ], uniquingKeysWith: { _, rhs in rhs })
+            result["destinationCollection"] = collectionProof(destination, context: context)
+        }
         return result
+    }
+
+    private func collectionProof(_ title: String?, context: Context) -> [String: Any] {
+        ["title": title as Any? ?? NSNull(),
+         "identity": title.map { identity($0, context: context) } as Any? ?? NSNull(),
+         "nativeWindowIdentifier": context.windowIdentifier]
     }
 
     private func identity(_ title: String, context: Context) -> [String: String] {
@@ -333,6 +483,10 @@ final class SafariTabOrganization {
 
     private func observedSelectedTab(_ context: Context, isAuthorized: () -> Bool) throws -> SelectedTab {
         try stable(context, isAuthorized: isAuthorized, requirePage: false)
+        return try rawSelectedTab(context)
+    }
+
+    private func rawSelectedTab(_ context: Context) throws -> SelectedTab {
         let tabs = nativeTabs(context).map { tab -> (identifier: String, title: String?) in
             let fields = nativeNodes(tab).filter { string($0, kAXIdentifierAttribute) == "UnifiedTabBarButton._titleTextField" }
             return (string(tab, kAXIdentifierAttribute) ?? "", fields.count == 1 ? string(fields[0], kAXValueAttribute) : nil)
@@ -341,7 +495,7 @@ final class SafariTabOrganization {
     }
 
     private func tabBarMenuItem(_ context: Context, isAuthorized: () -> Bool,
-                                actions: inout Int, requirePage: Bool) throws -> AXUIElement {
+                                actions: inout Int, requirePage: Bool, requireEnabled: Bool = true) throws -> AXUIElement {
         // These are Safari's native identifiers observed in its real View menu.
         let menus = nativeNodes(context.app).filter { string($0, kAXIdentifierAttribute) == "SafariViewMenu" }
         guard menus.count == 1 else {
@@ -349,11 +503,17 @@ final class SafariTabOrganization {
         }
         try press(menus[0], context: context, isAuthorized: isAuthorized, actions: &actions, requirePage: requirePage)
         let item = try waitForIdentifier("AlwaysShowTabBar", context: context, isAuthorized: isAuthorized)
-        guard bool(item, kAXEnabledAttribute) == true else {
+        guard !requireEnabled || bool(item, kAXEnabledAttribute) == true else {
             _ = AXUIElementPerformAction(menus[0], kAXCancelAction as CFString)
             throw Failure(code: "TAB_BAR_UNAVAILABLE", message: "Safari disabled View > Always Show Tab Bar for the selected native window.")
         }
         return item
+    }
+
+    private func tabBarPreference(_ item: AXUIElement) throws -> Bool {
+        var rawMark: CFTypeRef?
+        let status = AXUIElementCopyAttributeValue(item, kAXMenuItemMarkCharAttribute as CFString, &rawMark)
+        return try Self.tabBarPreference(mark: rawMark as? String, status: status)
     }
 
     private func showHiddenTabBar(_ context: Context, isAuthorized: () -> Bool,
@@ -362,7 +522,7 @@ final class SafariTabOrganization {
         guard nativeTabs(context).isEmpty else { return }
         defer { cancelViewMenu(context) }
         let item = try tabBarMenuItem(context, isAuthorized: isAuthorized, actions: &actions, requirePage: requirePage)
-        guard (string(item, kAXMenuItemMarkCharAttribute) ?? "").isEmpty else {
+        guard try !tabBarPreference(item) else {
             throw Failure(code: "TAB_BAR_UNAVAILABLE", message: "Safari already enables its native tab bar but did not expose a selectable tab.")
         }
         // Do not retry this preference mutation, even if observation times out.
@@ -380,21 +540,26 @@ final class SafariTabOrganization {
     private func restoreHiddenTabBar(_ context: Context, isAuthorized: () -> Bool,
                                      actions: inout Int) throws {
         try stable(context, isAuthorized: isAuthorized, requirePage: false)
-        let tabs = nativeTabs(context)
-        if tabs.isEmpty { return }
-        guard tabs.count == 1 else {
-            throw Failure(code: "TAB_BAR_RESTORE_UNCONFIRMED", message: "Safari changed to a multi-tab collection before the original hidden tab bar could be restored.")
-        }
         defer { cancelViewMenu(context) }
-        let item = try tabBarMenuItem(context, isAuthorized: isAuthorized, actions: &actions, requirePage: false)
+        let item = try tabBarMenuItem(context, isAuthorized: isAuthorized, actions: &actions,
+                                      requirePage: false, requireEnabled: false)
+        // Multiple tabs force a visible bar regardless of this preference.
+        // Only its native menu state establishes whether our change remains.
+        guard try tabBarPreference(item) else { return }
+        guard bool(item, kAXEnabledAttribute) == true else {
+            throw Failure(code: "TAB_BAR_RESTORE_UNCONFIRMED", message: "Safari currently disables restoring the changed tab bar preference. No collection was switched for cleanup.")
+        }
         try press(item, context: context, isAuthorized: isAuthorized, actions: &actions, requirePage: false)
+        cancelViewMenu(context)
+        let verification = try tabBarMenuItem(context, isAuthorized: isAuthorized, actions: &actions,
+                                              requirePage: false, requireEnabled: false)
         let deadline = Date().addingTimeInterval(2)
         repeat {
             try stable(context, isAuthorized: isAuthorized, requirePage: false)
-            if nativeTabs(context).isEmpty { return }
+            if try !tabBarPreference(verification) { return }
             Thread.sleep(forTimeInterval: 0.04)
         } while Date() < deadline
-        throw Failure(code: "TAB_BAR_RESTORE_UNCONFIRMED", message: "Safari did not confirm restoring the original hidden tab bar. The group action was not replayed.")
+        throw Failure(code: "TAB_BAR_RESTORE_UNCONFIRMED", message: "Safari's native View menu did not confirm restoring the original tab bar preference. The group action was not replayed.")
     }
 
     private func cancelViewMenu(_ context: Context) {
@@ -496,15 +661,21 @@ final class SafariTabOrganization {
         guard toggles.count == 1 else {
             throw Failure(code: "GROUP_UI_UNAVAILABLE", message: "Safari did not expose exactly one visible native sidebar toggle.")
         }
+        // Moving a tab can remove the menu's original window AX subtree before
+        // native menu tracking finishes. Do not let the next toolbar click be
+        // consumed merely as an outside click that dismisses that menu.
+        try waitForMenuDismissal(context, isAuthorized: isAuthorized, stage: "sidebar_preflight")
         try nativeClick(toggles[0], button: .left, context: context, isAuthorized: isAuthorized,
                         actions: &actions, requirePage: requirePage)
         let deadline = Date().addingTimeInterval(2)
+        var sidebarHit = false, pickerHit = false
         repeat {
             try stable(context, isAuthorized: isAuthorized, requirePage: requirePage)
-            let pickerVisible = nativeNodes(context.window).contains {
+            pickerHit = nativeNodes(context.window).contains {
                 Self.groupTitle(string($0, kAXIdentifierAttribute) ?? "") != nil && nativeTargetVisible($0, context: context)
             }
-            if nativeSidebarVisible(context) == visible, visible || pickerVisible {
+            sidebarHit = nativeSidebarVisible(context)
+            if Self.sidebarLayoutConfirmed(requestedVisible: visible, sidebarHit: sidebarHit, pickerHit: pickerHit) {
                 guard try currentGroupTitle(context) == originalGroup, pageURLs(context.window) == originalPages else {
                     throw Failure(code: "GROUP_READ_CHANGED_SELECTION", message: "Safari changed its selected group or page while changing the native sidebar layout.")
                 }
@@ -512,22 +683,35 @@ final class SafariTabOrganization {
             }
             Thread.sleep(forTimeInterval: 0.04)
         } while Date() < deadline
-        throw Failure(code: "GROUP_UI_UNAVAILABLE", message: "Safari did not confirm the requested native sidebar layout. No group action was replayed.")
+        var diagnostics = nativeMenuState(context).data
+        diagnostics["stage"] = "sidebar_layout_confirmation"
+        diagnostics["requestedVisible"] = visible
+        diagnostics["sidebarHit"] = sidebarHit
+        diagnostics["pickerHit"] = pickerHit
+        diagnostics["newTabGroupButtonPresent"] = nativeNodes(context.window).contains { string($0, kAXIdentifierAttribute) == "NewTabGroupButton" }
+        diagnostics["sidebarToggleHitCount"] = min(8, nativeNodes(context.window).filter {
+            string($0, kAXIdentifierAttribute) == "SidebarButton" && nativeTargetVisible($0, context: context)
+        }.count)
+        throw Failure(code: "GROUP_UI_UNAVAILABLE", message: "Safari did not confirm the requested native sidebar layout. No group action was replayed.", details: diagnostics)
     }
 
     private func groupRow(_ title: String, context: Context, isAuthorized: () -> Bool, actions: inout Int) throws -> AXUIElement {
         try setNativeSidebarVisible(true, context: context, isAuthorized: isAuthorized, actions: &actions)
-        let rows = nativeNodes(context.window).filter { row in
+        let rows = matchingGroupRows(title, context: context)
+        guard rows.count == 1, let row = rows.first else {
+            throw Failure(code: "GROUP_UI_UNAVAILABLE", message: "Safari's sidebar did not expose exactly one matching native group row.")
+        }
+        return row
+    }
+
+    private func matchingGroupRows(_ title: String, context: Context) -> [AXUIElement] {
+        nativeNodes(context.window).filter { row in
             guard string(row, kAXRoleAttribute) == kAXRowRole else { return false }
             if string(row, kAXValueAttribute) == title { return true }
             return nativeNodes(row).contains {
                 string($0, kAXIdentifierAttribute) == "LibraryItemCellTextField" && string($0, kAXValueAttribute) == title
             }
         }
-        guard rows.count == 1, let row = rows.first else {
-            throw Failure(code: "GROUP_UI_UNAVAILABLE", message: "Safari's sidebar did not expose exactly one matching native group row.")
-        }
-        return row
     }
 
     private func requireUnshared(_ title: String, context: Context, isAuthorized: () -> Bool, actions: inout Int) throws {
@@ -547,8 +731,9 @@ final class SafariTabOrganization {
         }
     }
 
-    private func renameCurrentGroup(_ context: Context, currentTitle: String, newTitle: String,
-                                    isAuthorized: () -> Bool, actions: inout Int, mutationApplied: inout Bool) throws {
+    private func renameGroup(_ context: Context, currentTitle: String, newTitle: String,
+                             isAuthorized: () -> Bool, actions: inout Int, mutationApplied: inout Bool) throws {
+        let changesSelectedCollection = try currentGroupTitle(context) == currentTitle
         let row = try groupRow(currentTitle, context: context, isAuthorized: isAuthorized, actions: &actions)
         try rightClick(row, context: context, isAuthorized: isAuthorized, actions: &actions)
         defer { cancelMenu(context) }
@@ -560,27 +745,61 @@ final class SafariTabOrganization {
         }
         try press(rename, context: context, isAuthorized: isAuthorized, actions: &actions)
         let field = try waitForNameEditor(context, isAuthorized: isAuthorized)
-        guard string(field, kAXValueAttribute) == currentTitle else {
+        guard string(field, kAXValueAttribute) == currentTitle, isDescendant(field, of: row) else {
             throw Failure(code: "GROUP_CHANGED", message: "Safari opened a different group name editor. No new name was entered.")
         }
         mutationApplied = true
-        try setName(field, title: newTitle, context: context, isAuthorized: isAuthorized, actions: &actions)
-        try waitForGroup(newTitle, context: context, isAuthorized: isAuthorized)
+        try setName(field, currentTitle: currentTitle, title: newTitle, context: context,
+                    isAuthorized: isAuthorized, actions: &actions, groupRow: row,
+                    changesSelectedCollection: changesSelectedCollection)
+        if changesSelectedCollection {
+            try waitForGroup(newTitle, context: context, isAuthorized: isAuthorized)
+            context.expectedSelection = ExpectedSelection(groupTitle: newTitle, tab: try rawSelectedTab(context))
+        }
+        try waitForRenamedRow(row, previousTitle: currentTitle, title: newTitle, context: context, isAuthorized: isAuthorized)
     }
 
-    private func setName(_ field: AXUIElement, title: String, context: Context,
-                         isAuthorized: () -> Bool, actions: inout Int) throws {
+    private func setName(_ field: AXUIElement, currentTitle: String, title: String, context: Context,
+                         isAuthorized: () -> Bool, actions: inout Int, groupRow: AXUIElement? = nil,
+                         changesSelectedCollection: Bool = true) throws {
         try stable(context, isAuthorized: isAuthorized)
+        let selectedGroupBefore = try currentGroupTitle(context)
+        guard (!changesSelectedCollection || selectedGroupBefore == currentTitle),
+              let focused = element(context.app, kAXFocusedUIElementAttribute), CFEqual(focused, field),
+              string(field, kAXValueAttribute) == currentTitle,
+              groupRow.map({ isDescendant(field, of: $0) }) != false else {
+            throw Failure(code: "GROUP_CHANGED", message: "The native group or its focused name editor changed before naming. No name was entered.")
+        }
+        if changesSelectedCollection { context.expectedSelection = nil }
         actions += 1
         guard AXUIElementSetAttributeValue(field, kAXValueAttribute as CFString, title as CFString) == .success else {
             throw Failure(code: "GROUP_RENAME_UNCONFIRMED", message: "Safari did not accept the native group name. Inspect its current group state before continuing.")
         }
         try stable(context, isAuthorized: isAuthorized)
+        let current = try currentGroupTitle(context)
+        let validSelection = changesSelectedCollection ? (current == currentTitle || current == title) : current == selectedGroupBefore
         guard let focused = element(context.app, kAXFocusedUIElementAttribute), CFEqual(focused, field),
-              string(field, kAXValueAttribute) == title else {
+              string(field, kAXValueAttribute) == title, validSelection,
+              groupRow.map({ isDescendant(field, of: $0) }) != false else {
             throw Failure(code: "GROUP_RENAME_UNCONFIRMED", message: "Safari's native group name editor lost focus. The pending name was not committed by this helper.")
         }
         try key(36, context: context, isAuthorized: isAuthorized, actions: &actions)
+    }
+
+    private func waitForRenamedRow(_ targetRow: AXUIElement, previousTitle: String, title: String,
+                                   context: Context, isAuthorized: () -> Bool) throws {
+        let deadline = Date().addingTimeInterval(2)
+        repeat {
+            try stable(context, isAuthorized: isAuthorized)
+            let rows = matchingGroupRows(title, context: context)
+            let focused = element(context.app, kAXFocusedUIElementAttribute)
+            let editingName = focused.map { string($0, kAXIdentifierAttribute) == "LibraryItemCellTextField" } ?? false
+            let oldNameAbsent = previousTitle == title || matchingGroupRows(previousTitle, context: context).isEmpty
+            if rows.count == 1, CFEqual(rows[0], targetRow), nativeTargetVisible(rows[0], context: context),
+               oldNameAbsent, !editingName { return }
+            Thread.sleep(forTimeInterval: 0.04)
+        } while Date() < deadline
+        throw Failure(code: "GROUP_RENAME_UNCONFIRMED", message: "Safari did not commit the name on the exact native group row. Its current collection was not switched.")
     }
 
     private func selectGroup(_ title: String, context: Context, isAuthorized: () -> Bool, actions: inout Int) throws {
@@ -590,8 +809,40 @@ final class SafariTabOrganization {
         let menu = try waitForIdentifier("TabGroupPickerMenu", context: context, isAuthorized: isAuthorized)
         let matches = nativeNodes(menu).filter { string($0, kAXIdentifierAttribute) == title + "TabGroupPickerMenuItem" }
         guard matches.count == 1 else { throw Failure(code: "AMBIGUOUS_GROUP", message: "The native group destination changed before selection.") }
+        try stable(context, isAuthorized: isAuthorized)
+        context.expectedSelection = nil
         try press(matches[0], context: context, isAuthorized: isAuthorized, actions: &actions)
         try waitForGroup(title, context: context, isAuthorized: isAuthorized)
+        if !nativeTabs(context).isEmpty {
+            context.expectedSelection = ExpectedSelection(groupTitle: title, tab: try rawSelectedTab(context))
+        }
+    }
+
+    private func selectCollection(_ title: String?, context: Context, isAuthorized: () -> Bool,
+                                  actions: inout Int, revealedTabBar: inout Bool) throws {
+        // The expected post-mutation collection and exact active page remain
+        // guarded until the single intentional source-selection action below.
+        try stable(context, isAuthorized: isAuthorized, requirePage: false)
+        try setNativeSidebarVisible(false, context: context, isAuthorized: isAuthorized, actions: &actions, requirePage: false)
+        try nativeClick(try picker(context), button: .left, context: context, isAuthorized: isAuthorized,
+                        actions: &actions, requirePage: false)
+        defer { cancelMenu(context) }
+        let menu = try waitForIdentifier("TabGroupPickerMenu", context: context, isAuthorized: isAuthorized)
+        let itemID = title.map { $0 + "TabGroupPickerMenuItem" } ?? "LocalTabGroupPickerMenuItem"
+        let matches = nativeNodes(menu).filter { string($0, kAXIdentifierAttribute) == itemID }
+        guard matches.count == 1 else {
+            throw Failure(code: "SOURCE_COLLECTION_NOT_RESTORED", message: "Safari did not expose exactly one original source collection. No source selection was sent.")
+        }
+        try stable(context, isAuthorized: isAuthorized, requirePage: false)
+        context.expectedSelection = nil
+        try press(matches[0], context: context, isAuthorized: isAuthorized, actions: &actions, requirePage: false)
+        try waitForGroup(title, context: context, isAuthorized: isAuthorized)
+        try waitForMenuDismissal(context, isAuthorized: isAuthorized)
+        if nativeTabs(context).isEmpty {
+            try showHiddenTabBar(context, isAuthorized: isAuthorized, actions: &actions,
+                                 revealed: &revealedTabBar, requirePage: false)
+        }
+        context.expectedSelection = ExpectedSelection(groupTitle: title, tab: try rawSelectedTab(context))
     }
 
     private func makeContext(_ request: Request, isAuthorized: () -> Bool) throws -> Context {
@@ -624,16 +875,49 @@ final class SafariTabOrganization {
         guard session["screenLocked"] != true else { throw Failure(code: "SESSION_LOCKED", message: "Unlock this Mac before organizing Safari tabs.") }
         let system = AXUIElementCreateSystemWide()
         var pid: pid_t = 0
-        guard let front = onMain({ NSWorkspace.shared.frontmostApplication }), front.processIdentifier == context.pid,
-              isAppleSafari(front), let axFront = element(system, kAXFocusedApplicationAttribute),
-              AXUIElementGetPid(axFront, &pid) == .success, pid == context.pid,
-              let window = element(context.app, kAXFocusedWindowAttribute), CFEqual(window, context.window),
-              string(window, kAXIdentifierAttribute).flatMap(Self.windowIdentifier) == context.windowIdentifier,
-              let observed = frame(window), close(observed, context.request.target.windowBounds) else {
-            throw Failure(code: "FOCUS_CHANGED", message: "Safari's foreground process, focused window, or window bounds changed. Stop and inspect fresh state.")
+        let front = onMain({ NSWorkspace.shared.frontmostApplication })
+        let signedSafari = front.map { isAppleSafari($0) } ?? false
+        let axFront = element(system, kAXFocusedApplicationAttribute)
+        let axPIDStatus: AXError = axFront.map { AXUIElementGetPid($0, &pid) } ?? .noValue
+        let focusedWindow = element(context.app, kAXFocusedWindowAttribute)
+        let currentIdentifier = focusedWindow.flatMap { string($0, kAXIdentifierAttribute).flatMap(Self.windowIdentifier) }
+        let currentBounds = focusedWindow.flatMap { frame($0) }
+        let sameWindow = focusedWindow.map { CFEqual($0, context.window) } ?? false
+        let matchingBounds = currentBounds.map { close($0, context.request.target.windowBounds) } ?? false
+        guard let front, front.processIdentifier == context.pid, signedSafari, axFront != nil,
+              axPIDStatus == .success, pid == context.pid,
+              let window = focusedWindow, sameWindow,
+              currentIdentifier == context.windowIdentifier, currentBounds != nil, matchingBounds else {
+            // One bounded observation of identity/focus only. Never include page
+            // URLs, titles, application names, credentials, or session tokens.
+            let diagnostics: [String: Any] = [
+                "expectedNativeWindowIdentifier": context.windowIdentifier,
+                "currentNativeWindowIdentifier": currentIdentifier as Any? ?? NSNull(),
+                "expectedWindowBounds": Self.diagnosticBounds(context.request.target.windowBounds) as Any? ?? NSNull(),
+                "currentWindowBounds": currentBounds.flatMap(Self.diagnosticBounds) as Any? ?? NSNull(),
+                "focusedWindowAvailable": focusedWindow != nil,
+                "focusedWindowCFEqual": sameWindow,
+                "nativeWindowIdentifierMatches": currentIdentifier == context.windowIdentifier,
+                "windowBoundsMatch": matchingBounds,
+                "nsWorkspaceSelectedSafari": front?.processIdentifier == context.pid,
+                "nsWorkspaceAppleSafariVerified": signedSafari,
+                "axFocusedApplicationAvailable": axFront != nil,
+                "axFocusedApplicationPIDReadStatus": axPIDStatus.rawValue,
+                "axFocusedApplicationIsSelectedSafari": axPIDStatus == .success && pid == context.pid
+            ]
+            throw Failure(code: "FOCUS_CHANGED", message: "Safari's foreground process, focused window, or window bounds changed. Stop and inspect fresh state.", details: diagnostics)
         }
         if requirePage, pageURLs(window) != [context.request.target.expectedURL] {
             throw Failure(code: "PAGE_CHANGED", message: "The selected Safari page changed before the native organization action.")
+        }
+        if let expected = context.expectedSelection {
+            let selected: SelectedTab?
+            if nativeTabs(context).isEmpty { selected = nil }
+            else { selected = try rawSelectedTab(context) }
+            let group = try currentGroupTitle(context)
+            try Self.validateExpectedSelection(groupTitle: group, selectedTab: selected,
+                                               pageURLs: pageURLs(window), expectedGroupTitle: expected.groupTitle,
+                                               expectedTab: expected.tab)
         }
         for source in [CGEventSourceStateID.combinedSessionState, .hidSystemState] {
             let flags = CGEventSource.flagsState(source)
@@ -662,13 +946,20 @@ final class SafariTabOrganization {
               let hit, isDescendant(hit, of: node) else {
             throw Failure(code: "NATIVE_TARGET_OBSCURED", message: "The native Safari tab or group row is covered by a different control.")
         }
-        let types: [CGEventType] = button == .left ? [.leftMouseDown, .leftMouseUp] : [.rightMouseDown, .rightMouseUp]
-        for type in types {
-            guard let event = CGEvent(mouseEventSource: source, mouseType: type, mouseCursorPosition: point, mouseButton: button) else {
-                throw Failure(code: "NATIVE_INPUT_FAILED", message: "Could not construct the native Safari context-menu event.")
-            }
+        let downType: CGEventType = button == .left ? .leftMouseDown : .rightMouseDown
+        let upType: CGEventType = button == .left ? .leftMouseUp : .rightMouseUp
+        guard let move = CGEvent(mouseEventSource: source, mouseType: .mouseMoved, mouseCursorPosition: point, mouseButton: button),
+              let down = CGEvent(mouseEventSource: source, mouseType: downType, mouseCursorPosition: point, mouseButton: button),
+              let up = CGEvent(mouseEventSource: source, mouseType: upType, mouseCursorPosition: point, mouseButton: button) else {
+            throw Failure(code: "NATIVE_INPUT_FAILED", message: "Could not construct the native Safari pointer and click events.")
+        }
+        // Match the existing trusted-input backend: update the real pointer,
+        // then deliver one click through HID to the verified foreground Safari.
+        for event in [move, down, up] {
+            event.flags = []
+            event.setIntegerValueField(.mouseEventClickState, value: 1)
             actions += 1
-            event.postToPid(context.pid)
+            event.post(tap: .cghidEventTap)
         }
     }
 
@@ -688,8 +979,11 @@ final class SafariTabOrganization {
               let up = CGEvent(keyboardEventSource: source, virtualKey: code, keyDown: false) else {
             throw Failure(code: "NATIVE_INPUT_FAILED", message: "Could not construct the native Safari group-name commit event.")
         }
-        actions += 2
-        down.postToPid(context.pid); up.postToPid(context.pid)
+        for event in [down, up] {
+            event.flags = []
+            actions += 1
+            event.post(tap: .cghidEventTap)
+        }
     }
 
     private func press(_ node: AXUIElement, context: Context, isAuthorized: () -> Bool,
@@ -726,7 +1020,7 @@ final class SafariTabOrganization {
         throw Failure(code: "GROUP_EDITOR_UNAVAILABLE", message: "Safari did not focus the native group name editor. Inspect its current group state; do not replay the mutation.")
     }
 
-    private func waitForGroup(_ title: String, context: Context, isAuthorized: () -> Bool) throws {
+    private func waitForGroup(_ title: String?, context: Context, isAuthorized: () -> Bool) throws {
         let deadline = Date().addingTimeInterval(2)
         repeat {
             try stable(context, isAuthorized: isAuthorized, requirePage: false)
@@ -736,14 +1030,46 @@ final class SafariTabOrganization {
         throw Failure(code: "GROUP_RESULT_UNCONFIRMED", message: "Safari did not expose the requested selected group title. Inspect its current state; do not replay the mutation.")
     }
 
-    private func waitForMenuDismissal(_ context: Context, isAuthorized: () -> Bool) throws {
+    private func waitForMenuDismissal(_ context: Context, isAuthorized: () -> Bool, stage: String = "menu_completion") throws {
         let deadline = Date().addingTimeInterval(2)
+        var state = nativeMenuState(context)
         repeat {
             try stable(context, isAuthorized: isAuthorized, requirePage: false)
-            if !nativeNodes(context.window).contains(where: { ["SafariContextMenu", "TabGroupPickerMenu"].contains(string($0, kAXIdentifierAttribute) ?? "") }) { return }
+            state = nativeMenuState(context)
+            if Self.menuCompletionConfirmed(visibleNativeMenu: state.visible, nativeMenuFocused: state.menuFocused) { return }
             Thread.sleep(forTimeInterval: 0.04)
         } while Date() < deadline
-        throw Failure(code: "GROUP_RESULT_UNCONFIRMED", message: "Safari kept the native group menu open after delivery. Inspect fresh state; do not replay the mutation.")
+        var diagnostics = state.data
+        diagnostics["stage"] = stage
+        throw Failure(code: "GROUP_RESULT_UNCONFIRMED", message: "Safari did not finish its native menu interaction after delivery. Inspect fresh state; do not replay the mutation.", details: diagnostics)
+    }
+
+    private func nativeMenuState(_ context: Context) -> NativeMenuState {
+        // Check real application-level menu surfaces, not the moved tab's old
+        // AX subtree. Hit testing excludes retained, non-interactive AX stubs.
+        let nodes = nativeNodes(context.app)
+        let menus = nodes.filter { string($0, kAXRoleAttribute) == kAXMenuRole && nativeMenuVisible($0, context: context) }
+        let contextVisible = menus.contains { string($0, kAXIdentifierAttribute) == "SafariContextMenu" }
+        let pickerVisible = menus.contains { string($0, kAXIdentifierAttribute) == "TabGroupPickerMenu" }
+        let viewOwners = nodes.filter { string($0, kAXIdentifierAttribute) == "SafariViewMenu" }
+        let viewVisible = menus.contains { menu in viewOwners.contains { isDescendant(menu, of: $0) } }
+        let otherVisible = menus.contains { menu in
+            !["SafariContextMenu", "TabGroupPickerMenu"].contains(string(menu, kAXIdentifierAttribute) ?? "") &&
+                !viewOwners.contains { isDescendant(menu, of: $0) }
+        }
+        let focusedRole = element(context.app, kAXFocusedUIElementAttribute).flatMap { string($0, kAXRoleAttribute) }
+        let menuFocused = [kAXMenuRole, kAXMenuItemRole, kAXMenuBarItemRole].contains(focusedRole ?? "")
+        return NativeMenuState(contextVisible: contextVisible, pickerVisible: pickerVisible,
+                               viewVisible: viewVisible, otherVisible: otherVisible, menuFocused: menuFocused)
+    }
+
+    private func nativeMenuVisible(_ node: AXUIElement, context: Context) -> Bool {
+        guard let rect = frame(node), !rect.isEmpty else { return false }
+        let intersection = rect.intersection(context.request.target.windowBounds)
+        guard !intersection.isNull, !intersection.isEmpty else { return false }
+        var hit: AXUIElement?
+        return AXUIElementCopyElementAtPosition(context.app, Float(intersection.midX), Float(intersection.midY), &hit) == .success &&
+            hit.map { isDescendant($0, of: node) } == true
     }
 
     private func dismissMenus(_ context: Context, isAuthorized: () -> Bool, actions: inout Int) throws {
@@ -820,6 +1146,11 @@ final class SafariTabOrganization {
     }
     private func close(_ lhs: CGRect, _ rhs: CGRect) -> Bool {
         abs(lhs.minX - rhs.minX) <= 8 && abs(lhs.minY - rhs.minY) <= 8 && abs(lhs.width - rhs.width) <= 8 && abs(lhs.height - rhs.height) <= 8
+    }
+    private static func diagnosticBounds(_ rect: CGRect) -> [String: Double]? {
+        let values = [Double(rect.minX), Double(rect.minY), Double(rect.width), Double(rect.height)]
+        guard values.allSatisfy({ $0.isFinite && abs($0) <= 100_000 }) else { return nil }
+        return ["left": values[0], "top": values[1], "width": values[2], "height": values[3]]
     }
     private func onMain<T>(_ body: () -> T) -> T { Thread.isMainThread ? body() : DispatchQueue.main.sync(execute: body) }
     private func isAppleSafari(_ app: NSRunningApplication) -> Bool {

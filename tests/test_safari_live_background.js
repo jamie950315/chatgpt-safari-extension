@@ -99,6 +99,15 @@ test("poll discovery never launches the companion; real handles bind the profile
   assert.equal(result.tabs[0].profileId, f.profileId);
   await assert.rejects(f.binding.execute(f.request("read_page", { handle: "live:other-profile:12" })), { code: "INVALID_HANDLE" });
 });
+test("live polling keeps scoped selection diagnostics available independently of sidebar ownership", async () => {
+  const f = fixture();
+  const selection = { phase: "rejected", action: "createGroup", before: [{ tabId: 12, windowId: 8, active: true }],
+    after: [{ tabId: 99, windowId: 9, active: true }], events: [{ type: "windowFocusChanged", windowId: 9 }] };
+  f.setSidebar({ selectionDiagnostics: () => structuredClone(selection) });
+  await f.binding.start();
+  assert.deepEqual(f.calls[0].selection, selection);
+  assert.equal(f.calls[0].action, "livePoll");
+});
 test("a batch activates Safari once and does not undo a later manual focus change", async () => {
   const f = fixture();
   const request = f.request("interact", { handle: `live:${f.profileId}:12`, documentId: "doc", snapshotId: "snap",
@@ -155,6 +164,25 @@ test("native errors are resolved once with no synthetic input or mutation replay
   assert.equal(f.calls.at(-1).response.error.data.mayHavePostedInput, false);
   assert.equal(f.calls.at(-1).response.error.data.details.stage, "input");
   assert.equal(f.scripts.every(x => typeof x.func === "function" && x.target.frameIds[0] === 0), true);
+});
+
+test("native organization failure preserves confirmed mutation and no-replay outcomes alongside existing error data", async () => {
+  for (const mutationApplied of [false, true]) {
+    const f = fixture();
+    const request = f.request("organize", { handle: `live:${f.profileId}:12`, expectedUrl: f.tab.url, operation: "createGroup" });
+    const native = { code: "FOCUS_CHANGED", message: "Native selection changed", actionsPerformed: mutationApplied ? 5 : 0,
+      mutationApplied, doNotReplay: mutationApplied, mayHavePostedInput: mutationApplied,
+      tabBarRestoration: "unconfirmed", nativeSidebarRestoration: "restored", data: { stage: "native-result", retained: true } };
+    f.setNative(command => command.action === "livePoll" ? { ok: true, requests: [request] }
+      : command.action === "liveOrganize" ? { ok: false, error: native } : { ok: true, result: { eventsPosted: 0 } });
+    await f.binding.start();
+    const resolved = f.calls.find(command => command.action === "liveResolve");
+    assert.equal(resolved.response.error.code, native.code);
+    assert.deepEqual(resolved.response.error.data, { ...native.data, actionsPerformed: native.actionsPerformed,
+      mutationApplied, doNotReplay: mutationApplied, mayHavePostedInput: mutationApplied,
+      tabBarRestoration: "unconfirmed", nativeSidebarRestoration: "restored" });
+    assert.equal(f.calls.filter(command => command.action === "liveOrganize").length, 1);
+  }
 });
 
 test("original agent typing requires existing focus and never posts an implicit click", async () => {

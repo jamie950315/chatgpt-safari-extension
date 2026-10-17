@@ -1,4 +1,5 @@
 import Foundation
+import ApplicationServices
 
 @main
 struct SafariTabOrganizationGuards {
@@ -64,6 +65,56 @@ struct SafariTabOrganizationGuards {
         precondition(emptyInventory.isEmpty)
         rejects("GROUP_INVENTORY_INCOMPLETE") { _ = try SafariTabOrganization.groupInventory(Array(nativeGroups.prefix(1)), currentGroup: "Research") }
         rejects("AMBIGUOUS_GROUP") { _ = try SafariTabOrganization.groupInventory(nativeGroups + [nativeGroups[1]], currentGroup: "Research") }
+        try SafariTabOrganization.validateExpectedSelection(groupTitle: "Destination", selectedTab: selected, pageURLs: [selected.url],
+                                                              expectedGroupTitle: "Destination", expectedTab: selected)
+        try SafariTabOrganization.validateExpectedSelection(groupTitle: nil, selectedTab: selected, pageURLs: [selected.url],
+                                                              expectedGroupTitle: nil, expectedTab: selected)
+        rejects("SELECTION_CHANGED") {
+            try SafariTabOrganization.validateExpectedSelection(groupTitle: "Manual switch", selectedTab: selected, pageURLs: [selected.url],
+                                                                  expectedGroupTitle: "Destination", expectedTab: selected)
+        }
+        rejects("SELECTION_CHANGED") {
+            try SafariTabOrganization.validateExpectedSelection(groupTitle: "Destination", selectedTab: selected, pageURLs: ["https://example.com/manual"],
+                                                                  expectedGroupTitle: "Destination", expectedTab: selected)
+        }
+        rejects("SELECTION_CHANGED") {
+            let otherTab = SafariTabOrganization.SelectedTab(index: 0, title: selected.title, url: selected.url)
+            try SafariTabOrganization.validateExpectedSelection(groupTitle: "Destination", selectedTab: otherTab, pageURLs: [selected.url],
+                                                                  expectedGroupTitle: "Destination", expectedTab: selected)
+        }
+        try SafariTabOrganization.validateRenamedInventory(["Source", "Renamed"], previousTitle: "Destination", newTitle: "Renamed")
+        try SafariTabOrganization.validateRenamedInventory(["Source", "Destination"], previousTitle: "Destination", newTitle: "Destination")
+        rejects("GROUP_RENAME_UNCONFIRMED") {
+            try SafariTabOrganization.validateRenamedInventory(["Source", "Destination"], previousTitle: "Destination", newTitle: "Renamed")
+        }
+        rejects("GROUP_RENAME_UNCONFIRMED") {
+            try SafariTabOrganization.validateRenamedInventory(["Source", "Destination", "Renamed"], previousTitle: "Destination", newTitle: "Renamed")
+        }
+        let renamedInventory = try SafariTabOrganization.inventoryAfterConfirmedRename(["Source", "Destination", "Other"], previousTitle: "Destination", newTitle: "Renamed")
+        precondition(renamedInventory == ["Source", "Renamed", "Other"])
+        let unchangedInventory = try SafariTabOrganization.inventoryAfterConfirmedRename(["Source", "Destination"], previousTitle: "Destination", newTitle: "Destination")
+        precondition(unchangedInventory == ["Source", "Destination"])
+        rejects("GROUP_RENAME_UNCONFIRMED") {
+            _ = try SafariTabOrganization.inventoryAfterConfirmedRename(["Source", "Other"], previousTitle: "Destination", newTitle: "Renamed")
+        }
+        rejects("GROUP_RENAME_UNCONFIRMED") {
+            _ = try SafariTabOrganization.inventoryAfterConfirmedRename(["Source", "Destination", "Renamed"], previousTitle: "Destination", newTitle: "Renamed")
+        }
+        rejects("GROUP_RENAME_UNCONFIRMED") {
+            _ = try SafariTabOrganization.inventoryAfterConfirmedRename(["Source", "Destination", "Destination"], previousTitle: "Destination", newTitle: "Renamed")
+        }
+        let unchecked = try SafariTabOrganization.tabBarPreference(mark: nil, status: .noValue)
+        let checked = try SafariTabOrganization.tabBarPreference(mark: "✓", status: .success)
+        precondition(!unchecked && checked)
+        rejects("TAB_BAR_PREFERENCE_UNAVAILABLE") {
+            _ = try SafariTabOrganization.tabBarPreference(mark: nil, status: .attributeUnsupported)
+        }
+        precondition(SafariTabOrganization.menuCompletionConfirmed(visibleNativeMenu: false, nativeMenuFocused: false))
+        precondition(!SafariTabOrganization.menuCompletionConfirmed(visibleNativeMenu: true, nativeMenuFocused: false))
+        precondition(!SafariTabOrganization.menuCompletionConfirmed(visibleNativeMenu: false, nativeMenuFocused: true))
+        precondition(SafariTabOrganization.sidebarLayoutConfirmed(requestedVisible: true, sidebarHit: true, pickerHit: false))
+        precondition(SafariTabOrganization.sidebarLayoutConfirmed(requestedVisible: false, sidebarHit: false, pickerHit: true))
+        precondition(!SafariTabOrganization.sidebarLayoutConfirmed(requestedVisible: false, sidebarHit: false, pickerHit: false))
         print("Safari native Tab Group argument guards, title/window identities, and observed selected-tab identities passed. No Safari activation or input was performed.")
     }
 }

@@ -144,6 +144,44 @@
         if (typeof profileId !== "string" || !/^[0-9a-f-]{36}$/i.test(profileId)) throw new Error("The Safari browser profile is not ready");
         return { instanceId: state.instanceId, profileId, tabId: state.tabId, windowId: state.windowId };
       },
+      async rebindAgentOwner(state, previousTabId) {
+        let step = "REBIND_STATE";
+        try {
+          if (!embedded || owner !== state || !Number.isSafeInteger(previousTabId) || previousTabId < 0) throw new Error();
+          const token = state.instanceId;
+          // The sidebar has verified this one native lease and installed its
+          // real tab identity on the same state. Never reopen the native owner
+          // or refresh its account tunnel for a frame remount.
+          step = "REBIND_CONTEXT";
+          await update(state, "update");
+          step = "REBIND_STATE";
+          if (owner !== state || owner.instanceId !== token) throw new Error();
+          step = "REBIND_SNAPSHOT";
+          await api.scripting.executeScript({ target: { tabId: state.tabId, frameIds: [0] }, world: "ISOLATED",
+            func: function invalidateReboundSnapshot() {
+              const snapshot = globalThis.__chatGPTSafariLiveDocument;
+              if (snapshot) { snapshot.nodes.clear(); snapshot.snapshotId = null; }
+            } });
+          step = "REBIND_CONVERSATION";
+          const previousKey = `codexWorkSidePanelConversationUrl:${previousTabId}`;
+          const conversation = (await api.storage.session.get(previousKey))[previousKey];
+          step = "REBIND_STATE";
+          if (owner !== state || owner.instanceId !== token) throw new Error();
+          step = "REBIND_CONVERSATION";
+          if (previousTabId !== state.tabId) {
+            if (typeof conversation === "string") {
+              await api.storage.session.set({ [`codexWorkSidePanelConversationUrl:${state.tabId}`]: conversation });
+            }
+            await api.storage.session.remove(previousKey);
+          }
+          step = "REBIND_STATE";
+          if (owner !== state || owner.instanceId !== token) throw new Error();
+        } catch {
+          // The caller records this fixed phase code, never the underlying
+          // native/storage/script error text or private browser identities.
+          throw Object.assign(new Error("The native Safari sidebar owner rebind could not be completed."), { code: step });
+        }
+      },
       async agentKernelURL() {
         if (!embedded || !owner) throw new Error("Open the ChatGPT sidebar before starting its agent kernel");
         const state = owner;

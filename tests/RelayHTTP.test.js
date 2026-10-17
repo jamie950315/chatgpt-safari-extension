@@ -30,6 +30,8 @@ test("provider relay uses real bounded HTTP, isolated capabilities, module gates
       res.writeHead(200, { "Content-Type": "application/json" }); res.end("{\"fixture\":true}");
     } else if (req.url.startsWith("/__codex-api/settings/user")) {
       res.writeHead(404, { "Content-Type": "application/json" }); res.end("{\"fixture\":false}");
+    } else if (req.url.startsWith("/backend-api/f/conversation?") || req.url.startsWith("/backend-api/me?")) {
+      res.writeHead(400, { "Content-Type": "application/json" }); res.end("{\"fixture\":false}");
     } else if (req.url === "/stream") {
       res.writeHead(200, { "Content-Type": "text/event-stream" }); res.write("data: first\n\n"); setTimeout(() => res.end("data: last\n\n"), 250);
     } else if (req.url === "/challenge") {
@@ -133,6 +135,16 @@ test("provider relay uses real bounded HTTP, isolated capabilities, module gates
   assert.equal(diagnosticStatus.requestRoutes.hostModule, 1);
   assert.equal(diagnosticStatus.requestRoutes.runtimeModule, 1);
   assert.ok(diagnosticStatus.requestRoutes.rejections >= 3);
+  assert.equal(diagnosticStatus.requestRoutes.rejection_capability, 1);
+  assert.equal(diagnosticStatus.requestRoutes.rejection_host, 1);
+  assert.equal(diagnosticStatus.requestRoutes.rejection_origin, 1);
+  assert.equal(diagnosticStatus.requestRoutes.rejection_route, 1);
+  await call("/backend-api/f/conversation?private=synthetic-private-query", { method: "POST" });
+  await call("/backend-api/me?private=synthetic-private-account");
+  child.stdin.write("status\n"); const accountStatus = await next();
+  assert.equal(accountStatus.requestRoutes.conversation_submit_http_400, 1);
+  assert.equal(accountStatus.requestRoutes.account_me_http_400, 1);
+  assert.ok(!JSON.stringify(accountStatus.requestRoutes).includes("synthetic-private"));
   assert.equal((await call("/cdn/assets/fixture-123.js", { authorized: false })).status, 200);
   assert.equal((await call("/cdn/assets/async/637745.14f70978dc.js", { authorized: false })).status, 200);
   assert.equal(received.at(-1).headers.cookie, undefined);

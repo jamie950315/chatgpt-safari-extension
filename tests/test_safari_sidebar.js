@@ -20,6 +20,7 @@ function event() {
 
 function fixture(options = {}) {
   const messages = [], scripts = [], rules = [], storage = {}, controllers = new Set();
+  const scriptableTabs = new Set();
   const selections = [];
   let focusedWindow = 3;
   if (options.savedState) storage.chatgptSafariSidebarStateV1 = structuredClone(options.savedState);
@@ -59,15 +60,24 @@ function fixture(options = {}) {
       onRemoved: event(),
       onActivated: event(),
       onUpdated: event(),
+      onCreated: event(),
+      onAttached: event(),
+      onDetached: event(),
     },
     windows: {
       async get(windowId) { return { id: windowId, focused: focusedWindow === windowId }; },
       async update(windowId) { focusedWindow = windowId; api.windows.onFocusChanged.emit(windowId); },
       onFocusChanged: event(),
+      onCreated: event(),
+      onRemoved: event(),
     },
     scripting: { async executeScript(args) {
       scripts.push(args);
       if (options.scriptFailure) throw new Error("Script rejected");
+      if (tabs.get(args.target.tabId)?.active) scriptableTabs.add(args.target.tabId);
+      if (options.requireActiveScript && !scriptableTabs.has(args.target.tabId)) {
+        throw new Error("Invalid call to scripting.executeScript(). Could not execute script on this tab.");
+      }
       if (args.files) { controllers.add(args.target.tabId); return [{ frameId: 0 }]; }
       if (args.func.name !== "callSidebarController") return [];
       if (options.noAcknowledgement) return [];
@@ -93,7 +103,7 @@ function fixture(options = {}) {
       if (!handled) resolve(undefined);
     });
   }
-  return { api, adapter, messages, scripts, rules, tabs, storage, request, selections };
+  return { api, adapter, messages, scripts, rules, tabs, storage, request, selections, controllers };
 }
 
 test("an original-agent batch selects its target and restores the genuine sidebar owner without remounting", async () => {
@@ -204,6 +214,29 @@ test("a confirmed native group move retains the genuine owner when Safari activa
   assert.notEqual(f.storage.chatgptSafariSidebarStateV1.openPanels[0].instanceId, owner.instanceId);
 });
 
+test("native selection diagnostics retain only bounded event and inventory IDs", async () => {
+  const f = fixture({ companion: { embedded: true, onClosed: event(), async open() {}, async close() {} } });
+  await f.adapter.sidePanel.open({ tabId: 11 });
+  const owner = f.messages[0].message;
+  await f.adapter.withAgentSelection(owner.instanceId, await f.api.tabs.get(12), async selection => {
+    await selection.select(await f.api.tabs.get(12));
+    return selection.runNativeGroupMove("moveToGroup", async () => {
+      for (let id = 100; id < 180; id++) f.api.tabs.onCreated.emit({ id, windowId: 3, url: "https://private.example/", title: "Secret fixture" });
+      return { action: "moveToGroup", mutationApplied: true };
+    });
+  }, { nativeGroupMove: "moveToGroup" });
+  const trace = f.adapter.selectionDiagnostics();
+  assert.equal(trace.phase, "verified");
+  assert.equal(trace.events.length, 64);
+  assert.deepEqual(trace.events.at(-1), { type: "tabCreated", tabId: 179, windowId: 3 });
+  assert.deepEqual(trace.before.map(tab => tab.tabId), [11, 12]);
+  assert.equal(trace.after.length, 2);
+  assert.doesNotMatch(JSON.stringify(trace), /https:|Secret|private|instanceId/);
+  trace.events.length = 0;
+  f.api.tabs.onCreated.emit({ id: 999, windowId: 3 });
+  assert.equal(f.adapter.selectionDiagnostics().events.length, 64, "diagnostics neither record outside the native scope nor expose mutable state");
+});
+
 test("a source owner becomes visible again after the exact confirmed native sibling transition", async () => {
   for (const manualAfter of [false, true]) {
     const calls = [];
@@ -219,12 +252,11 @@ test("a source owner becomes visible again after the exact confirmed native sibl
         f.tabs.get(13).index = 1;
         await f.api.tabs.update(13, { active: true });
         const selected = await f.api.tabs.get(13);
-        return { action: "createGroup", mutationApplied: true,
-          selectedTab: { index: selected.index, title: selected.title, url: selected.url } };
+        return nativeGroupResult("createGroup", f.tabs.get(12), selected, "Created");
       });
       if (manualAfter) await f.api.tabs.update(14, { active: true });
       return result;
-    }, { nativeGroupMove: "createGroup" });
+    }, { nativeGroupMove: "createGroup", destinationTitle: "Created" });
     await f.adapter.sidePanel.getOptions();
     assert.deepEqual(f.selections, manualAfter ? [12, 13, 14] : [12, 13, 11]);
     assert.equal(f.tabs.get(manualAfter ? 14 : 11).active, true);
@@ -234,6 +266,365 @@ test("a source owner becomes visible again after the exact confirmed native sibl
       assert.equal(f.messages.length, 1);
       assert.equal(f.storage.chatgptSafariSidebarStateV1.openPanels[0].instanceId, owner.instanceId);
     }
+  }
+});
+
+function nativeGroupResult(action, target, selected, destination = "Destination") {
+  const nativeWindowIdentifier = "native-window";
+  const collection = title => ({ title, nativeWindowIdentifier, identity: title === null ? null
+    : { kind: "safari-native-title", title, windowIdentifier: nativeWindowIdentifier } });
+  return { action, mutationApplied: true, actionsPerformed: 5, windowIdentifier: nativeWindowIdentifier,
+    currentGroupTitle: "Source", destinationGroupTitle: destination,
+    sourceCollection: { ...collection("Source"), selectedUrlBefore: target.url, restored: true },
+    destinationCollection: collection(destination), selectedTab: { index: selected.index, title: selected.title, url: selected.url } };
+}
+
+async function createDestination(f, selection, target) {
+  const transfer = (id, from, to) => {
+    f.api.tabs.onDetached.emit(id, { oldWindowId: from });
+    f.api.tabs.onAttached.emit(id, { newWindowId: to });
+    if (f.tabs.has(id)) f.tabs.get(id).windowId = to;
+  };
+  await f.api.tabs.update(11, { active: true });
+  transfer(12, 3, -1);
+  transfer(12, -1, 3);
+  await f.api.tabs.update(12, { active: true });
+  transfer(13, 3, -1);
+  transfer(11, 3, -1);
+  f.tabs.get(11).active = false;
+  f.tabs.delete(13); f.api.tabs.onRemoved.emit(13, { windowId: -1 });
+  selection.assertCurrent();
+  return transfer;
+}
+
+test("observed create transfers remount the parked same-ID source owner only after native proof", async () => {
+  const calls = [];
+  const f = fixture({ companion: { embedded: true, onClosed: event(),
+    async open(state) { calls.push(["open", state.tabId]); }, async close(state) { calls.push(["close", state.tabId]); },
+    async rebindAgentOwner(state, previousTabId) { calls.push(["rebind", previousTabId, state.tabId, state.instanceId]); } } });
+  f.tabs.set(13, { id: 13, windowId: 3, index: 2, title: "Source page", url: "https://source.example/", active: false });
+  await f.adapter.sidePanel.open({ tabId: 11 });
+  const owner = f.messages[0].message, target = await f.api.tabs.get(12);
+  const result = await f.adapter.withAgentSelection(owner.instanceId, target, async selection => {
+    await selection.select(target);
+    return selection.runNativeGroupMove("createGroup", async () => {
+      const transfer = await createDestination(f, selection, target);
+      assert.equal(f.tabs.get(11).windowId, -1, "Safari temporarily parks the real source document");
+      const suspended = await f.request({ type: MESSAGE.ready }, {
+        id: f.api.runtime.id, frameId: 0, tab: { ...f.tabs.get(11), windowId: 3 },
+      });
+      assert.equal(suspended.suspended, true, "a stale source-window sender cannot mount before native restoration");
+      f.api.tabs.onUpdated.emit(11, { status: "complete" });
+      await f.adapter.sidePanel.getOptions();
+      assert.equal(f.messages.length, 1, "ready and complete events neither mount nor close the parked owner");
+      assert.deepEqual(calls, [["open", 11]]);
+      transfer(12, 3, -1);
+      f.tabs.delete(12); f.api.tabs.onRemoved.emit(12, { windowId: -1 });
+      transfer(11, -1, 3);
+      f.tabs.set(23, { id: 23, windowId: 3, index: 1, title: "Source page", url: "https://source.example/", active: false });
+      f.api.tabs.onCreated.emit(f.tabs.get(23));
+      await f.api.tabs.update(11, { active: true });
+      selection.assertCurrent();
+      return nativeGroupResult("createGroup", target, await f.api.tabs.get(11), "Created");
+    });
+  }, { nativeGroupMove: "createGroup", destinationTitle: "Created" });
+  await f.adapter.sidePanel.getOptions();
+  assert.deepEqual(calls, [["open", 11], ["rebind", 11, 11, owner.instanceId]]);
+  assert.deepEqual(result.sidebarOwner, { tabId: 11, windowId: 3, rebound: true });
+  assert.deepEqual(f.selections, [12, 11, 12, 11]);
+  assert.equal(f.storage.chatgptSafariSidebarStateV1.openPanels[0].instanceId, owner.instanceId);
+  assert.equal(f.storage.chatgptSafariSidebarStateV1.openPanels[0].tabId, 11);
+  assert.deepEqual(f.messages.map(entry => [entry.tabId, entry.message.type, entry.message.instanceId]), [
+    [11, MESSAGE.mount, owner.instanceId], [11, MESSAGE.unmount, owner.instanceId], [11, MESSAGE.mount, owner.instanceId],
+  ], "native source restoration replaces the failed frame while keeping its original owner token");
+  assert.equal((await f.request({ type: MESSAGE.authorize, tabId: 11, windowId: 3, instanceId: owner.instanceId }, {
+    id: f.api.runtime.id, url: owner.iframeUrl, frameId: 7, tab: f.tabs.get(11),
+  })).ok, true);
+  assert.equal(f.adapter.selectionDiagnostics().phase, "verified");
+  assert.deepEqual(f.adapter.selectionDiagnostics().after.map(tab => tab.tabId), [11, 23]);
+});
+
+test("a create lease rebinds its rekeyed source owner without requiring a target detach round trip", async () => {
+  for (const { retainedController, nativeSelectedId } of [
+    { retainedController: false, nativeSelectedId: 21 },
+    { retainedController: true, nativeSelectedId: 23 },
+  ]) {
+    const calls = [];
+    const f = fixture({ requireActiveScript: true, companion: { embedded: true, onClosed: event(),
+      async open(state) { calls.push(["open", state.tabId]); }, async close(state) { calls.push(["close", state.tabId]); },
+      async rebindAgentOwner(state, previousTabId) {
+        assert.equal(f.tabs.get(state.tabId).active, true, "fresh source owner must be selected before companion snapshot injection");
+        calls.push(["rebind", previousTabId, state.tabId, state.instanceId]);
+      } } });
+    f.tabs.set(13, { id: 13, windowId: 3, index: 2, title: "Source page", url: "https://source.example/", active: false });
+    await f.adapter.sidePanel.setOptions({ tabId: 11, enabled: true, path: "codex-work-sidepanel.html" });
+    await f.adapter.sidePanel.open({ tabId: 11 });
+    const owner = f.messages[0].message, target = await f.api.tabs.get(12);
+    const result = await f.adapter.withAgentSelection(owner.instanceId, target, async selection => {
+      await selection.select(target);
+      return selection.runNativeGroupMove("createGroup", async () => {
+        await f.api.tabs.update(13, { active: true });
+        await f.api.tabs.update(12, { active: true });
+        const source = [await f.api.tabs.get(11), await f.api.tabs.get(13)];
+        for (const tab of source) {
+          f.api.tabs.onDetached.emit(tab.id, { oldWindowId: 3 });
+          f.api.tabs.onAttached.emit(tab.id, { newWindowId: -1 });
+          f.tabs.delete(tab.id); f.api.tabs.onRemoved.emit(tab.id, { windowId: -1 });
+        }
+        selection.assertCurrent();
+        f.tabs.delete(12); f.api.tabs.onRemoved.emit(12, { windowId: -1 });
+        for (const tab of source) {
+          const fresh = { ...tab, id: tab.id + 10, index: tab.id === 11 ? 0 : 1, active: tab.id + 10 === nativeSelectedId };
+          f.tabs.set(fresh.id, fresh); f.api.tabs.onCreated.emit(fresh);
+        }
+        if (retainedController) f.controllers.add(21);
+        // API activation ordering must not be a prerequisite for native proof.
+        f.api.tabs.onActivated.emit({ tabId: nativeSelectedId, windowId: 3 });
+        return nativeGroupResult("createGroup", target, await f.api.tabs.get(nativeSelectedId), "Created");
+      });
+    }, { nativeGroupMove: "createGroup", destinationTitle: "Created", nativeWindowIdentifier: "native-window" });
+    assert.deepEqual(result.sidebarOwner, { tabId: 21, windowId: 3, rebound: true });
+    assert.deepEqual(calls, [["open", 11], ["rebind", 11, 21, owner.instanceId]]);
+    assert.deepEqual(f.messages.map(entry => [entry.tabId, entry.message.type, entry.message.instanceId]), [
+      [11, MESSAGE.mount, owner.instanceId], ...(retainedController ? [[21, MESSAGE.unmount, owner.instanceId]] : []),
+      [21, MESSAGE.mount, owner.instanceId],
+    ]);
+    assert.equal(f.storage.chatgptSafariSidebarStateV1.openPanels[0].tabId, 21);
+    assert.equal(f.tabs.get(21).active, true, "an initially inactive rekeyed owner is restored after its verified native source sibling");
+    assert.deepEqual(f.storage.chatgptSafariSidebarStateV1.tabOptions.map(item => item.tabId), [21]);
+    const sender = { id: f.api.runtime.id, url: owner.iframeUrl, frameId: 7 };
+    assert.equal((await f.request({ type: MESSAGE.authorize, tabId: 11, windowId: 3, instanceId: owner.instanceId },
+      { ...sender, tab: { id: 11, windowId: 3 } })).ok, false, "the original tab identity has no alias");
+    assert.equal((await f.request({ type: MESSAGE.authorize, tabId: 21, windowId: 3, instanceId: owner.instanceId },
+      { ...sender, tab: f.tabs.get(21) })).ok, true);
+    assert.equal(f.adapter.selectionDiagnostics().phase, "verified");
+    assert.equal(f.adapter.selectionDiagnostics().failure, undefined);
+    await f.request({ type: MESSAGE.ready }, { id: f.api.runtime.id, frameId: 0, tab: f.tabs.get(21) });
+    assert.deepEqual(calls, [["open", 11], ["rebind", 11, 21, owner.instanceId]],
+      "the restored document's ready signal does not reopen the native owner");
+    await f.api.tabs.update(23, { active: true });
+    await f.adapter.sidePanel.getOptions();
+    assert.notEqual(f.storage.chatgptSafariSidebarStateV1.openPanels[0].instanceId, owner.instanceId,
+      "ordinary ownership rules resume immediately after this native lease");
+  }
+});
+
+test("create transfers cannot rebind an owner without valid source proof and a unique initial and fresh page", async () => {
+  for (const fault of ["source", "initial_duplicate", "fresh_duplicate"]) {
+    const calls = [];
+    const f = fixture({ companion: { embedded: true, onClosed: event(), async open() {}, async close(state) { calls.push(state.tabId); },
+      async rebindAgentOwner() { assert.fail("An unconfirmed page must not acquire the native owner"); } } });
+    f.tabs.set(13, { id: 13, windowId: 3, index: 2, title: "Source page", url: "https://source.example/", active: false });
+    if (fault === "initial_duplicate") f.tabs.set(14, { ...f.tabs.get(11), id: 14, index: 3, active: false });
+    await f.adapter.sidePanel.open({ tabId: 11 });
+    const owner = f.messages[0].message, target = await f.api.tabs.get(12);
+    await assert.rejects(f.adapter.withAgentSelection(owner.instanceId, target, async selection => {
+      await selection.select(target);
+      return selection.runNativeGroupMove("createGroup", async () => {
+        const transfer = await createDestination(f, selection, target);
+        transfer(12, 3, -1);
+        transfer(11, -1, 3);
+        await f.api.tabs.update(11, { active: true });
+        const selected = await f.api.tabs.get(11);
+        const result = nativeGroupResult("createGroup", target, selected, "Created");
+        f.tabs.delete(11); f.tabs.set(21, { ...selected, id: 21 });
+        if (fault === "source") result.sourceCollection.restored = false;
+        if (fault === "fresh_duplicate") f.tabs.set(22, { ...selected, id: 22, index: 3, active: false });
+        return result;
+      });
+    }, { nativeGroupMove: "createGroup", destinationTitle: "Created" }), error => {
+      assert.equal(error.mutationApplied, true); assert.equal(error.doNotReplay, true); return true;
+    });
+    assert.deepEqual(calls, [11]);
+    assert.deepEqual(f.storage.chatgptSafariSidebarStateV1.openPanels, []);
+    assert.deepEqual(f.selections, [12, 11, 12, 11]);
+    assert.deepEqual(f.adapter.selectionDiagnostics().failure, { stage: "source_proof", code: "FOCUS_CHANGED" });
+  }
+});
+
+test("a user activation during the proved owner restoration cancels before any rebind script", async () => {
+  let rebindings = 0;
+  const f = fixture({ companion: { embedded: true, onClosed: event(), async open() {}, async close() {},
+    async rebindAgentOwner() { rebindings++; } } });
+  f.tabs.set(13, { id: 13, windowId: 3, index: 2, title: "Source page", url: "https://source.example/", active: false });
+  await f.adapter.sidePanel.open({ tabId: 11 });
+  const owner = f.messages[0].message, target = await f.api.tabs.get(12), update = f.api.tabs.update;
+  f.api.tabs.update = async (id, value) => {
+    const result = await update(id, value);
+    if (id === 21 && value.active) await update(23, { active: true });
+    return result;
+  };
+  await assert.rejects(f.adapter.withAgentSelection(owner.instanceId, target, async selection => {
+    await selection.select(target);
+    return selection.runNativeGroupMove("createGroup", async () => {
+      await createDestination(f, selection, target);
+      const originalOwner = { ...f.tabs.get(11), windowId: 3, index: 0, active: false };
+      f.tabs.delete(11); f.api.tabs.onRemoved.emit(11, { windowId: -1 });
+      f.tabs.delete(12); f.api.tabs.onRemoved.emit(12, { windowId: -1 });
+      f.tabs.set(21, { ...originalOwner, id: 21 });
+      f.tabs.set(23, { id: 23, windowId: 3, index: 1, title: "Source page", url: "https://source.example/", active: true });
+      f.api.tabs.onActivated.emit({ tabId: 23, windowId: 3 });
+      return nativeGroupResult("createGroup", target, await f.api.tabs.get(23), "Created");
+    });
+  }, { nativeGroupMove: "createGroup", destinationTitle: "Created" }), { code: "FOCUS_CHANGED" });
+  assert.equal(rebindings, 0);
+  assert.equal(f.tabs.get(23).active, true);
+  assert.deepEqual(f.selections.slice(-2), [21, 23], "no later restoration steals focus from the user");
+  assert.deepEqual(f.adapter.selectionDiagnostics().failure, { stage: "owner_rebind", code: "FOCUS_CHANGED" });
+});
+
+test("selection failure diagnostics retain only the exact failing phase and safe public code", async () => {
+  for (const stage of ["native", "owner_rebind", "owner_unmount", "owner_mount", "owner_commit"]) {
+    let inject = false;
+    const privateError = () => Object.assign(new Error("Synthetic private URL https://secret.example/ token=never-record"),
+      { code: stage === "native" ? "LIVE_TIMEOUT" : stage === "owner_rebind" ? "REBIND_SNAPSHOT" : "PRIVATE_SECRET_ERROR" });
+    const f = fixture({ companion: { embedded: true, onClosed: event(), async open() {}, async close() {},
+      async rebindAgentOwner() { if (stage === "owner_rebind") throw privateError(); } } });
+    f.tabs.set(13, { id: 13, windowId: 3, index: 2, title: "Source page", url: "https://source.example/", active: false });
+    await f.adapter.sidePanel.open({ tabId: 11 });
+    const owner = f.messages[0].message, target = await f.api.tabs.get(12);
+    const executeScript = f.api.scripting.executeScript;
+    f.api.scripting.executeScript = async command => {
+      const type = command.args?.[0]?.type;
+      if (inject && ((stage === "owner_unmount" && type === MESSAGE.unmount)
+        || (stage === "owner_mount" && type === MESSAGE.mount))) throw privateError();
+      return executeScript(command);
+    };
+    const save = f.api.storage.session.set;
+    f.api.storage.session.set = async value => {
+      if (inject && stage === "owner_commit") { inject = false; throw privateError(); }
+      return save(value);
+    };
+    await assert.rejects(f.adapter.withAgentSelection(owner.instanceId, target, async selection => {
+      await selection.select(target);
+      return selection.runNativeGroupMove("createGroup", async () => {
+        if (stage === "native") throw privateError();
+        const transfer = await createDestination(f, selection, target);
+        transfer(12, 3, -1);
+        transfer(11, -1, 3);
+        await f.api.tabs.update(11, { active: true });
+        inject = true;
+        return nativeGroupResult("createGroup", target, await f.api.tabs.get(11), "Created");
+      });
+    }, { nativeGroupMove: "createGroup", destinationTitle: "Created" }), /Synthetic private/);
+    const trace = f.adapter.selectionDiagnostics();
+    assert.equal(trace.phase, "rejected");
+    assert.deepEqual(trace.failure, { stage,
+      code: stage === "native" ? "LIVE_TIMEOUT" : stage === "owner_rebind" ? "REBIND_SNAPSHOT" : "UNCLASSIFIED" });
+    assert.doesNotMatch(JSON.stringify(trace), /secret|https:|token|PRIVATE_SECRET_ERROR/u);
+    trace.failure.stage = "changed-by-caller";
+    assert.equal(f.adapter.selectionDiagnostics().failure.stage, stage);
+  }
+});
+
+test("an unexpected physical-window attachment or activation cancels a create collection lease", async () => {
+  for (const physicalMove of [false, true]) {
+    const calls = [];
+    const f = fixture({ companion: { embedded: true, onClosed: event(), async open() {}, async close(state) { calls.push(state.tabId); } } });
+    f.tabs.set(13, { id: 13, windowId: 3, index: 2, title: "Source page", url: "https://source.example/", active: false });
+    f.tabs.set(99, { id: 99, windowId: 40, index: 3, title: "Manual", url: "https://manual.example/", active: false });
+    await f.adapter.sidePanel.open({ tabId: 11 });
+    const owner = f.messages[0].message, target = await f.api.tabs.get(12);
+    await assert.rejects(f.adapter.withAgentSelection(owner.instanceId, target, async selection => {
+      await selection.select(target);
+      return selection.runNativeGroupMove("createGroup", async () => {
+        await createDestination(f, selection, target);
+        if (physicalMove) {
+          f.api.tabs.onDetached.emit(11, { oldWindowId: -1 });
+          f.api.tabs.onAttached.emit(11, { newWindowId: 40 });
+        } else await f.api.tabs.update(99, { active: true });
+        assert.throws(() => selection.assertCurrent(), { code: "FOCUS_CHANGED" });
+        throw Object.assign(new Error("Manual selection changed"), { code: "FOCUS_CHANGED", mutationApplied: true, doNotReplay: true });
+      });
+    }, { nativeGroupMove: "createGroup", destinationTitle: "Created" }), { code: "FOCUS_CHANGED" });
+    await f.adapter.sidePanel.getOptions();
+    assert.ok(calls.includes(11));
+    assert.equal(f.selections.at(-1), physicalMove ? 12 : 99, "cleanup must not steal focus back to the hidden owner");
+  }
+});
+
+test("the observed target removal from its source collection waits for exact native move proof", async () => {
+  const calls = [];
+  const f = fixture({ companion: { embedded: true, onClosed: event(),
+    async open(state) { calls.push(["open", state.tabId]); }, async close(state) { calls.push(["close", state.tabId]); } } });
+  f.tabs.set(13, { id: 13, windowId: 3, index: 2, title: "Source fallback", url: "https://source.example/", active: false });
+  await f.adapter.sidePanel.open({ tabId: 11 });
+  const owner = f.messages[0].message, target = await f.api.tabs.get(12);
+  await f.adapter.withAgentSelection(owner.instanceId, target, async selection => {
+    await selection.select(target);
+    return selection.runNativeGroupMove("moveToGroup", async () => {
+      f.tabs.get(13).index = 1;
+      await f.api.tabs.update(13, { active: true });
+      f.tabs.delete(12);
+      f.api.tabs.onRemoved.emit(12, { windowId: -1 });
+      selection.assertCurrent();
+      return nativeGroupResult("moveToGroup", target, await f.api.tabs.get(13));
+    });
+  }, { nativeGroupMove: "moveToGroup", destinationTitle: "Destination", nativeWindowIdentifier: "native-window" });
+  await f.adapter.sidePanel.getOptions();
+  assert.deepEqual(calls, [["open", 11]]);
+  assert.deepEqual(f.selections, [12, 13, 11]);
+  assert.equal(f.storage.chatgptSafariSidebarStateV1.openPanels[0].instanceId, owner.instanceId);
+  assert.deepEqual(f.adapter.selectionDiagnostics().events, [
+    { type: "tabActivated", tabId: 13, windowId: 3 }, { type: "tabRemoved", tabId: 12, windowId: -1 }]);
+  assert.equal(f.adapter.selectionDiagnostics().phase, "verified");
+});
+
+test("a deferred source removal cannot consume failed source, destination, window, or final selection proof", async () => {
+  for (const fault of ["source", "destination", "window", "selection"]) {
+    const f = fixture({ companion: { embedded: true, onClosed: event(), async open() {}, async close() {} } });
+    f.tabs.set(13, { id: 13, windowId: 3, index: 2, title: "Source fallback", url: "https://source.example/", active: false });
+    await f.adapter.sidePanel.open({ tabId: 11 });
+    const owner = f.messages[0].message, target = await f.api.tabs.get(12);
+    await assert.rejects(f.adapter.withAgentSelection(owner.instanceId, target, async selection => {
+      await selection.select(target);
+      return selection.runNativeGroupMove("moveToGroup", async () => {
+        await f.api.tabs.update(13, { active: true });
+        f.tabs.delete(12); f.api.tabs.onRemoved.emit(12, { windowId: -1 });
+        const result = nativeGroupResult("moveToGroup", target, await f.api.tabs.get(13));
+        if (fault === "source") result.sourceCollection.restored = false;
+        if (fault === "destination") result.destinationCollection.identity.title = "Wrong destination";
+        if (fault === "window") result.windowIdentifier = "another-native-window";
+        if (fault === "selection") result.selectedTab.url += "?changed";
+        return result;
+      });
+    }, { nativeGroupMove: "moveToGroup", destinationTitle: "Destination", nativeWindowIdentifier: "native-window" }), error => {
+      assert.equal(error.code, "FOCUS_CHANGED");
+      assert.equal(error.mutationApplied, true);
+      assert.equal(error.doNotReplay, true);
+      assert.equal(error.data.nativeResult.action, "moveToGroup");
+      return true;
+    });
+    await f.adapter.sidePanel.getOptions();
+    assert.deepEqual(f.selections, [12, 13]);
+    assert.equal(f.storage.chatgptSafariSidebarStateV1.openPanels[0].tabId, 13);
+    assert.notEqual(f.storage.chatgptSafariSidebarStateV1.openPanels[0].instanceId, owner.instanceId);
+    assert.equal(f.adapter.selectionDiagnostics().phase, "rejected");
+    assert.deepEqual(f.adapter.selectionDiagnostics().failure, {
+      stage: fault === "selection" ? "selected_proof" : "source_proof", code: "FOCUS_CHANGED",
+    });
+  }
+});
+
+test("owner removal and ordinary-window target removal remain genuine cancellations during native moves", async () => {
+  for (const removed of [11, 12]) {
+    const calls = [];
+    const f = fixture({ companion: { embedded: true, onClosed: event(), async open() {}, async close(state) { calls.push(state.tabId); } } });
+    f.tabs.set(13, { id: 13, windowId: 3, index: 2, title: "Source fallback", url: "https://source.example/", active: false });
+    await f.adapter.sidePanel.open({ tabId: 11 });
+    const owner = f.messages[0].message, target = await f.api.tabs.get(12);
+    await assert.rejects(f.adapter.withAgentSelection(owner.instanceId, target, async selection => {
+      await selection.select(target);
+      return selection.runNativeGroupMove("moveToGroup", async () => {
+        await f.api.tabs.update(13, { active: true });
+        f.tabs.delete(removed); f.api.tabs.onRemoved.emit(removed, { windowId: removed === 11 ? -1 : 3 });
+        assert.throws(() => selection.assertCurrent(), { code: "FOCUS_CHANGED" });
+        return nativeGroupResult("moveToGroup", target, await f.api.tabs.get(13));
+      });
+    }, { nativeGroupMove: "moveToGroup", destinationTitle: "Destination", nativeWindowIdentifier: "native-window" }), { code: "FOCUS_CHANGED" });
+    await f.adapter.sidePanel.getOptions();
+    assert.ok(calls.includes(11));
+    assert.deepEqual(f.selections, [12, 13]);
   }
 });
 
@@ -247,12 +638,11 @@ test("a changed native terminal identity is not overridden to restore the sideba
     const result = await selection.runNativeGroupMove("createGroup", async () => {
       await f.api.tabs.update(13, { active: true });
       const selected = await f.api.tabs.get(13);
-      return { action: "createGroup", mutationApplied: true,
-        selectedTab: { index: selected.index, title: selected.title, url: selected.url } };
+      return nativeGroupResult("createGroup", f.tabs.get(12), selected, "Created");
     });
     f.tabs.get(13).url += "?navigation";
     return result;
-  }, { nativeGroupMove: "createGroup" });
+  }, { nativeGroupMove: "createGroup", destinationTitle: "Created" });
   assert.deepEqual(f.selections, [12, 13]);
   assert.equal(f.tabs.get(13).active, true);
 });
@@ -267,13 +657,12 @@ test("an unavailable source owner reports completed group mutation without repla
     const result = await selection.runNativeGroupMove("createGroup", async () => {
       await f.api.tabs.update(13, { active: true });
       const selected = await f.api.tabs.get(13);
-      return { action: "createGroup", mutationApplied: true,
-        selectedTab: { index: selected.index, title: selected.title, url: selected.url } };
+      return nativeGroupResult("createGroup", f.tabs.get(12), selected, "Created");
     });
     const get = f.api.tabs.get;
     f.api.tabs.get = async id => { if (id === 11) throw new Error("Owner unavailable"); return get(id); };
     return result;
-  }, { nativeGroupMove: "createGroup" }), error => {
+  }, { nativeGroupMove: "createGroup", destinationTitle: "Created" }), error => {
     assert.match(error.message, /Owner unavailable.*group move completed/);
     assert.equal(error.data.mutationApplied, true);
     assert.equal(error.data.doNotReplay, true);
@@ -294,8 +683,8 @@ test("failed or mismatched group results cannot authorize a deferred user activa
         await f.api.tabs.update(12, { active: true });
         if (result === null) throw new Error("Native mutation failed before confirmation");
         const tab = await f.api.tabs.get(12);
-        return { action: "createGroup", mutationApplied: true, selectedTab: { index: tab.index, title: tab.title, url: tab.url }, ...result };
-      }), { nativeGroupMove: "createGroup" }), /Native mutation failed|selection changed/);
+        return { ...nativeGroupResult("createGroup", f.tabs.get(11), tab, "Created"), ...result };
+      }), { nativeGroupMove: "createGroup", destinationTitle: "Created" }), /Native mutation failed|selection changed/);
     await f.adapter.sidePanel.getOptions();
     assert.equal(f.storage.chatgptSafariSidebarStateV1.openPanels[0].tabId, 12);
     assert.notEqual(f.storage.chatgptSafariSidebarStateV1.openPanels[0].instanceId, owner.instanceId);

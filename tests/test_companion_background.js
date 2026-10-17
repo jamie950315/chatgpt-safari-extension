@@ -4,21 +4,26 @@ const { createCompanion } = require("../safari/ChatGPT for Safari/ChatGPT for Sa
 
 function fixture(options = {}) {
   const tab = { id: 11, windowId: 3, url: "https://example.com/", status: "complete" };
-  const calls = [], scripts = [];
+  const calls = [], scripts = [], session = {}, sessionChanges = [];
   let afterCapture;
   let response = { ok: true, requests: [] };
   const api = {
     runtime: { getURL: path => "safari-web-extension://actual-owner" + path, async sendNativeMessage(_, value) { calls.push(value.command); return typeof response === "function" ? response(value.command) : response; } },
     tabs: { async get() { return { ...tab }; }, onUpdated: { addListener() {} } },
     windows: { async get() { return { left: 100, top: 100, width: 1000, height: 800 }; } },
-    storage: { local: { async get() { return { safariLiveProfileId: "55555555-5555-4555-8555-555555555555" }; } } },
+    storage: {
+      local: { async get() { return { safariLiveProfileId: "55555555-5555-4555-8555-555555555555" }; } },
+      session: { async get(key) { return { [key]: session[key] }; }, async set(value) { Object.assign(session, value); },
+        async remove(key) { delete session[key]; } },
+    },
     scripting: { async executeScript(value) { scripts.push(value); afterCapture?.(); return [{ documentId: "doc", result: { selectedText: "selected test text", revision: 2 } }]; } },
   };
   const environment = {
     ChatGPTSafariHooks: { async getInstanceId() { return "browser-instance"; }, async getTabMentions() { return [{ id: 11, title: "Test" }]; } },
     ChatGPTSafariSidebarFunctions: { selection() {}, removeSelection() {} },
+    ChatGPTSafariBrowserSessionChanged() { sessionChanges.push(true); },
   };
-  return { api, tab, calls, scripts, binding: createCompanion(api, environment, options), setAfterCapture(value) { afterCapture = value; }, setResponse(value) { response = value; } };
+  return { api, tab, calls, scripts, session, sessionChanges, binding: createCompanion(api, environment, options), setAfterCapture(value) { afterCapture = value; }, setResponse(value) { response = value; } };
 }
 const owner = { tabId: 11, windowId: 3, instanceId: "owner-token" };
 
@@ -148,4 +153,73 @@ test("embedded frames use the relay lifecycle and retain owner-bound browser aut
     await assert.rejects(f.binding.frameRequest(owner, { operation: "host", method: "execute", params: {} }), /Unknown native/);
   } finally { await f.binding.close(owner); }
   assert.equal(f.calls.at(-1).action, "embeddedClose");
+});
+
+test("a verified collection rebind updates the same native owner without reopening or refreshing its tunnel", async () => {
+  const f = fixture({ embedded: true }), state = { ...owner };
+  await f.binding.open(state);
+  const expectedOwner = await f.binding.agentOwner(), callCount = f.calls.length, changes = f.sessionChanges.length;
+  f.session["codexWorkSidePanelConversationUrl:11"] = "https://chatgpt.com/c/existing-conversation";
+  state.tabId = f.tab.id = 21;
+  try {
+    await assert.rejects(f.binding.rebindAgentOwner({ ...state }, 11), { code: "REBIND_STATE" },
+      "equal tokens do not authorize an unrelated state object");
+    await f.binding.rebindAgentOwner(state, 11);
+    assert.deepEqual(f.calls.slice(callCount).map(call => call.action), ["embeddedUpdate"]);
+    assert.equal(f.calls.at(-1).ownerToken, owner.instanceId);
+    assert.equal(f.calls.at(-1).context.tabId, 21);
+    assert.equal(f.sessionChanges.length, changes);
+    assert.equal(f.session["codexWorkSidePanelConversationUrl:21"], "https://chatgpt.com/c/existing-conversation");
+    assert.equal(f.session["codexWorkSidePanelConversationUrl:11"], undefined);
+    assert.equal((await f.binding.agentOwner()).tabId, 21);
+    assert.equal((await f.binding.agentOwner()).instanceId, expectedOwner.instanceId);
+    f.setResponse({ ok: true, result: { text: "Original in-flight command completed" } });
+    assert.equal((await f.binding.runAgentCommand({}, expectedOwner)).text, "Original in-flight command completed");
+    await assert.rejects(f.binding.frameRequest(state, { operation: "host", method: "rebindAgentOwner", params: {} }), /Unknown native/);
+    const script = f.scripts.find(value => value.func.name === "invalidateReboundSnapshot");
+    assert.deepEqual(script.target, { tabId: 21, frameIds: [0] });
+    assert.equal(script.world, "ISOLATED");
+    const snapshot = { nodes: new Map([["old-node", {}]]), snapshotId: "old-snapshot", documentId: "real-document" };
+    globalThis.__chatGPTSafariLiveDocument = snapshot;
+    try { script.func(); } finally { delete globalThis.__chatGPTSafariLiveDocument; }
+    assert.equal(snapshot.nodes.size, 0);
+    assert.equal(snapshot.snapshotId, null);
+    assert.equal(snapshot.documentId, "real-document", "the document identity itself is not fabricated");
+    const beforeSameID = f.calls.length;
+    await f.binding.rebindAgentOwner(state, 21);
+    assert.deepEqual(f.calls.slice(beforeSameID).map(call => call.action), ["embeddedUpdate"]);
+    assert.equal(f.session["codexWorkSidePanelConversationUrl:21"], "https://chatgpt.com/c/existing-conversation",
+      "same-ID source restoration retains the original conversation key");
+    assert.equal(f.sessionChanges.length, changes);
+  } finally { await f.binding.close(state); }
+});
+
+test("owner rebind failures identify their actual step without exposing raw native, script, or storage errors", async () => {
+  for (const code of ["REBIND_CONTEXT", "REBIND_SNAPSHOT", "REBIND_CONVERSATION"]) {
+    const f = fixture({ embedded: true }), state = { ...owner };
+    await f.binding.open(state);
+    state.tabId = f.tab.id = 21;
+    const privateError = () => Object.assign(new Error("Synthetic private URL https://private.example/ token=never-record"), { code: "PRIVATE_ERROR" });
+    if (code === "REBIND_CONTEXT") f.setResponse(command => {
+      if (command.action === "embeddedUpdate") throw privateError();
+      return { ok: true };
+    });
+    if (code === "REBIND_SNAPSHOT") {
+      const execute = f.api.scripting.executeScript;
+      f.api.scripting.executeScript = async command => {
+        if (command.func.name === "invalidateReboundSnapshot") throw privateError();
+        return execute(command);
+      };
+    }
+    if (code === "REBIND_CONVERSATION") f.api.storage.session.remove = async () => { throw privateError(); };
+    try {
+      await assert.rejects(f.binding.rebindAgentOwner(state, 11), error => {
+        assert.equal(error.code, code);
+        assert.doesNotMatch(error.message, /private|https:|token|PRIVATE_ERROR/u);
+        assert.equal(error.cause, undefined);
+        assert.equal(error.data, undefined);
+        return true;
+      });
+    } finally { f.setResponse({ ok: true }); await f.binding.close(state); }
+  }
 });

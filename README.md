@@ -96,7 +96,8 @@ for website interactions; they do not provide this verified-download result.
 Ask Work to organize explicitly selected tabs. Its `management` capability can
 query, reorder, pin, close, group, ungroup, and rename native groups using real
 Safari APIs and macOS Accessibility. Tabs must be claimed before changes;
-unrequested tabs and existing logins are retained.
+unrequested tabs are retained. Keep the tab hosting the active sidebar outside
+group/ungroup operations; open the sidebar in another existing tab first.
 
 Safari groups are separate named tab collections, not Chrome's colored inline
 groups. Moving a tab can remove it from the currently displayed collection.
@@ -104,6 +105,10 @@ Group handles are session-local and resolve to an observed native title/window;
 duplicate names and shared or unverifiable groups cannot be changed. Chrome
 group colors/collapse state and bookmark management are not emulated. Read the
 capability's Safari-specific documentation before invoking its methods.
+Safari may replace source tab IDs during creation. A batch resolves only its
+already-claimed pending tabs against unique observed source identities; later
+commands must query and claim their current real IDs again. A group created by
+the same sidebar session can be renamed from its source collection.
 
 Safari lacks Chrome's manifest sandbox pages. The packaged original JavaScript
 worker therefore runs at a dedicated local origin with no extension APIs,
@@ -185,6 +190,14 @@ adapter and `safari_live` target existing tabs; `safari_native` is for isolated 
 - In the original **Work** sidebar, the management capability claimed two
   scratch tabs, reversed their adjacent order, and read the real final order
   back. The original conversation finished normally and other tabs were retained.
+
+- The original **Work** sidebar completed one two-tab batch into a real native
+  Safari Tab Group and restored its source sidebar and conversation after
+  Safari parked/rekeyed source tabs. A subsequent original Work run renamed
+  that group to **Safari Work Complete**, read both pages with
+  `Session established: true`, and finished normally. Both pages retained their
+  original URLs and order. These actions used ordinary Safari, not MCP or an
+  isolated browser session.
 
 - `safari_live` listed the ordinary Safari profile's existing tabs and read an
   already signed-in Gemini page without changing its login or input. A fresh

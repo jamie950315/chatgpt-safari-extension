@@ -18,6 +18,28 @@
     if (!result.length || result.length > 50) throw new Error("Organize between 1 and 50 explicitly selected tabs");
     return result;
   };
+  function readableNativeFailure(error) {
+    // The upstream kernel serializes only Error.message. Carry the bounded
+    // native outcome through that boundary without copying private error data.
+    const data = record(error.data) ? error.data : {}, safe = {};
+    const codes = new Set(["GROUP_UI_UNAVAILABLE", "GROUP_RESULT_UNCONFIRMED", "GROUP_READ_CHANGED_SELECTION",
+      "FOCUS_CHANGED", "PAGE_CHANGED", "NATIVE_TARGET_OBSCURED", "STALE_OPERATION", "LIVE_TIMEOUT"]);
+    if (codes.has(error.code)) safe.code = error.code;
+    if (["menu_completion", "sidebar_preflight", "sidebar_layout_confirmation"].includes(data.stage)) safe.stage = data.stage;
+    for (const key of ["requestedVisible", "sidebarHit", "pickerHit", "newTabGroupButtonPresent",
+      "visibleContextMenu", "visibleGroupPickerMenu", "visibleViewMenu", "visibleOtherNativeMenu",
+      "nativeMenuFocused", "mutationApplied", "doNotReplay"]) {
+      if (typeof data[key] === "boolean") safe[key] = data[key];
+    }
+    if (Number.isSafeInteger(data.sidebarToggleHitCount) && data.sidebarToggleHitCount >= 0 && data.sidebarToggleHitCount <= 8) {
+      safe.sidebarToggleHitCount = data.sidebarToggleHitCount;
+    }
+    for (const key of ["tabBarRestoration", "nativeSidebarRestoration"]) {
+      if (["restored", "unconfirmed"].includes(data[key])) safe[key] = data[key];
+    }
+    if (Object.keys(safe).length) error.message += ` Native result: ${JSON.stringify(safe)}.`;
+    return error;
+  }
   function createManagement(api, companion) {
     const sessions = new Map();
     let nextGroup = 1;
@@ -58,9 +80,11 @@
       const layout = () => ({});
       const organize = async (target, action, extra = {}) => {
         await assertCurrent();
-        return companion.runAgentCommand({ action: "organize", arguments: {
-          handle: `live:${owner.profileId}:${target.id}`, expectedUrl: target.url, operation: action, ...extra,
-        } }, owner);
+        try {
+          return await companion.runAgentCommand({ action: "organize", arguments: {
+            handle: `live:${owner.profileId}:${target.id}`, expectedUrl: target.url, operation: action, ...extra,
+          } }, owner);
+        } catch (error) { throw readableNativeFailure(error); }
       };
       const describeGroup = group => ({ id: group.id, title: group.title, windowId: group.windowId,
         nativeIdentity: { kind: "safari-native-title", title: group.title, windowIdentifier: group.windowIdentifier } });
@@ -88,6 +112,13 @@
         return group;
       };
       const groupTarget = async group => {
+        // A successful creation grants this session authority over that exact
+        // native group even while Safari hides its destination collection.
+        if (group.createdBySession) {
+          const source = await tab(owner.tabId);
+          if (source.windowId !== group.windowId) throw new Error("The sidebar left the native group's Safari window");
+          return source;
+        }
         for (const tabId of group.tabs) {
           try { const value = await owned(tabId); if (value.windowId === group.windowId) return value; } catch { /* A user may have closed a formerly observed member. */ }
         }
@@ -114,6 +145,7 @@
       } else if (namespace === "tabs" && method === "group") {
         const request = options(args[0], ["tabIds", "groupId", "createProperties"]);
         const targets = await Promise.all(tabIds(request.tabIds).map(owned));
+        if (targets.some(item => item.id === owner.tabId)) throw new Error("Keep the active sidebar tab outside this native group operation. Open the sidebar in another existing tab before grouping its current page");
         if (targets.some(item => item.pinned || item.windowId !== targets[0].windowId)) throw new Error("Group unpinned tabs in the same Safari window; move them only when the user requests a transfer");
         const properties = options(request.createProperties ?? {}, ["windowId"], true);
         if (properties.windowId !== undefined && properties.windowId !== targets[0].windowId) throw new Error("createProperties.windowId must match the selected tabs");
@@ -121,25 +153,61 @@
         let group = request.groupId === undefined ? undefined : await findGroup(request.groupId);
         if (group && group.windowId !== targets[0].windowId) throw new Error("Select a native group in the same Safari window");
         const title = group?.title || `ChatGPT ${new Date().toISOString().replace(/[:.]/gu, "-")}`;
-        const ordered = targets.slice().sort((a, b) => Number(a.id === owner.tabId) - Number(b.id === owner.tabId));
         const completed = [];
+        const originalTabs = await api.tabs.query({ windowId: targets[0].windowId });
+        let creationProof, latestProof;
+        const pendingTarget = async original => {
+          await assertCurrent();
+          let current;
+          try { current = await api.tabs.get(original.id); } catch { /* Safari rekeys hidden source tabs after group creation. */ }
+          if (current?.id === original.id) {
+            if (current.url !== original.url || current.title !== original.title || current.windowId !== original.windowId) {
+              throw new Error("A pending claimed tab changed after the previous native operation");
+            }
+            return owned(original.id);
+          }
+          const source = latestProof?.sourceCollection;
+          if (!creationProof || latestProof?.mutationApplied !== true || source?.restored !== true
+            || source.nativeWindowIdentifier !== creationProof.windowIdentifier
+            || source.title !== creationProof.sourceCollection?.title
+            || originalTabs.filter(item => item.url === original.url && item.title === original.title).length !== 1) {
+            throw new Error("Safari changed a pending tab's ID without an unambiguous restored source collection");
+          }
+          const matches = (await api.tabs.query({ windowId: original.windowId })).filter(item =>
+            item.windowId === original.windowId && !item.incognito && item.id !== owner.tabId
+            && item.url === original.url && item.title === original.title);
+          await assertCurrent();
+          if (matches.length !== 1) throw new Error("The originally claimed pending tab no longer has a unique source identity");
+          // This one batch already claimed the original tab before any mutation.
+          // Use its observed replacement ID, never publish a persistent alias or
+          // transfer this authority to a later command/session.
+          return matches[0];
+        };
         try {
           value = await audit(layout(targets), async () => {
-            for (const target of ordered) {
-              const result = await organize(await owned(target.id), group ? "moveToGroup" : "createGroup", {
+            for (const target of targets) {
+              const current = await pendingTarget(target);
+              const result = await organize(current, group ? "moveToGroup" : "createGroup", {
                 groupTitle: title, ...(group ? { windowIdentifier: group.windowIdentifier } : { newTitle: title }),
               });
+              latestProof = result;
               if (!group) {
-                group = { id: nextGroup++, title, windowId: target.windowId, windowIdentifier: result.windowIdentifier, tabs: new Set() };
+                creationProof = result;
+                group = { id: nextGroup++, title, windowId: target.windowId, windowIdentifier: result.windowIdentifier,
+                  createdBySession: true, tabs: new Set() };
                 state.groups.set(group.id, group);
               }
-              group.tabs.add(target.id); completed.push(target.id);
+              group.tabs.add(current.id); completed.push(current.id);
             }
             return group.id;
           });
-        } catch (error) { throw new Error(`${error.message}. Grouped tab IDs: ${completed.join(", ") || "none confirmed"}. Native operations were not retried. Query current tabs before continuing.`); }
+        } catch (error) {
+          error.message = `${error.message}. Grouped tab IDs: ${completed.join(", ") || "none confirmed"}. Native operations were not retried. Query current tabs before continuing.`;
+          throw error;
+        }
       } else if (namespace === "tabs" && method === "ungroup") {
         const targets = await Promise.all(tabIds(args[0]).map(owned));
+        if (targets.some(item => item.id === owner.tabId)) throw new Error("Keep the active sidebar tab outside this native group operation. Open the sidebar in another existing tab before ungrouping its current page");
         value = await audit(layout(targets), async () => {
           for (const target of targets) {
             await organize(await owned(target.id), "moveToUngrouped");
@@ -155,7 +223,16 @@
         if (typeof changes.title !== "string" || !changes.title.trim() || changes.title.length > 120) throw new Error("A native group needs a nonempty title of at most 120 characters");
         const target = await groupTarget(group);
         value = await audit({}, async () => {
-          await organize(target, "renameGroup", { groupTitle: group.title, newTitle: changes.title, windowIdentifier: group.windowIdentifier });
+          const result = await organize(target, "renameGroup", { groupTitle: group.title, newTitle: changes.title, windowIdentifier: group.windowIdentifier });
+          const renamed = result.renamedGroup;
+          if (renamed?.kind !== "safari-native-title" || renamed.title !== changes.title
+            || renamed.windowIdentifier !== group.windowIdentifier) {
+            const error = new Error("Safari did not confirm the exact renamed native group. Inspect current groups; do not repeat the name change");
+            error.mutationApplied = result.mutationApplied === true;
+            error.doNotReplay = true;
+            error.data = { nativeResult: result };
+            throw error;
+          }
           group.title = changes.title; return describeGroup(group);
         });
       } else if (namespace === "windows" && ["get", "getAll", "getCurrent", "getLastFocused"].includes(method)) {

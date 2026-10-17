@@ -306,6 +306,44 @@ function m(t,o,e){if(location.origin!==t||o!=null&&location.href!==o)return{sele
         if (typeof profileId !== "string" || !/^[0-9a-f-]{36}$/i.test(profileId)) throw new Error("The Safari browser profile is not ready");
         return { instanceId: state.instanceId, profileId, tabId: state.tabId, windowId: state.windowId };
       },
+      async rebindAgentOwner(state, previousTabId) {
+        let step = "REBIND_STATE";
+        try {
+          if (!embedded || owner !== state || !Number.isSafeInteger(previousTabId) || previousTabId < 0) throw new Error();
+          const token = state.instanceId;
+          // The sidebar has verified this one native lease and installed its
+          // real tab identity on the same state. Never reopen the native owner
+          // or refresh its account tunnel for a frame remount.
+          step = "REBIND_CONTEXT";
+          await update(state, "update");
+          step = "REBIND_STATE";
+          if (owner !== state || owner.instanceId !== token) throw new Error();
+          step = "REBIND_SNAPSHOT";
+          await api.scripting.executeScript({ target: { tabId: state.tabId, frameIds: [0] }, world: "ISOLATED",
+            func: function invalidateReboundSnapshot() {
+              const snapshot = globalThis.__chatGPTSafariLiveDocument;
+              if (snapshot) { snapshot.nodes.clear(); snapshot.snapshotId = null; }
+            } });
+          step = "REBIND_CONVERSATION";
+          const previousKey = `codexWorkSidePanelConversationUrl:${previousTabId}`;
+          const conversation = (await api.storage.session.get(previousKey))[previousKey];
+          step = "REBIND_STATE";
+          if (owner !== state || owner.instanceId !== token) throw new Error();
+          step = "REBIND_CONVERSATION";
+          if (previousTabId !== state.tabId) {
+            if (typeof conversation === "string") {
+              await api.storage.session.set({ [`codexWorkSidePanelConversationUrl:${state.tabId}`]: conversation });
+            }
+            await api.storage.session.remove(previousKey);
+          }
+          step = "REBIND_STATE";
+          if (owner !== state || owner.instanceId !== token) throw new Error();
+        } catch {
+          // The caller records this fixed phase code, never the underlying
+          // native/storage/script error text or private browser identities.
+          throw Object.assign(new Error("The native Safari sidebar owner rebind could not be completed."), { code: step });
+        }
+      },
       async agentKernelURL() {
         if (!embedded || !owner) throw new Error("Open the ChatGPT sidebar before starting its agent kernel");
         const state = owner;
@@ -718,8 +756,12 @@ function m(t,o,e){if(location.origin!==t||o!=null&&location.href!==o)return{sele
         const tab = await target(request.command.arguments?.handle, request.command.arguments?.expectedUrl);
         const nativeGroupMove = action === "organize" && ["createGroup", "moveToGroup", "moveToUngrouped"].includes(request.command.arguments?.operation)
           ? request.command.arguments.operation : undefined;
+        const groupArgs = request.command.arguments || {};
         return environment.ChatGPTSafariSidebar.withAgentSelection(request.agentOwner, tab,
-          selection => executeCommand(request, selection), { nativeGroupMove });
+          selection => executeCommand(request, selection), { nativeGroupMove,
+            destinationTitle: nativeGroupMove === "moveToUngrouped" ? null
+              : nativeGroupMove === "createGroup" ? groupArgs.newTitle : groupArgs.groupTitle,
+            nativeWindowIdentifier: groupArgs.windowIdentifier });
       }
       return executeCommand(request);
     }
@@ -830,13 +872,29 @@ function m(t,o,e){if(location.origin!==t||o!=null&&location.href!==o)return{sele
       if (stopped || polling || !profileId) return;
       polling = true;
       try {
-        const response = await send({ action: "livePoll", profileId, sessionId });
+        const selection = environment.ChatGPTSafariSidebar?.selectionDiagnostics();
+        const response = await send({ action: "livePoll", profileId, sessionId, ...(selection ? { selection } : {}) });
         if (response?.ok !== true) return; // A poll never launches a user-quit app.
         for (const request of response.requests || []) {
           let response;
           try { response = { ok: true, result: await execute(request) }; }
-          catch (error) { response = { ok: false, error: { code: error.code || "SAFARI_API_ERROR", message: error.message,
-            ...(error.data ? { data: error.data } : {}) } }; }
+          catch (error) {
+            const native = {};
+            for (const key of ["actionsPerformed", "eventsPosted"]) {
+              if (Number.isSafeInteger(error[key]) && error[key] >= 0) native[key] = error[key];
+            }
+            for (const key of ["mutationApplied", "doNotReplay", "mayHavePostedInput"]) {
+              if (typeof error[key] === "boolean") native[key] = error[key];
+            }
+            for (const key of ["tabBarRestoration", "nativeSidebarRestoration"]) {
+              if (["restored", "unconfirmed"].includes(error[key])) native[key] = error[key];
+            }
+            const hasNative = Object.keys(native).length > 0;
+            const details = hasNative ? { ...(error.data && typeof error.data === "object" && !Array.isArray(error.data)
+              ? error.data : error.data === undefined ? {} : { details: error.data }), ...native } : error.data;
+            response = { ok: false, error: { code: error.code || "SAFARI_API_ERROR", message: error.message,
+              ...(details === undefined ? {} : { data: details }) } };
+          }
           await send({ action: "liveResolve", id: request.id, profileId, sessionId, response });
         }
       } catch { /* Service discovery resumes on the next poll; mutations are not retried. */ }
@@ -882,6 +940,28 @@ function m(t,o,e){if(location.origin!==t||o!=null&&location.href!==o)return{sele
     if (!result.length || result.length > 50) throw new Error("Organize between 1 and 50 explicitly selected tabs");
     return result;
   };
+  function readableNativeFailure(error) {
+    // The upstream kernel serializes only Error.message. Carry the bounded
+    // native outcome through that boundary without copying private error data.
+    const data = record(error.data) ? error.data : {}, safe = {};
+    const codes = new Set(["GROUP_UI_UNAVAILABLE", "GROUP_RESULT_UNCONFIRMED", "GROUP_READ_CHANGED_SELECTION",
+      "FOCUS_CHANGED", "PAGE_CHANGED", "NATIVE_TARGET_OBSCURED", "STALE_OPERATION", "LIVE_TIMEOUT"]);
+    if (codes.has(error.code)) safe.code = error.code;
+    if (["menu_completion", "sidebar_preflight", "sidebar_layout_confirmation"].includes(data.stage)) safe.stage = data.stage;
+    for (const key of ["requestedVisible", "sidebarHit", "pickerHit", "newTabGroupButtonPresent",
+      "visibleContextMenu", "visibleGroupPickerMenu", "visibleViewMenu", "visibleOtherNativeMenu",
+      "nativeMenuFocused", "mutationApplied", "doNotReplay"]) {
+      if (typeof data[key] === "boolean") safe[key] = data[key];
+    }
+    if (Number.isSafeInteger(data.sidebarToggleHitCount) && data.sidebarToggleHitCount >= 0 && data.sidebarToggleHitCount <= 8) {
+      safe.sidebarToggleHitCount = data.sidebarToggleHitCount;
+    }
+    for (const key of ["tabBarRestoration", "nativeSidebarRestoration"]) {
+      if (["restored", "unconfirmed"].includes(data[key])) safe[key] = data[key];
+    }
+    if (Object.keys(safe).length) error.message += ` Native result: ${JSON.stringify(safe)}.`;
+    return error;
+  }
   function createManagement(api, companion) {
     const sessions = new Map();
     let nextGroup = 1;
@@ -922,9 +1002,11 @@ function m(t,o,e){if(location.origin!==t||o!=null&&location.href!==o)return{sele
       const layout = () => ({});
       const organize = async (target, action, extra = {}) => {
         await assertCurrent();
-        return companion.runAgentCommand({ action: "organize", arguments: {
-          handle: `live:${owner.profileId}:${target.id}`, expectedUrl: target.url, operation: action, ...extra,
-        } }, owner);
+        try {
+          return await companion.runAgentCommand({ action: "organize", arguments: {
+            handle: `live:${owner.profileId}:${target.id}`, expectedUrl: target.url, operation: action, ...extra,
+          } }, owner);
+        } catch (error) { throw readableNativeFailure(error); }
       };
       const describeGroup = group => ({ id: group.id, title: group.title, windowId: group.windowId,
         nativeIdentity: { kind: "safari-native-title", title: group.title, windowIdentifier: group.windowIdentifier } });
@@ -952,6 +1034,13 @@ function m(t,o,e){if(location.origin!==t||o!=null&&location.href!==o)return{sele
         return group;
       };
       const groupTarget = async group => {
+        // A successful creation grants this session authority over that exact
+        // native group even while Safari hides its destination collection.
+        if (group.createdBySession) {
+          const source = await tab(owner.tabId);
+          if (source.windowId !== group.windowId) throw new Error("The sidebar left the native group's Safari window");
+          return source;
+        }
         for (const tabId of group.tabs) {
           try { const value = await owned(tabId); if (value.windowId === group.windowId) return value; } catch { /* A user may have closed a formerly observed member. */ }
         }
@@ -978,6 +1067,7 @@ function m(t,o,e){if(location.origin!==t||o!=null&&location.href!==o)return{sele
       } else if (namespace === "tabs" && method === "group") {
         const request = options(args[0], ["tabIds", "groupId", "createProperties"]);
         const targets = await Promise.all(tabIds(request.tabIds).map(owned));
+        if (targets.some(item => item.id === owner.tabId)) throw new Error("Keep the active sidebar tab outside this native group operation. Open the sidebar in another existing tab before grouping its current page");
         if (targets.some(item => item.pinned || item.windowId !== targets[0].windowId)) throw new Error("Group unpinned tabs in the same Safari window; move them only when the user requests a transfer");
         const properties = options(request.createProperties ?? {}, ["windowId"], true);
         if (properties.windowId !== undefined && properties.windowId !== targets[0].windowId) throw new Error("createProperties.windowId must match the selected tabs");
@@ -985,25 +1075,61 @@ function m(t,o,e){if(location.origin!==t||o!=null&&location.href!==o)return{sele
         let group = request.groupId === undefined ? undefined : await findGroup(request.groupId);
         if (group && group.windowId !== targets[0].windowId) throw new Error("Select a native group in the same Safari window");
         const title = group?.title || `ChatGPT ${new Date().toISOString().replace(/[:.]/gu, "-")}`;
-        const ordered = targets.slice().sort((a, b) => Number(a.id === owner.tabId) - Number(b.id === owner.tabId));
         const completed = [];
+        const originalTabs = await api.tabs.query({ windowId: targets[0].windowId });
+        let creationProof, latestProof;
+        const pendingTarget = async original => {
+          await assertCurrent();
+          let current;
+          try { current = await api.tabs.get(original.id); } catch { /* Safari rekeys hidden source tabs after group creation. */ }
+          if (current?.id === original.id) {
+            if (current.url !== original.url || current.title !== original.title || current.windowId !== original.windowId) {
+              throw new Error("A pending claimed tab changed after the previous native operation");
+            }
+            return owned(original.id);
+          }
+          const source = latestProof?.sourceCollection;
+          if (!creationProof || latestProof?.mutationApplied !== true || source?.restored !== true
+            || source.nativeWindowIdentifier !== creationProof.windowIdentifier
+            || source.title !== creationProof.sourceCollection?.title
+            || originalTabs.filter(item => item.url === original.url && item.title === original.title).length !== 1) {
+            throw new Error("Safari changed a pending tab's ID without an unambiguous restored source collection");
+          }
+          const matches = (await api.tabs.query({ windowId: original.windowId })).filter(item =>
+            item.windowId === original.windowId && !item.incognito && item.id !== owner.tabId
+            && item.url === original.url && item.title === original.title);
+          await assertCurrent();
+          if (matches.length !== 1) throw new Error("The originally claimed pending tab no longer has a unique source identity");
+          // This one batch already claimed the original tab before any mutation.
+          // Use its observed replacement ID, never publish a persistent alias or
+          // transfer this authority to a later command/session.
+          return matches[0];
+        };
         try {
           value = await audit(layout(targets), async () => {
-            for (const target of ordered) {
-              const result = await organize(await owned(target.id), group ? "moveToGroup" : "createGroup", {
+            for (const target of targets) {
+              const current = await pendingTarget(target);
+              const result = await organize(current, group ? "moveToGroup" : "createGroup", {
                 groupTitle: title, ...(group ? { windowIdentifier: group.windowIdentifier } : { newTitle: title }),
               });
+              latestProof = result;
               if (!group) {
-                group = { id: nextGroup++, title, windowId: target.windowId, windowIdentifier: result.windowIdentifier, tabs: new Set() };
+                creationProof = result;
+                group = { id: nextGroup++, title, windowId: target.windowId, windowIdentifier: result.windowIdentifier,
+                  createdBySession: true, tabs: new Set() };
                 state.groups.set(group.id, group);
               }
-              group.tabs.add(target.id); completed.push(target.id);
+              group.tabs.add(current.id); completed.push(current.id);
             }
             return group.id;
           });
-        } catch (error) { throw new Error(`${error.message}. Grouped tab IDs: ${completed.join(", ") || "none confirmed"}. Native operations were not retried. Query current tabs before continuing.`); }
+        } catch (error) {
+          error.message = `${error.message}. Grouped tab IDs: ${completed.join(", ") || "none confirmed"}. Native operations were not retried. Query current tabs before continuing.`;
+          throw error;
+        }
       } else if (namespace === "tabs" && method === "ungroup") {
         const targets = await Promise.all(tabIds(args[0]).map(owned));
+        if (targets.some(item => item.id === owner.tabId)) throw new Error("Keep the active sidebar tab outside this native group operation. Open the sidebar in another existing tab before ungrouping its current page");
         value = await audit(layout(targets), async () => {
           for (const target of targets) {
             await organize(await owned(target.id), "moveToUngrouped");
@@ -1019,7 +1145,16 @@ function m(t,o,e){if(location.origin!==t||o!=null&&location.href!==o)return{sele
         if (typeof changes.title !== "string" || !changes.title.trim() || changes.title.length > 120) throw new Error("A native group needs a nonempty title of at most 120 characters");
         const target = await groupTarget(group);
         value = await audit({}, async () => {
-          await organize(target, "renameGroup", { groupTitle: group.title, newTitle: changes.title, windowIdentifier: group.windowIdentifier });
+          const result = await organize(target, "renameGroup", { groupTitle: group.title, newTitle: changes.title, windowIdentifier: group.windowIdentifier });
+          const renamed = result.renamedGroup;
+          if (renamed?.kind !== "safari-native-title" || renamed.title !== changes.title
+            || renamed.windowIdentifier !== group.windowIdentifier) {
+            const error = new Error("Safari did not confirm the exact renamed native group. Inspect current groups; do not repeat the name change");
+            error.mutationApplied = result.mutationApplied === true;
+            error.doNotReplay = true;
+            error.data = { nativeResult: result };
+            throw error;
+          }
           group.title = changes.title; return describeGroup(group);
         });
       } else if (namespace === "windows" && ["get", "getAll", "getCurrent", "getLastFocused"].includes(method)) {
@@ -1197,6 +1332,10 @@ function m(t,o,e){if(location.origin!==t||o!=null&&location.href!==o)return{sele
     "embedded-sidechat.html",
   ]);
   const NATIVE_GROUP_MOVES = new Set(["createGroup", "moveToGroup", "moveToUngrouped"]);
+  const SELECTION_FAILURE_CODES = new Set([
+    "FOCUS_CHANGED", "LIVE_TIMEOUT", "COMPANION_NOT_RUNNING", "STALE_TARGET", "AGENT_OWNER_CHANGED",
+    "REBIND_STATE", "REBIND_CONTEXT", "REBIND_SNAPSHOT", "REBIND_CONVERSATION",
+  ]);
 
   // This function is serialized by Safari into the owning isolated world.
   function callSidebarController(message) {
@@ -1245,6 +1384,22 @@ function m(t,o,e){if(location.origin!==t||o!=null&&location.href!==o)return{sele
     let panelBehavior = { openPanelOnActionClick: false };
     let queue = Promise.resolve();
     let agentSelection;
+    let selectionTrace = { phase: "idle", events: [], before: [], after: [] };
+    const inventoryIds = tabs => tabs.slice(0, 256).map(tab => ({ tabId: tab.id, windowId: tab.windowId, active: tab.active === true }));
+    function traceSelection(type, fields = {}) {
+      if (!agentSelection?.groupMove) return;
+      const event = { type };
+      for (const key of ["tabId", "windowId", "oldWindowId", "newWindowId"]) {
+        if (Number.isSafeInteger(fields[key])) event[key] = fields[key];
+      }
+      selectionTrace.events.push(event);
+      selectionTrace.events = selectionTrace.events.slice(-64);
+    }
+    function nativeOwnerSuspended(state) {
+      const selection = agentSelection;
+      return selection?.owner === state && selection.groupMove?.create
+        && selection.groupMove.create.ownerRestored !== true;
+    }
 
     const ready = (async () => {
       const saved = (await api.storage.session.get(STORAGE_KEY))[STORAGE_KEY];
@@ -1322,13 +1477,14 @@ function m(t,o,e){if(location.origin!==t||o!=null&&location.href!==o)return{sele
       return tab;
     }
 
-    async function contentCommand(state, message, installIfMissing) {
+    async function contentCommand(state, message, installIfMissing, allowAbsent = false) {
       const target = { tabId: state.tabId, frameIds: [0] };
       const execute = () => api.scripting.executeScript({
         target, world: "ISOLATED", func: callSidebarController, args: [message],
       });
       let entries = await execute();
       let result = entries?.find(entry => entry.frameId === 0)?.result;
+      if (allowAbsent && result?.code === "SIDEBAR_CONTROLLER_MISSING") return result;
       if (result?.code === "SIDEBAR_CONTROLLER_MISSING" && installIfMissing) {
         await api.scripting.executeScript({ target, world: "ISOLATED", files: ["safari/sidebar-content.js"] });
         entries = await execute();
@@ -1351,8 +1507,8 @@ function m(t,o,e){if(location.origin!==t||o!=null&&location.href!==o)return{sele
       }, true);
     }
 
-    async function unmountContent(state) {
-      return contentCommand(state, { type: MESSAGE.unmount, instanceId: state.instanceId }, false);
+    async function unmountContent(state, allowAbsent = false) {
+      return contentCommand(state, { type: MESSAGE.unmount, instanceId: state.instanceId }, false, allowAbsent);
     }
 
     async function mount(state) {
@@ -1434,7 +1590,7 @@ function m(t,o,e){if(location.origin!==t||o!=null&&location.href!==o)return{sele
         if (current.windowId !== owner.windowId || current.incognito || !/^https?:\/\//iu.test(current.url || "")) {
           throw new Error("The Safari agent sidebar owner is no longer available");
         }
-        const value = { owner, targetTab, expected: [], cancelled: false, expectedWindow: targetTab.windowId };
+        const value = { owner, ownerTab: current, targetTab, expected: [], cancelled: false, expectedWindow: targetTab.windowId };
         value.assertCurrent = () => {
           if (value.cancelled || agentSelection !== value || openByWindow.get(owner.windowId) !== owner) {
             const error = new Error("Safari selection changed during the agent command. Read the current page before continuing; do not repeat input.");
@@ -1456,18 +1612,66 @@ function m(t,o,e){if(location.origin!==t||o!=null&&location.href!==o)return{sele
         value.runNativeGroupMove = async (action, perform) => {
           value.assertCurrent();
           if (action !== nativeGroupMove || value.groupMove) throw new Error("This Safari selection has no matching native group mutation");
-          const before = new Map((await api.tabs.query({ windowId: targetTab.windowId })).map(tab => [tab.id, tab]));
+          const before = new Map((await api.tabs.query({ windowId: targetTab.windowId })).map(tab => [tab.id, { ...tab }]));
           value.assertCurrent();
-          const transition = { action, before };
+          const transition = { action, before, ...(action === "createGroup" ? { create: {
+            removed: new Set(), observed: false, ownerParked: false,
+          } } : {}) };
           value.groupMove = transition;
+          selectionTrace = { phase: "native", action, events: [], before: inventoryIds([...before.values()]), after: [] };
           let accepted = false;
+          let nativeResult;
+          let failureStage = "native";
           try {
-            const result = await perform();
+            const result = nativeResult = await perform();
             value.assertCurrent();
-            if (transition.activation) {
+            let freshOwner;
+            if (transition.targetRemoval || transition.create) {
+              failureStage = "source_proof";
+              const source = result?.sourceCollection, destination = result?.destinationCollection;
+              const nativeWindow = result?.windowIdentifier;
+              const collection = proof => proof && proof.nativeWindowIdentifier === nativeWindow
+                && (proof.title === null ? proof.identity === null : typeof proof.title === "string" && proof.title.length > 0
+                  && proof.identity?.kind === "safari-native-title" && proof.identity.title === proof.title
+                  && proof.identity.windowIdentifier === nativeWindow);
+              const sourceTabs = await api.tabs.query({ windowId: targetTab.windowId });
+              value.assertCurrent();
+              if (result.action !== action || result.mutationApplied !== true
+                || (!transition.create && !transition.activation)
+                || typeof nativeWindow !== "string" || !nativeWindow
+                || (scope.nativeWindowIdentifier !== undefined && nativeWindow !== scope.nativeWindowIdentifier)
+                || !collection(source) || !collection(destination) || source.restored !== true
+                || source.selectedUrlBefore !== targetTab.url || result.currentGroupTitle !== source.title
+                || destination.title !== scope.destinationTitle || result.destinationGroupTitle !== destination.title) {
+                value.cancelled = true;
+                value.assertCurrent();
+              }
+              let priorOwner;
+              try { priorOwner = await api.tabs.get(owner.tabId); } catch { /* Safari may rekey a restored source collection. */ }
+              value.assertCurrent();
+              if (priorOwner?.windowId === owner.windowId) freshOwner = priorOwner;
+              else if (transition.create && before.has(owner.tabId)
+                && (!priorOwner || priorOwner.windowId === -1)) {
+                transition.create.observed = true;
+                const original = [...before.values()].filter(tab => tab.url === value.ownerTab.url && tab.title === value.ownerTab.title);
+                const restored = sourceTabs.filter(tab => !tab.incognito && tab.url === value.ownerTab.url && tab.title === value.ownerTab.title);
+                if (original.length === 1 && restored.length === 1) freshOwner = restored[0];
+              }
+              if (!freshOwner || freshOwner.windowId !== owner.windowId || freshOwner.incognito
+                || freshOwner.url !== value.ownerTab.url || freshOwner.title !== value.ownerTab.title) {
+                value.cancelled = true;
+                value.assertCurrent();
+              }
+            }
+            if (transition.activation || transition.create) {
+              failureStage = "selected_proof";
               const selected = result?.selectedTab;
-              const current = await api.tabs.get(transition.activation.tabId);
-              const prior = before.get(current.id);
+              const active = transition.create
+                ? await api.tabs.query({ active: true, windowId: targetTab.windowId }) : null;
+              const current = active ? (active.length === 1 ? active[0] : {}) : await api.tabs.get(transition.activation.tabId);
+              const prior = before.get(current.id) || (transition.create
+                ? (() => { const samePage = [...before.values()].filter(tab => tab.url === current.url && tab.title === current.title);
+                  return samePage.length === 1 ? samePage[0] : undefined; })() : undefined);
               const window = await api.windows.get(targetTab.windowId);
               value.assertCurrent();
               // The native helper identifies its terminal AX-selected tab only
@@ -1484,11 +1688,99 @@ function m(t,o,e){if(location.origin!==t||o!=null&&location.href!==o)return{sele
               value.verifiedNativeSelection = { tabId: current.id, windowId: current.windowId,
                 index: current.index, title: current.title, url: current.url };
             }
+            if (freshOwner && (freshOwner.id !== owner.tabId || transition.create?.ownerParked)) {
+              failureStage = "owner_rebind";
+              await serialize(async () => {
+                value.assertCurrent();
+                const current = await api.tabs.get(freshOwner.id);
+                const terminal = await api.tabs.get(value.verifiedNativeSelection.tabId);
+                const window = await api.windows.get(owner.windowId);
+                const verified = value.verifiedNativeSelection;
+                value.assertCurrent();
+                if (current.windowId !== owner.windowId || current.incognito
+                  || current.url !== value.ownerTab.url || current.title !== value.ownerTab.title
+                  || !window.focused || !terminal.active || terminal.windowId !== verified.windowId
+                  || terminal.index !== verified.index || terminal.url !== verified.url || terminal.title !== verified.title) {
+                  value.cancelled = true;
+                  value.assertCurrent();
+                }
+                // Restored inactive source tabs reject script injection in
+                // Safari. Restore this already-proved owner once, before any
+                // snapshot or frame script, not after the operation returns.
+                transition.create.restoringOwner = true;
+                await value.select(current);
+                const selectedOwner = await api.tabs.get(current.id);
+                const ownerWindow = await api.windows.get(current.windowId);
+                value.assertCurrent();
+                if (!selectedOwner.active || !ownerWindow.focused || selectedOwner.incognito
+                  || selectedOwner.windowId !== current.windowId || selectedOwner.index !== current.index
+                  || selectedOwner.url !== current.url || selectedOwner.title !== current.title) {
+                  value.cancelled = true;
+                  value.assertCurrent();
+                }
+                value.verifiedNativeSelection = { tabId: selectedOwner.id, windowId: selectedOwner.windowId,
+                  index: selectedOwner.index, title: selectedOwner.title, url: selectedOwner.url };
+                const previousTabId = owner.tabId, previousOptions = optionsByTab.get(previousTabId);
+                owner.tabId = current.id;
+                owner.windowId = current.windowId;
+                optionsByTab.delete(previousTabId);
+                if (previousOptions) optionsByTab.set(current.id, previousOptions);
+                // Keep the native owner/conversation, but replace obsolete tab
+                // bootstrap or a same-ID frame whose parked handshake failed.
+                await options.companion.rebindAgentOwner(owner, previousTabId);
+                value.assertCurrent();
+                // A restored document may have either retained the old frame
+                // or no controller. Only the latter needs no unmount command.
+                failureStage = "owner_unmount";
+                await unmountContent(owner, true);
+                failureStage = "owner_mount";
+                await mountContent(owner);
+                value.assertCurrent();
+                failureStage = "owner_commit";
+                await save();
+                transition.create.ownerRestored = true;
+              });
+              result.sidebarOwner = { tabId: owner.tabId, windowId: owner.windowId, rebound: true };
+            }
             accepted = true;
             return result;
+          } catch (error) {
+            // Record only bounded public enums before cleanup can cancel the
+            // original broker request and obscure the failing local phase.
+            selectionTrace.failure = { stage: failureStage,
+              code: SELECTION_FAILURE_CODES.has(error?.code) ? error.code : "UNCLASSIFIED" };
+            if (nativeResult?.mutationApplied === true) {
+              error.mutationApplied = true;
+              error.doNotReplay = true;
+              if (Number.isSafeInteger(nativeResult.actionsPerformed)) error.actionsPerformed = nativeResult.actionsPerformed;
+              error.data = { ...error.data, nativeResult };
+            }
+            throw error;
           } finally {
+            selectionTrace.phase = accepted ? "verified" : "rejected";
+            try { selectionTrace.after = inventoryIds(await api.tabs.query({})); }
+            catch { selectionTrace.phase = "inventory_unavailable"; }
             if (value.groupMove === transition) value.groupMove = undefined;
-            if (!accepted && transition.activation && !transition.handled) {
+            if (transition.create) {
+              await serialize(async () => {
+                for (const id of transition.create.removed) {
+                  optionsByTab.delete(id);
+                  for (const created of mediaTabs.values()) created.delete(id);
+                }
+                await save();
+              });
+            }
+            if (transition.targetRemoval) {
+              if (!accepted) value.cancelled = true;
+              await serialize(() => removeTab(transition.targetRemoval.tabId));
+            }
+            if (!accepted && transition.create?.observed) {
+              value.cancelled = true;
+              // A failed source proof cannot revive a parked/rekeyed owner.
+              await serialize(async () => {
+                if (openByWindow.get(owner.windowId) === owner) await closeState(owner, "group_unconfirmed", true);
+              });
+            } else if (!accepted && transition.activation && !transition.handled) {
               value.cancelled = true;
               await serialize(() => activateTab(transition.activation));
             }
@@ -1504,7 +1796,8 @@ function m(t,o,e){if(location.origin!==t||o!=null&&location.href!==o)return{sele
         // a source owner only while that exact terminal selection is unchanged.
         // Do not attempt to switch native groups for an owner that was moved.
         const movedOwner = selection.verifiedNativeSelection && selection.owner.tabId === targetTab.id;
-        if (!selection.cancelled && !movedOwner && openByWindow.get(selection.owner.windowId) === selection.owner) {
+        const restoredOwner = selection.verifiedNativeSelection?.tabId === selection.owner.tabId;
+        if (!selection.cancelled && !movedOwner && !restoredOwner && openByWindow.get(selection.owner.windowId) === selection.owner) {
           const verified = selection.owner.tabId !== targetTab.id ? selection.verifiedNativeSelection : undefined;
           try {
             const current = await api.tabs.get(verified?.tabId ?? targetTab.id);
@@ -1636,7 +1929,15 @@ function m(t,o,e){if(location.origin!==t||o!=null&&location.href!==o)return{sele
       serialize(async () => {
         const state = openByWindow.get(sender.tab.windowId);
         if (!state || state.tabId !== sender.tab.id) return { ok: true, open: false };
-        if (message.type === MESSAGE.ready) await mount(state);
+        if (message.type === MESSAGE.ready) {
+          // A parked native source has no usable frame authority yet. Its
+          // successful native result performs the one verified remount.
+          if (nativeOwnerSuspended(state)) return { ok: true, open: true, suspended: true };
+          // A new owning document needs its frame, not a new native account
+          // owner or tunnel. Initial opening/restoration already bound it.
+          if (embedded) await mountContent(state);
+          else await mount(state);
+        }
         else {
           if (state.instanceId !== message.instanceId) throw new Error("The sidebar instance is no longer active");
           if (message.type === MESSAGE.closed) await closeState(state, "button", true);
@@ -1725,47 +2026,100 @@ function m(t,o,e){if(location.origin!==t||o!=null&&location.href!==o)return{sele
         if (current?.instanceId === state.instanceId) await closeState(current, "native_window", !embedded);
       }).catch(reportError);
     });
-    api.tabs.onRemoved.addListener((tabId) => {
+    async function removeTab(tabId) {
+      optionsByTab.delete(tabId);
+      for (const state of Array.from(openByWindow.values())) {
+        if (state.tabId === tabId) await closeState(state, "tab_removed", true);
+      }
+      await save();
+    }
+    api.tabs.onRemoved.addListener((tabId, details) => {
+      traceSelection("tabRemoved", { tabId, windowId: details?.windowId });
+      const transition = agentSelection?.groupMove;
+      if (transition?.create && !agentSelection.cancelled && transition.before.has(tabId) && details?.windowId === -1) {
+        // Switching native collections may unload every source API identity,
+        // including the owner. Only this native lease may reconcile them.
+        transition.create.observed = true;
+        transition.create.removed.add(tabId);
+        if (tabId === agentSelection.owner.tabId) transition.create.ownerParked = true;
+        return;
+      }
+      if (transition && !agentSelection.cancelled && !transition.targetRemoval && tabId === agentSelection.targetTab.id
+        && tabId !== agentSelection.owner.tabId && details?.windowId === -1) {
+        // Safari emits this exact removal when a moved tab leaves the visible
+        // source collection. Native source/destination proof must confirm it.
+        transition.targetRemoval = { tabId };
+        return;
+      }
       if (agentSelection && [agentSelection.owner.tabId, agentSelection.targetTab.id].includes(tabId)) agentSelection.cancelled = true;
-      serialize(async () => {
-        optionsByTab.delete(tabId);
-        for (const state of Array.from(openByWindow.values())) {
-          if (state.tabId === tabId) await closeState(state, "tab_removed", true);
-        }
-        await save();
-      }).catch(reportError);
+      serialize(() => removeTab(tabId)).catch(reportError);
     });
-    async function activateTab({ tabId, windowId }) {
+    async function activateTab({ tabId, windowId }, alreadyUnmounted = false) {
       const previous = openByWindow.get(windowId);
       if (!previous || previous.tabId === tabId) return;
-      await closeState(previous, "tab_changed");
+      await closeState(previous, "tab_changed", alreadyUnmounted);
       if (getOptionsUnlocked(tabId).enabled) await openUnlocked({ tabId, windowId });
     }
+    function createTransfer(tabId, windowId) {
+      const selection = agentSelection, transition = selection?.groupMove, flow = transition?.create;
+      if (!flow || selection.cancelled || !transition.before.has(tabId)) return;
+      // Safari's virtual -1 lifecycle differs between collection switches.
+      // Do not infer physical movement or require an optional event sequence.
+      if (windowId === -1 || windowId === selection.targetTab.windowId) {
+        flow.observed = true;
+        if (tabId === selection.owner.tabId && windowId === -1) flow.ownerParked = true;
+      }
+      else selection.cancelled = true;
+    }
     api.tabs.onActivated.addListener(({ tabId, windowId }) => {
+      traceSelection("tabActivated", { tabId, windowId });
+      let parkedOwner = false;
       if (agentSelection) {
         const expected = agentSelection.cancelled ? -1
           : agentSelection.expected.findIndex(item => item.tabId === tabId && item.windowId === windowId);
         if (expected >= 0) { agentSelection.expected.splice(expected, 1); return; }
         const transition = agentSelection.groupMove;
-        if (!agentSelection.cancelled && transition && !transition.activation && windowId === agentSelection.targetTab.windowId) {
+        const flow = transition?.create;
+        if (!agentSelection.cancelled && flow && !flow.restoringOwner && windowId === agentSelection.targetTab.windowId) {
+          // The native phase guards own real menu/tab/user changes during this
+          // call. API collection churn is staged until restored-source proof;
+          // the final active tab must match native URL/title/index exactly.
+          transition.activation = { tabId, windowId };
+          return;
+        }
+        if (!flow && !agentSelection.cancelled && transition && !transition.activation && windowId === agentSelection.targetTab.windowId) {
           // Defer one native-move side effect, not an interval of user events.
           // A failed/mismatched native result replays normal owner invalidation.
           transition.activation = { tabId, windowId };
           return;
         }
         if (transition) transition.handled = true;
+        parkedOwner = flow?.observed === true;
         agentSelection.cancelled = true;
       }
-      serialize(() => activateTab({ tabId, windowId })).catch(reportError);
+      serialize(() => activateTab({ tabId, windowId }, parkedOwner)).catch(reportError);
     });
     api.windows?.onFocusChanged?.addListener(windowId => {
+      traceSelection("windowFocusChanged", { windowId });
       if (agentSelection && windowId !== agentSelection.expectedWindow) agentSelection.cancelled = true;
     });
+    api.tabs.onCreated?.addListener(tab => traceSelection("tabCreated", { tabId: tab.id, windowId: tab.windowId }));
+    api.tabs.onDetached?.addListener((tabId, details) => {
+      traceSelection("tabDetached", { tabId, oldWindowId: details.oldWindowId });
+      createTransfer(tabId, details.oldWindowId);
+    });
+    api.tabs.onAttached?.addListener((tabId, details) => {
+      traceSelection("tabAttached", { tabId, newWindowId: details.newWindowId });
+      createTransfer(tabId, details.newWindowId);
+    });
+    api.windows?.onCreated?.addListener(window => traceSelection("windowCreated", { windowId: window.id }));
+    api.windows?.onRemoved?.addListener(windowId => traceSelection("windowRemoved", { windowId }));
     api.tabs.onUpdated?.addListener((tabId, change) => {
       if (!embedded || change.status !== "complete") return;
       serialize(async () => {
         const state = Array.from(openByWindow.values()).find(item => item.tabId === tabId);
         if (!state) return;
+        if (nativeOwnerSuspended(state)) return;
         const tab = await api.tabs.get(tabId);
         if (!/^https?:\/\//i.test(tab.url || "") || tab.incognito || tab.windowId !== state.windowId) {
           await closeState(state, "navigation", true); return;
@@ -1787,7 +2141,8 @@ function m(t,o,e){if(location.origin!==t||o!=null&&location.href!==o)return{sele
       }).catch(reportError);
     });
 
-    return { sidePanel, ready, mountContent, unmountContent, withAgentSelection, messages: MESSAGE, origin: extensionOrigin(api.runtime) };
+    return { sidePanel, ready, mountContent, unmountContent, withAgentSelection,
+      selectionDiagnostics: () => structuredClone(selectionTrace), messages: MESSAGE, origin: extensionOrigin(api.runtime) };
   }
 
   const exported = { createSidebarAdapter, extensionOrigin, MESSAGE };

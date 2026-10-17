@@ -7,6 +7,7 @@ final class SafariLiveBroker {
     private struct Profile {
         let session: String
         var seen: Date
+        let selection: [String: Any]?
     }
     private struct Operation {
         let id: String
@@ -87,6 +88,7 @@ final class SafariLiveBroker {
                     result["mode"] = "existing-safari-tabs"
                     result["profiles"] = self.availableProfiles().map { ["profileId": $0] }
                     result["connected"] = !self.availableProfiles().isEmpty
+                    result["selectionDiagnostics"] = self.profiles.compactMapValues(\.selection)
                     reply(["ok": true, "result": result])
                 }
             } else {
@@ -120,7 +122,7 @@ final class SafariLiveBroker {
             cancelDownload(old.id)
             old.reply(Self.failure("BACKGROUND_CHANGED", "The Safari background restarted; the command was not replayed."))
         }
-        profiles[profile] = Profile(session: session, seen: Date())
+        profiles[profile] = Profile(session: session, seen: Date(), selection: Self.selectionDiagnostics(command["selection"]))
         var requests = [[String: Any]]()
         if var current = operation, current.profile == profile, current.session == session, !current.delivered {
             current.delivered = true
@@ -211,6 +213,48 @@ final class SafariLiveBroker {
         guard parts.count == 3, parts[0] == "live", UUID(uuidString: String(parts[1])) != nil,
               let id = Int(parts[2]), id >= 0 else { return nil }
         return String(parts[1])
+    }
+
+    /// Bounded native-group lifecycle evidence, without page data or capabilities.
+    static func selectionDiagnostics(_ input: Any?) -> [String: Any]? {
+        guard let input = input as? [String: Any], let phase = input["phase"] as? String,
+              ["idle", "native", "verified", "rejected", "inventory_unavailable"].contains(phase) else { return nil }
+        var result: [String: Any] = ["phase": phase]
+        if let action = input["action"] as? String,
+           ["createGroup", "moveToGroup", "moveToUngrouped"].contains(action) { result["action"] = action }
+        if let failure = input["failure"] as? [String: Any],
+           let stage = failure["stage"] as? String,
+           ["native", "source_proof", "selected_proof", "owner_rebind", "owner_unmount", "owner_mount", "owner_commit"].contains(stage),
+           let code = failure["code"] as? String,
+           ["FOCUS_CHANGED", "LIVE_TIMEOUT", "COMPANION_NOT_RUNNING", "STALE_TARGET", "AGENT_OWNER_CHANGED", "UNCLASSIFIED",
+            "REBIND_STATE", "REBIND_CONTEXT", "REBIND_SNAPSHOT", "REBIND_CONVERSATION"].contains(code) {
+            result["failure"] = ["stage": stage, "code": code]
+        }
+        func identifier(_ value: Any?) -> Int? {
+            guard let number = value as? NSNumber, CFGetTypeID(number) != CFBooleanGetTypeID(),
+                  number.doubleValue.isFinite, number.doubleValue.rounded() == number.doubleValue,
+                  number.doubleValue >= -1, number.doubleValue < Double(Int.max) else { return nil }
+            return number.intValue
+        }
+        for key in ["before", "after"] {
+            result[key] = ((input[key] as? [[String: Any]]) ?? []).prefix(256).compactMap { item -> [String: Any]? in
+                guard let tab = identifier(item["tabId"]), tab > 0,
+                      let window = identifier(item["windowId"]), window > 0,
+                      let active = item["active"] as? Bool else { return nil }
+                return ["tabId": tab, "windowId": window, "active": active]
+            }
+        }
+        let events: Set<String> = ["tabCreated", "tabRemoved", "tabActivated", "tabAttached", "tabDetached",
+                                   "windowCreated", "windowRemoved", "windowFocusChanged"]
+        result["events"] = ((input["events"] as? [[String: Any]]) ?? []).suffix(64).compactMap { item -> [String: Any]? in
+            guard let type = item["type"] as? String, events.contains(type) else { return nil }
+            var event: [String: Any] = ["type": type]
+            for key in ["tabId", "windowId", "oldWindowId", "newWindowId"] {
+                if let id = identifier(item[key]) { event[key] = id }
+            }
+            return event
+        }
+        return result
     }
 
     func cancelAgent(owner: String) {

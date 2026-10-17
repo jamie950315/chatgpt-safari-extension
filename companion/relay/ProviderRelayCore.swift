@@ -151,6 +151,16 @@ final class ProviderRelayClient {
         if responded { finish(); return }
         server?.incrementRoute("rejections")
         server?.incrementRoute("rejection_http_\(status)")
+        // Fixed categories distinguish a rejected local capability from an
+        // upstream account failure without retaining a URL or request data.
+        let reasons = [
+            "Only this local provider hostname is accepted": "host",
+            "Requests from another origin are rejected": "origin",
+            "The provider capability is invalid": "capability",
+            "This upstream route is not allowed": "route",
+            "The provider session is unavailable": "session",
+        ]
+        if let reason = reasons[message] { server?.incrementRoute("rejection_" + reason) }
         let body = "<!doctype html><html lang=\"en\"><meta charset=\"utf-8\"><title>\(providerRelayEscapeHTML(ProviderRelayMessages.text("relayStatusTitle")))</title><h1>\(providerRelayEscapeHTML(ProviderRelayMessages.text("chatUnavailable")))</h1><p>\(providerRelayEscapeHTML(message))</p><p>\(providerRelayEscapeHTML(ProviderRelayMessages.text("noAutomaticAction")))</p></html>"
         send(status, data: Data(body.utf8), headers: ["Content-Type": "text/html; charset=utf-8", "Content-Security-Policy": "default-src 'none'; base-uri 'none'; form-action 'none'"])
     }
@@ -426,6 +436,25 @@ final class ProviderRelayServer: NSObject, URLSessionDataDelegate, URLSessionTas
         requestRoutes[name] = min(1_000_000_000, (requestRoutes[name] ?? 0) + 1)
     }
 
+    // Do not put arbitrary paths, identifiers, query values, headers or bodies
+    // in status. These fixed route classes cover account and submit failures.
+    static func diagnosticRoute(_ path: String) -> String? {
+        switch path {
+        case "/api/auth/session": return "auth_session"
+        case "/backend-api/me": return "account_me"
+        case "/backend-api/accounts/check", "/backend-api/accounts/check/v4-2023-04-27": return "account_check"
+        case "/backend-api/settings/user": return "settings"
+        case "/backend-api/f/conversation", "/backend-api/conversation": return "conversation_submit"
+        case "/backend-api/f/conversation/prepare": return "conversation_prepare"
+        case "/backend-api/f/conversation/resume": return "resume"
+        default:
+            if path.hasPrefix("/backend-api/conversation/") {
+                return path.hasSuffix("/stream_status") ? "stream_status" : "conversation"
+            }
+            return nil
+        }
+    }
+
     func replaceSession(accessible: Bool) throws {
         enabled = false
         for client in Array(clients.values) { client.finish() }
@@ -538,16 +567,14 @@ final class ProviderRelayServer: NSObject, URLSessionDataDelegate, URLSessionTas
             if let probe = self.probes[key] {
                 let type = response.value(forHTTPHeaderField: "Content-Type")?.lowercased().split(separator: ";").first?.trimmingCharacters(in: .whitespaces) ?? ""
                 probe.status = response.statusCode
+                self.incrementRoute("session_probe_http_\(response.statusCode)")
                 probe.accepted = response.url == probe.url && response.statusCode == 200 && type == "application/json" && response.value(forHTTPHeaderField: "cf-mitigated") != "challenge" && response.expectedContentLength <= ProviderRelaySessionCookies.sessionResponseLimit
                 completionHandler(probe.accepted ? .allow : .cancel)
                 return
             }
             guard let transfer = self.transfers[key] else { completionHandler(.cancel); return }
             transfer.status = response.statusCode
-            if transfer.url.path == "/backend-api/f/conversation/resume" {
-                self.incrementRoute("resume_http_\(response.statusCode)")
-            } else if transfer.url.path.hasPrefix("/backend-api/conversation/") {
-                let kind = transfer.url.path.hasSuffix("/stream_status") ? "stream_status" : "conversation"
+            if let kind = Self.diagnosticRoute(transfer.url.path) {
                 self.incrementRoute("\(kind)_http_\(response.statusCode)")
             }
             transfer.settingsObservation?.status = response.statusCode
@@ -617,6 +644,7 @@ final class ProviderRelayServer: NSObject, URLSessionDataDelegate, URLSessionTas
                 guard self.session === session, !self.stopped else { probe.completion(.failure(ProviderRelayError.sessionChanged)); return }
                 guard error == nil, probe.accepted,
                       let payload = ProviderRelaySessionCookies.sessionPayload(status: probe.status, data: probe.body) else {
+                    self.incrementRoute(error == nil ? "session_probe_invalid" : "session_probe_networkFailure")
                     probe.completion(.failure(ProviderRelayError.sessionUnconfirmed)); return
                 }
                 probe.completion(.success(payload))

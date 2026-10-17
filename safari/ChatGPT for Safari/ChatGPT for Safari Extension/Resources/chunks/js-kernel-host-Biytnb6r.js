@@ -477,6 +477,9 @@ Use only for browser organization the user requested. This capability controls
 ordinary Safari tabs and actual native Safari Tab Groups, retaining their logins.
 Do not move, close, pin, or rename unrelated tabs. Claim each tab with
 \`browser.user.claimTab(...)\` before changing it. Re-query after every mutation.
+Management tab/window IDs are positive integers from \`tabs.query\`/\`windows.getAll\`,
+not the string IDs from \`browser.user.openTabs\`. Match the observed tab first;
+pass its numeric native ID to management methods.
 
 ## Supported methods
 - \`tabs.query({windowId?, active?, pinned?, title?, url?})\` and \`tabs.get(tabId)\`.
@@ -488,7 +491,9 @@ Do not move, close, pin, or rename unrelated tabs. Claim each tab with
 - \`tabs.ungroup(tabIds)\` moves those tabs into Safari's ungrouped collection.
 - \`tabGroups.query({windowId?, title?})\`, \`tabGroups.get(groupId)\`, and
   \`tabGroups.update(groupId, {title})\`. Query in the sidebar's current window.
-  Claim a visible member before renaming an existing group.
+  Claim a visible member before renaming an existing group. A group created
+  successfully by this same sidebar session can be renamed from its source
+  collection without opening its hidden destination tabs.
 - \`windows.get(id)\`, \`windows.getAll({populate?})\`, \`windows.getCurrent()\`,
   \`windows.getLastFocused()\` (the owning sidebar window), and
   \`windows.update(id, {focused?, left?, top?, width?, height?, state?})\`.
@@ -498,8 +503,8 @@ Do not move, close, pin, or rename unrelated tabs. Claim each tab with
 Safari groups are separate tab collections, not Chrome's colored inline groups.
 Moving a tab into a group can remove it from the current collection. It does not
 create another login session. Query the current tabs after each operation;
-never replay an uncertain move. If grouping includes the sidebar's own tab,
-move it last. A group result contains \`id\`, \`title\`, \`windowId\`, and
+never replay an uncertain move. Keep the tab hosting the active sidebar outside
+group/ungroup operations; open the sidebar in another existing tab first. A group result contains \`id\`, \`title\`, \`windowId\`, and
 \`nativeIdentity: {kind: 'safari-native-title', title, windowIdentifier}\`.
 Handles are session-local; renaming or changing windows can invalidate them.
 Duplicate names, shared groups, unknown sharing state, Chrome color/collapse,

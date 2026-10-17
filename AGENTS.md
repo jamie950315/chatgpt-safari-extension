@@ -73,6 +73,17 @@ This is a development-signed conversion of Chrome extension 1.26.1005.11759.
 - Work's management capability uses actual Safari tab APIs and native named
   Tab Groups through `SafariTabOrganization`. Require claimed tabs for changes,
   exact native window/page/title identity, and operation-bound cancellation.
+  Keep the hosting sidebar tab outside group/ungroup batches. A create operation
+  may park and rekey its source collection. Only that bounded native lease,
+  restored source/destination proof, exact native window, unique original/fresh
+  owner page identity, and matching terminal selection may rebind the same owner
+  token and remount its conversation. Never create persistent tab aliases,
+  transfer general claimed-tab authority, or restart the tunnel for this remount.
+  Select and verify a restored inactive owner before running any frame/snapshot
+  script: Safari rejects script injection into its lazy restored document.
+  Rename acceptance uses the exact original native row, its committed new name,
+  the old name's absence, and ended editing. Update the verified preflight
+  inventory from that proof; do not trigger another post-rename picker relayout.
   Safari groups are separate collections; their session-local handles map to
   observed native names, not fabricated Chrome group IDs/color/collapse state.
   Reject duplicate names and shared or unverifiable groups. Do not advertise
@@ -172,5 +183,12 @@ reordered them through Safari tab APIs, and read back their exact final order.
 The original Work download path also passed the original one-time policy
 approval, ordinary-profile authenticated fetch, exact 204-byte UTF-8 file,
 collision preservation, 0600/quarantine, and normal final conversation response.
-Native grouping still needs installed end-to-end acceptance; do not infer it
-from tab reordering or native guard tests.
+The original Work sidebar passed a single two-tab native grouping batch,
+including source collection restoration, fresh source IDs, and the original
+conversation's inline remount. The installed original Work agent subsequently
+renamed that group to Safari Work Complete, read both exact ordinary-profile
+pages with their HTTP-only session retained, and finished normally. Keep real
+foreground/window checks and stop on manual focus changes. Safe selection
+diagnostics report fixed failure stages/codes, not page contents or credentials;
+management errors retain fixed native outcome fields in their message because
+the upstream kernel does not preserve arbitrary error metadata.

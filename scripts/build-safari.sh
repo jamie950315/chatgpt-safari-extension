@@ -35,5 +35,19 @@ ditto "$BUILT" "$ROOT/dist/$APP"
 # copy. Two copies create different Safari extension origins/backgrounds and
 # can leave the visible toolbar bound to the stale one. Register only dist.
 /usr/bin/pluginkit -r "$BUILT/Contents/PlugIns/ChatGPT for Safari Extension.appex"
+# Xcode registers its intermediate app before this script can unregister its
+# extension. A live background can wake that project-owned copy in the gap.
+# Stop only that exact intermediate executable; never another app or Safari.
+python3 - "$BUILT/Contents/MacOS/ChatGPT for Safari" <<'PY'
+import os
+import signal
+import subprocess
+import sys
+
+for line in subprocess.check_output(["ps", "-axo", "pid=,command="], text=True).splitlines():
+    fields = line.strip().split(None, 1)
+    if len(fields) == 2 and fields[1] == sys.argv[1]:
+        os.kill(int(fields[0]), signal.SIGTERM)
+PY
 /usr/bin/pluginkit -a "$ROOT/dist/$APP/Contents/PlugIns/ChatGPT for Safari Extension.appex"
 echo "Built: $ROOT/dist/$APP"
