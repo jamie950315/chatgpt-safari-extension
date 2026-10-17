@@ -138,6 +138,9 @@ tabs. Test only owned pages, do not restart Safari, and stop owned probes.
 Do not alter the installed OpenAI app/plugin or Chrome host registration.
 Build artifacts, private configuration backups, and probe reports stay ignored.
 
-The direct Work-agent integration is a development candidate until the original
-sidebar completes real existing-tab actions. Tunnel registration and isolated
-worker tests are narrower evidence, not installed end-to-end acceptance.
+The installed original sidebar Work agent passed existing-tab text entry,
+Apply button input/readback, and same-tab Next page navigation with the ordinary
+HTTP-only session retained. The conversation survived inline remount and its
+response finished normally. This path used the original cloud agent and native
+backend, without a separate MCP client or isolated website session. Keep future
+acceptance distinct from tunnel-only and isolated-worker checks.

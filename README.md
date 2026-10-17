@@ -51,7 +51,7 @@ cold-start side-chat requests. Preparation retains the sandbox and original
 host permissions, adding only the embedded wrapper resource and scoped local
 provider frame policy.
 
-## Direct side-chat agent control (development candidate)
+## Direct side-chat agent control
 
 In the original inline sidebar, select **Work** and describe an action on an
 existing Safari tab, for example: "In this page, enter the project note and click
@@ -79,8 +79,11 @@ bound to the nested host frame and scope, since Safari's same-background-frame
 runtime messaging does not reach its own listener. This computation sandbox
 does not create website tabs or another login session.
 
-**Installed end-to-end verification of this new sidebar path is still required.**
-The independent desktop control results below do not establish that acceptance.
+The installed original Work agent completed text entry, an Apply button click,
+and a Next page link click in an ordinary Safari tab. It read back the applied
+value and `Session established: true` after same-tab navigation. The inline
+sidebar retained the same conversation and finished its response after remount;
+no separate MCP client or isolated browser session performed those actions.
 
 ## Optional desktop control of existing tabs
 
@@ -167,6 +170,7 @@ sidebar releases browser context while retaining its in-memory provider session.
 ./scripts/build-safari.sh
 python3 -m unittest discover -s tests -p 'test_prepare*.py'
 node --test tests/test_native_transport.js tests/test_safari_sidebar.js tests/test_session_windows.js tests/test_companion_background.js tests/sidechat_companion_bridge.js
+node --test tests/test_safari_agent_background.js tests/test_safari_agent_kernel.js tests/test_embedded_sidechat.js tests/RelayHTTP.test.js
 ```
 
 Requirements: full Xcode, macOS, and the local Apple Development identity for
