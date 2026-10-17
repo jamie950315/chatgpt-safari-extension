@@ -430,33 +430,30 @@ source selected until the user returns to the owner sidebar. Do not refocus on
 an error to conceal a manual interruption.
 A later same-page concurrent ordinary download was not adopted, but Work's own
 capture failed; do not call that a successful concurrent managed transfer.
-Slow-stream owner-close acceptance remains pending a transfer/native callback
-failure. A captured correct URL and nonce-bound manual request were observed;
-nonce absence in the default route or `Completed steps: 0` on a later transfer
-error does not establish a native anchor bypass or an undelivered source click.
-Native await and other untracked continuations retain the limitations above.
+A captured correct URL and nonce-bound manual request were observed; nonce
+absence in the default route or `Completed steps: 0` on a later transfer error
+does not establish an anchor bypass or an undelivered source click. Preparation
+navigation cancelled without a final request or replay.
 
-Installed causal download acceptance separately passed detached HTTP, explicit
-Promise/timer callbacks, server preparation and immediate-revoke Blob with exact
-files and normal original Work final replies. The existing-destination-document
-no-CORS route passed 46 exact bytes; destination requests were zero before the
-original full-URL approval and one afterward, with only that destination's own
-HTTP-only login. Multiple candidates failed without file requests. Preparation
-navigation cancelled without replay. Keep these conditional results separate
-from unsupported native-await attribution and arbitrary no-CORS origins.
-
-Installed original Work owner-close cancelled an active transfer with native
-`AGENT_OWNER_CHANGED` and removed its content-identified partial; it returned no
-completed path. The same slow fixture had already encountered the unresolved
-42-append / 1,835,008-byte interruption before close, so this is partial cleanup
-acceptance, not normal slow-transfer completion or proof that close caused the
-server disconnect. Temporary native request-count probes were removed. The subsequent
-scoped-admission signed build completed 3,145,728 exact bytes through original
-Work in 22.1 seconds, including native finish and a normal complete/path reply:
+The scoped-admission signed build resolved the reproduced host-admission burst
+failure: original Work completed 3,145,728 exact bytes in 22.1 seconds, including
+native finish and a normal complete/path reply at
 `/Users/jamie/Downloads/Owned interrupted stream (1).parityfixture`. It retained
 HTTP-only login, used one nonce-bound request, preserved the prior collision,
-and set 0600/quarantine; the actual transfer window had no host admission drops.
-The broader generic download goal remains incomplete.
+and set 0600/quarantine. The actual transfer window had no host admission drops.
+Temporary native count probes, a global sender queue and yield(0) were removed.
+
+The same installed build passed original Work owner-close during a live stream.
+A fixture-content-identified partial was observed with real bytes; native writer
+reached 1,146,880 bytes before `outer_cancel / AGENT_OWNER_CHANGED` at 8.758 s.
+Closing the actual sidebar removed that same partial, stopped the server stream
+after close, and issued no second file request or completed path. Queued native
+admission cannot bypass the original deadline or source-document proof; cleanup
+never waits for an admission slot.
+
+The broader generic download goal remains incomplete. Native await and other
+untracked continuations retain the attribution limitations above, and arbitrary
+no-CORS destinations still require an existing authorized origin document.
 
 Installed original Work bookmark tree/search/read, title/URL update, folder
 creation, URL creation, and native movement passed with exact synthetic-record
