@@ -8,6 +8,24 @@ Open `dist/ChatGPT for Safari.app` to enable the extension in Safari Settings.
 This is a local Apple Development-signed build, not an official OpenAI Safari
 extension or a notarized release.
 
+## Download the development preview
+
+Download `ChatGPT-for-Safari-v0.1.0-macOS-universal.zip` from the
+[v0.1.0 release](https://github.com/jamie950315/chatgpt-safari-extension/releases/tag/v0.1.0).
+The repository and release are private; sign in with an account that has access.
+The app requires **macOS 14 or later** and supports Apple Silicon and Intel Macs.
+
+Extract the ZIP, open **ChatGPT for Safari.app**, and enable its extension in
+Safari Settings. Allow access to the websites you want to use. Work's mouse and
+keyboard controls also require Accessibility permission for the containing app.
+macOS may require manual approval because this development-signed app is not
+notarized.
+
+Keep only one active copy of the extension. On this development Mac, retain the
+canonical `dist/ChatGPT for Safari.app` rather than opening the downloaded copy
+alongside it. See the [release notes](RELEASE_NOTES.md) for accepted functionality
+and remaining limitations.
+
 ## Side chat shares the Safari window
 
 A closed-shadow sidebar reserves page width and compensates viewport-fixed

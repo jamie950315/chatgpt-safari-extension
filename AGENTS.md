@@ -540,3 +540,15 @@ closing the sidebar, restarting the app, signing out or refreshing the session.
 A separate root-page reload retained its exact Work draft, conversation and
 enabled Send. The earlier disabled-Send state is currently not reproduced; do
 not add speculative composer/adoption mutations.
+
+## Repository and release
+
+The private GitHub repository is `jamie950315/chatgpt-safari-extension`; `origin`
+uses HTTPS and the default branch is `main`. The initial Safari release is
+`v0.1.0`, a published development prerelease based on upstream
+1.26.1005.11759. The accepted app retains bundle version 1.26.1005 (11759).
+Release notes are maintained in `RELEASE_NOTES.md`. Package only the canonical
+signed Universal app as `ChatGPT-for-Safari-v0.1.0-macOS-universal.zip`; keep
+archives and verification extractions ignored. Reuse unchanged accepted build
+and Work evidence. Publishing a private release does not authorize making the
+repository public, notarization, or replacing the running installation.
