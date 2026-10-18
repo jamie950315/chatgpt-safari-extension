@@ -454,6 +454,11 @@ never waits for an admission slot.
 The broader generic download goal remains incomplete. Native await and other
 untracked continuations retain the attribution limitations above, and arbitrary
 no-CORS destinations still require an existing authorized origin document.
+The generic remainder is blocked on those platform/provider capabilities.
+Reopen an affected requirement only with new relevant Safari/WebKit or provider
+evidence, or an explicit user change to that constraint. Reuse the accepted
+conditional build and Work evidence; unchanged probes, approvals, rebuilds, or
+timeout increases do not resolve these gaps.
 
 Installed original Work bookmark tree/search/read, title/URL update, folder
 creation, URL creation, and native movement passed with exact synthetic-record

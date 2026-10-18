@@ -221,10 +221,61 @@ retry; the approved server may already have received the request. The final body
 is read once, with the same five-GET-hop, size, active-transfer, and cancellation
 bounds. Approval time while no request is active is excluded from that budget.
 
-Existing direct-link and export behavior is unchanged. Detached anchors,
-asynchronous download triggers, and Blob downloads remain unsupported: Safari's
-public download interfaces do not establish their originating operation. A
-generic native `waitForEvent("download")` remains unavailable.
+#### Capture detached anchors and callback-based delayed exports
+
+For a known export button whose handler prepares a download URL before calling
+`a[download].click()`, opt in to causal capture:
+
+```js
+const downloads = await tab.capabilities.get("nativeDownloads");
+const saved = await downloads.run({
+  selector: "#download-report", capture: "causal", wait_ms: 15000
+});
+```
+
+This still performs only one native source click. It tracks that dispatch and
+its instrumented explicit `Promise.then/catch/finally`, `setTimeout`, and
+`queueMicrotask` callbacks, including detached anchors and Blob URLs created
+within that chain. A retained Blob survives immediate URL revocation; its bytes
+are read only after the original website-origin download approval. The source
+control's handlers run, but additional click listeners on the programmatic
+anchor do not run in this mode.
+
+Preparation defaults to **10 seconds**, with a **15-second** maximum, separately
+from the **30-second** active-transfer budget. Capture waits for the tracked
+callback tree to finish and rejects multiple candidate anchors. Completion,
+cancellation, expiry, or navigation removes its hooks; cancellation retires only
+the operation's tagged pending callbacks and timers. After an uncertain click,
+inspect the page rather than clicking again.
+
+Native `async/await`, pre-cached uninstrumented functions, worker, interval, or
+event-listener continuations, and pre-existing Blob URLs cannot be attributed
+to this operation. They can produce an ordinary Safari download, but Work never
+adopts that file or reports it as complete. Location assignments, forms, data
+URLs, cross-origin frame controls, and a generic native
+`waitForEvent("download")` remain unsupported. Without `capture: "causal"`, the
+default connected-anchor route retains its existing limitations.
+
+#### Use an existing destination tab when CORS is unavailable
+
+If an already-open destination-origin HTML tab is available, claim it through
+the original browser-consent flow and use `redirects: "tab-origin-policy"` with
+its real tab ID in `transportTabs`. Supply **1–4** already-claimed tabs in the
+same Safari profile, one per destination origin, excluding the source tab.
+This redirect option can also be combined with `capture: "causal"`.
+
+Each full URL still passes the original policy and approval before its request.
+Safari fetches in that URL's own origin document with that destination's own
+login; native request/document proof binds the transport separately from the
+source click. Both leases remain required through native writer completion.
+The same five-GET, **32 MiB / 30-second** limits and single final-body read apply.
+
+A missing or ambiguous destination document, navigation, released claim, or
+cancellation stops the operation. This route never creates or navigates carrier
+tabs, copies credentials, or retries a CORS failure. Arbitrary no-CORS origins
+without an existing authorized document remain unsupported.
+
+#### Export Google Workspace files and YouTube captions
 
 `Tab.content.exportGsuite(format)` derives the official export URL from the
 current Google Workspace page: documents support pdf/md/docx, spreadsheets
@@ -397,6 +448,34 @@ adapter and `safari_live` target existing tabs; `safari_native` is for isolated 
 
 Completed installed checks:
 
+- The original **Work** agent completed causal detached HTTP (**41 bytes**),
+  explicit Promise/timer (**40 bytes**), server-prepared (**40 bytes**), and
+  immediate-revoke Blob (**33 bytes**) downloads. Each returned a real writer
+  path with exact content, mode 0600 and quarantine, and a normal final reply.
+  Multiple candidates stopped without a path or file GET; navigation during
+  preparation made no final file request and did not replay the source click.
+
+- The original **Work** agent completed a different-host, no-CORS
+  `tab-origin-policy` redirect through an already-existing claimed destination
+  document. Before destination approval there were zero file requests; after
+  approval, one authenticated GET produced the exact **46-byte** file with mode
+  0600 and quarantine. The destination used only its own HTTP-only login, with
+  no copied source cookie or Authorization. Work returned the writer's path
+  and finished normally.
+
+- After the scoped native-message admission fix, the original **Work** agent
+  saved **3,145,728 exact bytes** through 66 appends in **22.1 seconds**, with one
+  nonce-bound GET, the ordinary HTTP-only login retained, mode 0600, quarantine,
+  and a normal completed reply. The transfer window had no native host admission
+  drops. Closing the actual sidebar in a separate live-stream check cancelled
+  the writer after **1,146,880 bytes**, removed its observed partial, stopped the
+  server stream, and produced no second file request or completion path.
+
+- A concurrent same-page ordinary download was not adopted, but Work's own
+  capture stopped. This establishes a safe stop, not simultaneous completion of
+  both downloads. Generic native `async/await` attribution and arbitrary no-CORS
+  destinations without an existing authorized origin document remain unresolved.
+
 - The original **Work** agent completed an explicit same-origin-policy button
   download through a real HTTP redirect. Both session-protected endpoints were
   requested once. While the second original approval was pending, the final
@@ -552,6 +631,7 @@ sidebar releases browser context while retaining its in-memory provider session.
 python3 -m unittest discover -s tests -p 'test_prepare*.py'
 node --test tests/test_native_transport.js tests/test_safari_sidebar.js tests/test_session_windows.js tests/test_companion_background.js tests/sidechat_companion_bridge.js
 node --test tests/test_safari_agent_background.js tests/test_safari_agent_kernel.js tests/test_embedded_sidechat.js tests/RelayHTTP.test.js
+node --test tests/test_safari_downloads.js tests/test_safari_download_intent.js tests/test_safari_causal_download.js tests/test_safari_download_realm.js
 ```
 
 Requirements: full Xcode, macOS, and the local Apple Development identity for
